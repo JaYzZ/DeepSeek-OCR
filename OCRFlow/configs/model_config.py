@@ -18,9 +18,12 @@ class ModelConfig:
 
     # Image token configuration (from DeepSeek OCR)
     # Image tokens are [B, num_tokens, token_dim]
-    # For DeepSeek OCR with 640x640 image and 16px patches with 4x downsample:
-    # num_tokens = (640/16/4) * (640/16/4) = 40 * 40 = 1600 tokens
-    num_image_tokens: int = 1600  # Number of image tokens per image
+    # DeepSeek OCR returns 111 tokens per 640x640 image:
+    #   - 100 visual tokens (trainable, included in loss)
+    #   - 10 newline markers (frozen, excluded from loss)
+    #   - 1 view separator (frozen, excluded from loss)
+    num_image_tokens: int = 111  # Total tokens from server (100 visual + 11 structural)
+    num_trainable_tokens: int = 100  # Only first 100 tokens used for loss calculation
     token_dim: int = 1280  # DeepSeek OCR projection dimension
 
     # Text encoder configuration
@@ -105,7 +108,7 @@ MODEL_CONFIGS = {
 
 def get_model_config(
     model_size: str = "small",
-    num_image_tokens: int = 1600,
+    num_image_tokens: int = 111,
     token_dim: int = 1280,
     **kwargs
 ) -> ModelConfig:
@@ -114,7 +117,7 @@ def get_model_config(
 
     Args:
         model_size: One of ["tiny", "small", "base", "large", "xl"]
-        num_image_tokens: Number of image tokens (depends on image size and patch size)
+        num_image_tokens: Number of image tokens (111 from DeepSeek OCR server)
         token_dim: Dimension of image tokens (DeepSeek OCR projection dim)
         **kwargs: Additional config overrides
 
@@ -122,7 +125,7 @@ def get_model_config(
         ModelConfig instance
 
     Example:
-        >>> config = get_model_config("small", num_image_tokens=1600, token_dim=1280)
+        >>> config = get_model_config("small", num_image_tokens=111, token_dim=1280)
         >>> config.hidden_size
         768
         >>> config.num_params_millions()

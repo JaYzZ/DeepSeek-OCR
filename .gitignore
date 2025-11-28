@@ -30,3 +30,13 @@ outputs/
 # *.safetensors
 # *.pt
 # *.pth
+
+# Checkpoint directories
+checkpoints/
+**/checkpoints/
+
+# Training logs
+training_log.txt
+*.log
+logs/
+**/logs/

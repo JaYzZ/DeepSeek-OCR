@@ -11,11 +11,57 @@ from typing import Tuple, Optional
 import re
 
 
+def calculate_optimal_font_size(
+    text: str,
+    token_count: int,
+    width: int = 640,
+    height: int = 640,
+    padding: int = 20,
+) -> int:
+    """
+    Calculate optimal font size based on token count to fill the image appropriately.
+
+    Args:
+        text: Text to render
+        token_count: Number of tokens in the text
+        width: Image width
+        height: Image height
+        padding: Padding from edges
+
+    Returns:
+        Optimal font size
+    """
+    # Heuristic: More tokens = smaller font to fit all content
+    # Target ~60 chars per line at 640px width
+    available_width = width - 2 * padding  # 600px
+    available_height = height - 2 * padding  # 600px
+
+    # Estimate chars from tokens (rough: 1 token ≈ 4 chars)
+    estimated_chars = token_count * 4
+
+    # Target lines to fill vertical space efficiently
+    if token_count <= 50:
+        font_size = 32  # Large for short text
+    elif token_count <= 150:
+        font_size = 24  # Medium for moderate text
+    elif token_count <= 400:
+        font_size = 20  # Standard for typical paragraphs
+    elif token_count <= 800:
+        font_size = 16  # Smaller for dense text
+    elif token_count <= 1200:
+        font_size = 14  # Smallest for maximum density
+    else:
+        font_size = 12  # Fallback for very dense text (should be split)
+
+    return font_size
+
+
 def render_text_to_image(
     text: str,
     width: int = 640,
     height: int = 640,
-    font_size: int = 18,
+    font_size: Optional[int] = None,
+    token_count: Optional[int] = None,
     font_path: Optional[str] = None,
     bg_color: Tuple[int, int, int] = (255, 255, 255),
     text_color: Tuple[int, int, int] = (0, 0, 0),
@@ -27,8 +73,9 @@ def render_text_to_image(
 
     Args:
         text: Text to render
-        width, height: Image dimensions in pixels
-        font_size: Font size in pixels
+        width, height: Image dimensions in pixels (default 640x640)
+        font_size: Font size in pixels (if None, auto-calculated from token_count)
+        token_count: Number of tokens in text (used for auto font sizing)
         font_path: Path to TTF font file (uses default if None)
         bg_color: Background color (R, G, B)
         text_color: Text color (R, G, B)
@@ -38,6 +85,13 @@ def render_text_to_image(
     Returns:
         PIL Image with rendered text
     """
+    # Auto-calculate font size if not provided
+    if font_size is None and token_count is not None:
+        font_size = calculate_optimal_font_size(text, token_count, width, height, padding)
+    elif font_size is None:
+        font_size = 18  # Default fallback
+
+
     # Create blank image
     img = Image.new('RGB', (width, height), color=bg_color)
     draw = ImageDraw.Draw(img)

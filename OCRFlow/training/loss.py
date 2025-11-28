@@ -44,24 +44,37 @@ class RectifiedFlowLoss(nn.Module):
         self,
         v_pred: torch.Tensor,  # [B, N, D] predicted velocity
         v_true: torch.Tensor,  # [B, N, D] ground truth velocity = x_1 - x_0
+        num_trainable_tokens: int = 100,  # Only compute loss on first 100 tokens
     ) -> torch.Tensor:
         """
         Compute loss between predicted and true velocity.
 
+        IMPORTANT: DeepSeek-OCR returns 111 tokens:
+            - Tokens 0-99 (100 tokens): Visual content tokens - TRAINABLE
+            - Tokens 100-109 (10 tokens): Learnable newline markers - FROZEN
+            - Token 110 (1 token): Learnable separator token - FROZEN
+
+        We only compute loss on the first 100 visual tokens.
+
         Args:
-            v_pred: Predicted velocity from model
-            v_true: Ground truth velocity (x_1 - x_0)
+            v_pred: Predicted velocity from model [B, N, D] where N=111
+            v_true: Ground truth velocity (x_1 - x_0) [B, N, D]
+            num_trainable_tokens: Number of tokens to include in loss (default 100)
 
         Returns:
-            Scalar loss
+            Scalar loss computed only on visual tokens
         """
+        # Only compute loss on trainable visual tokens (first 100)
+        v_pred_visual = v_pred[:, :num_trainable_tokens, :]
+        v_true_visual = v_true[:, :num_trainable_tokens, :]
+
         if self.loss_type == "mse":
-            loss = F.mse_loss(v_pred, v_true, reduction="mean")
+            loss = F.mse_loss(v_pred_visual, v_true_visual, reduction="mean")
         elif self.loss_type == "l1":
-            loss = F.l1_loss(v_pred, v_true, reduction="mean")
+            loss = F.l1_loss(v_pred_visual, v_true_visual, reduction="mean")
         elif self.loss_type == "huber":
             loss = F.huber_loss(
-                v_pred, v_true,
+                v_pred_visual, v_true_visual,
                 reduction="mean",
                 delta=self.huber_delta
             )
@@ -106,29 +119,31 @@ def sample_timesteps(
 
 def compute_flow_matching_loss(
     model: nn.Module,
-    x_0: torch.Tensor,  # [B, N, D] noise
-    x_1: torch.Tensor,  # [B, N, D] target image tokens
+    x_0: torch.Tensor,  # [B, N, D] noise where N=111
+    x_1: torch.Tensor,  # [B, N, D] target image tokens (111 tokens)
     text_seq_embeds: torch.Tensor,  # [B, L, D_txt]
     text_pooled_embeds: torch.Tensor,  # [B, D_pool]
     loss_fn: RectifiedFlowLoss,
     cfg_dropout_prob: float = 0.1,
     timestep_sampling: str = "uniform",
+    num_trainable_tokens: int = 100,  # Only first 100 tokens for loss
 ) -> torch.Tensor:
     """
     Compute flow matching loss for a batch.
 
     Args:
         model: MMDiT model
-        x_0: Gaussian noise
-        x_1: Target image tokens (from encoder)
+        x_0: Gaussian noise [B, 111, D]
+        x_1: Target image tokens from server [B, 111, D]
         text_seq_embeds: Text sequence embeddings
         text_pooled_embeds: Pooled text embeddings
         loss_fn: Loss function
         cfg_dropout_prob: Probability of dropping text conditioning (for CFG training)
         timestep_sampling: Timestep sampling strategy
+        num_trainable_tokens: Number of visual tokens to include in loss (default 100)
 
     Returns:
-        Scalar loss
+        Scalar loss (computed only on first 100 visual tokens)
     """
     B = x_0.shape[0]
     device = x_0.device
@@ -160,8 +175,8 @@ def compute_flow_matching_loss(
         cfg_mask=cfg_mask,
     )
 
-    # Compute loss
-    loss = loss_fn(v_pred, v_true)
+    # Compute loss (only on first 100 visual tokens)
+    loss = loss_fn(v_pred, v_true, num_trainable_tokens=num_trainable_tokens)
 
     return loss
 
