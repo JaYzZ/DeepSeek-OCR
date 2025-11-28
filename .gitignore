@@ -1,0 +1,32 @@
+*.pyc
+__pycache__/
+*/__pycache__/
+
+# Directories with generated content
+pdf/
+**/pdf/
+image/
+**/image/
+img/
+**/img/
+assets/
+**/assets/
+
+# Output directories
+outputs/
+**/outputs/
+
+# Log files
+*.log
+*.log.*
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+
+# Model checkpoints (optional - uncomment if needed)
+# *.bin
+# *.safetensors
+# *.pt
+# *.pth

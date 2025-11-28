@@ -1,0 +1,40 @@
+[Unit]
+Description=DeepSeek-OCR vLLM Server
+After=network.target nvidia-persistenced.service
+
+[Service]
+Type=simple
+User=your-username
+Group=your-username
+WorkingDirectory=/path/to/DeepSeek-OCR/DeepSeek-OCR-master/DeepSeek-OCR-vllm/server
+
+# Environment
+Environment="CUDA_VISIBLE_DEVICES=0"
+Environment="PATH=/path/to/conda/envs/deepseek-ocr/bin:/usr/local/cuda/bin:$PATH"
+Environment="LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
+
+# Command
+ExecStart=/path/to/conda/envs/deepseek-ocr/bin/python \
+    deepseek_ocr_server.py \
+    --host 0.0.0.0 \
+    --port 8009 \
+    --gpu-memory-utilization 0.9 \
+    --max-model-len 8192 \
+    --tensor-parallel-size 1
+
+# Restart policy
+Restart=on-failure
+RestartSec=10s
+StartLimitBurst=3
+StartLimitInterval=60s
+
+# Logging
+StandardOutput=append:/var/log/deepseek-ocr/server.log
+StandardError=append:/var/log/deepseek-ocr/error.log
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

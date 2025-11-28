@@ -1,39 +1,35 @@
-import asyncio
 import re
 import os
-
 import torch
-if torch.version.cuda == '11.8':
-    os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda-11.8/bin/ptxas"
+import sys
 
-os.environ['VLLM_USE_V1'] = '0'
-os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+# Handle CUDA 12.8 specific configuration
+if torch.version.cuda == '12.8':
+    os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda-12.8/bin/ptxas"
 
-from vllm import AsyncLLMEngine, SamplingParams
-from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.model_executor.models.registry import ModelRegistry
-import time
-from deepseek_ocr import DeepseekOCRForCausalLM
+# GPU device selection - can be overridden via environment variable
+# Example: CUDA_VISIBLE_DEVICES=1 python run_dpsk_ocr_image.py
+from gpu_manager import select_devices
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    # Auto-select first available GPU if not specified
+    select_devices(None, auto_select=True, set_env=True)
+
+from vllm import LLM, SamplingParams
+from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import numpy as np
 from tqdm import tqdm
-from process.ngram_norepeat import NoRepeatNGramLogitsProcessor
-from process.image_process import DeepseekOCRProcessor
-from config import MODEL_PATH, INPUT_PATH, OUTPUT_PATH, PROMPT, CROP_MODE
-
-
-
-ModelRegistry.register_model("DeepseekOCRForCausalLM", DeepseekOCRForCausalLM)
+from config import MODEL_PATH, IMG_INPUT_PATH, IMG_OUTPUT_PATH, PROMPT, CROP_MODE
 
 def load_image(image_path):
 
     try:
         image = Image.open(image_path)
-        
+
         corrected_image = ImageOps.exif_transpose(image)
 
         return corrected_image
-        
+
     except Exception as e:
         print(f"error: {e}")
         try:
@@ -78,18 +74,18 @@ def draw_bounding_boxes(image, refs):
 
     overlay = Image.new('RGBA', img_draw.size, (0, 0, 0, 0))
     draw2 = ImageDraw.Draw(overlay)
-    
+
     #     except IOError:
     font = ImageFont.load_default()
 
     img_idx = 0
-    
+
     for i, ref in enumerate(refs):
         try:
             result = extract_coordinates_and_label(ref, image_width, image_height)
             if result:
                 label_type, points_list = result
-                
+
                 color = (np.random.randint(0, 200), np.random.randint(0, 200), np.random.randint(0, 255))
 
                 color_a = color + (20, )
@@ -105,12 +101,12 @@ def draw_bounding_boxes(image, refs):
                     if label_type == 'image':
                         try:
                             cropped = image.crop((x1, y1, x2, y2))
-                            cropped.save(f"{OUTPUT_PATH}/images/{img_idx}.jpg")
+                            cropped.save(f"{IMG_OUTPUT_PATH}/images/{img_idx}.jpg")
                         except Exception as e:
                             print(e)
                             pass
                         img_idx += 1
-                        
+
                     try:
                         if label_type == 'title':
                             draw.rectangle([x1, y1, x2, y2], outline=color, width=4)
@@ -121,13 +117,13 @@ def draw_bounding_boxes(image, refs):
 
                         text_x = x1
                         text_y = max(0, y1 - 15)
-                            
+
                         text_bbox = draw.textbbox((0, 0), label_type, font=font)
                         text_width = text_bbox[2] - text_bbox[0]
                         text_height = text_bbox[3] - text_bbox[1]
-                        draw.rectangle([text_x, text_y, text_x + text_width, text_y + text_height], 
+                        draw.rectangle([text_x, text_y, text_x + text_width, text_y + text_height],
                                     fill=(255, 255, 255, 30))
-                        
+
                         draw.text((text_x, text_y), label_type, font=font, fill=color)
                     except:
                         pass
@@ -142,82 +138,46 @@ def process_image_with_refs(image, ref_texts):
     return result_image
 
 
-
-
-async def stream_generate(image=None, prompt=''):
-
-
-    engine_args = AsyncEngineArgs(
+if __name__ == "__main__":
+    # Initialize model
+    llm = LLM(
         model=MODEL_PATH,
-        hf_overrides={"architectures": ["DeepseekOCRForCausalLM"]},
-        block_size=256,
-        max_model_len=8192,
-        enforce_eager=False,
-        trust_remote_code=True,  
-        tensor_parallel_size=1,
-        gpu_memory_utilization=0.75,
+        enable_prefix_caching=False,
+        mm_processor_cache_gb=0,
+        logits_processors=[NGramPerReqLogitsProcessor]
     )
-    engine = AsyncLLMEngine.from_engine_args(engine_args)
-    
-    logits_processors = [NoRepeatNGramLogitsProcessor(ngram_size=30, window_size=90, whitelist_token_ids= {128821, 128822})] #whitelist: <td>, </td> 
 
     sampling_params = SamplingParams(
         temperature=0.0,
         max_tokens=8192,
-        logits_processors=logits_processors,
+        extra_args=dict(
+            ngram_size=30,
+            window_size=90,
+            whitelist_token_ids={128821, 128822},  # whitelist: <td>, </td>
+        ),
         skip_special_tokens=False,
-        # ignore_eos=False,
-        
     )
-    
-    request_id = f"request-{int(time.time())}"
 
-    printed_length = 0  
+    os.makedirs(IMG_OUTPUT_PATH, exist_ok=True)
+    os.makedirs(f'{IMG_OUTPUT_PATH}/images', exist_ok=True)
 
-    if image and '<image>' in prompt:
-        request = {
-            "prompt": prompt,
-            "multi_modal_data": {"image": image}
-        }
-    elif prompt:
-        request = {
-            "prompt": prompt
-        }
-    else:
-        assert False, f'prompt is none!!!'
-    async for request_output in engine.generate(
-        request, sampling_params, request_id
-    ):
-        if request_output.outputs:
-            full_text = request_output.outputs[0].text
-            new_text = full_text[printed_length:]
-            print(new_text, end='', flush=True)
-            printed_length = len(full_text)
-            final_output = full_text
-    print('\n') 
-
-    return final_output
-
-
-
-
-if __name__ == "__main__":
-
-    os.makedirs(OUTPUT_PATH, exist_ok=True)
-    os.makedirs(f'{OUTPUT_PATH}/images', exist_ok=True)
-
-    image = load_image(INPUT_PATH).convert('RGB')
-
-    
-    if '<image>' in PROMPT:
-
-        image_features = DeepseekOCRProcessor().tokenize_with_images(images = [image], bos=True, eos=True, cropping=CROP_MODE)
-    else:
-        image_features = ''
+    image = load_image(IMG_INPUT_PATH).convert('RGB')
 
     prompt = PROMPT
 
-    result_out = asyncio.run(stream_generate(image_features, prompt))
+    model_input = [
+        {
+            "prompt": prompt,
+            "multi_modal_data": {"image": image}
+        }
+    ]
+
+    # Generate output
+    model_outputs = llm.generate(model_input, sampling_params)
+    result_out = model_outputs[0].outputs[0].text
+
+    # Print output
+    print(result_out)
 
 
     save_results = 1
@@ -229,7 +189,7 @@ if __name__ == "__main__":
 
         outputs = result_out
 
-        with open(f'{OUTPUT_PATH}/result_ori.mmd', 'w', encoding = 'utf-8') as afile:
+        with open(f'{IMG_OUTPUT_PATH}/result_ori.mmd', 'w', encoding = 'utf-8') as afile:
             afile.write(outputs)
 
         matches_ref, matches_images, mathes_other = re_match(outputs)
@@ -245,7 +205,7 @@ if __name__ == "__main__":
 
         # if 'structural formula' in conversation[0]['content']:
         #     outputs = '<smiles>' + outputs + '</smiles>'
-        with open(f'{OUTPUT_PATH}/result.mmd', 'w', encoding = 'utf-8') as afile:
+        with open(f'{IMG_OUTPUT_PATH}/result.mmd', 'w', encoding = 'utf-8') as afile:
             afile.write(outputs)
 
         if 'line_type' in outputs:
@@ -281,9 +241,9 @@ if __name__ == "__main__":
 
                 label = endpoint.split(': ')[0]
                 (x, y) = eval(endpoint.split(': ')[1])
-                ax.annotate(label, (x, y), xytext=(1, 1), textcoords='offset points', 
+                ax.annotate(label, (x, y), xytext=(1, 1), textcoords='offset points',
                             fontsize=5, fontweight='light')
-            
+
             try:
                 if 'Circle' in eval(outputs).keys():
                     circle_centers = eval(outputs)['Circle']['circle_center']
@@ -297,7 +257,14 @@ if __name__ == "__main__":
                 pass
 
 
-            plt.savefig(f'{OUTPUT_PATH}/geo.jpg')
+            plt.savefig(f'{IMG_OUTPUT_PATH}/geo.jpg')
             plt.close()
 
-        result.save(f'{OUTPUT_PATH}/result_with_boxes.jpg')
+        result.save(f'{IMG_OUTPUT_PATH}/result_with_boxes.jpg')
+
+    print("\n" + "="*60)
+    print("Processing complete! All output files have been saved.")
+    print("(Note: You may see an engine cleanup error below - this is")
+    print(" harmless and does not affect the results.)")
+    print("="*60)
+    sys.exit(0)

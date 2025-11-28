@@ -115,7 +115,8 @@ uv pip install -U vllm --pre --extra-index-url https://wheels.vllm.ai/nightly
 ```
 
 ```python
-from vllm import LLM, SamplingParams
+from vllm import LLM
+from vllm.sampling_params import SamplingParams
 from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
 from PIL import Image
 
@@ -167,9 +168,8 @@ for output in model_outputs:
 from transformers import AutoModel, AutoTokenizer
 import torch
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = '0'
-model_name = 'deepseek-ai/DeepSeek-OCR'
 
+model_name = 'deepseek-ai/DeepSeek-OCR'
 tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 model = AutoModel.from_pretrained(model_name, _attn_implementation='flash_attention_2', trust_remote_code=True, use_safetensors=True)
 model = model.eval().cuda().to(torch.bfloat16)

@@ -2,44 +2,40 @@ import os
 import re
 from tqdm import tqdm
 import torch
-if torch.version.cuda == '11.8':
-    os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda-11.8/bin/ptxas"
-os.environ['VLLM_USE_V1'] = '0'
-os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+
+# Handle CUDA 12.8 specific configuration
+if torch.version.cuda == '12.8':
+    os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda-12.8/bin/ptxas"
+
+# GPU device selection - can be overridden via environment variable
+# Example: CUDA_VISIBLE_DEVICES=0,1 python run_dpsk_ocr_eval_batch.py
+from gpu_manager import select_devices
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    # Auto-select first available GPU if not specified
+    select_devices(None, auto_select=True, set_env=True)
 
 from config import MODEL_PATH, INPUT_PATH, OUTPUT_PATH, PROMPT, MAX_CONCURRENCY, CROP_MODE, NUM_WORKERS
 from concurrent.futures import ThreadPoolExecutor
 import glob
 from PIL import Image
-from deepseek_ocr import DeepseekOCRForCausalLM
-
-from vllm.model_executor.models.registry import ModelRegistry
-
 from vllm import LLM, SamplingParams
-from process.ngram_norepeat import NoRepeatNGramLogitsProcessor
-from process.image_process import DeepseekOCRProcessor
-ModelRegistry.register_model("DeepseekOCRForCausalLM", DeepseekOCRForCausalLM)
-
+from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
 
 llm = LLM(
     model=MODEL_PATH,
-    hf_overrides={"architectures": ["DeepseekOCRForCausalLM"]},
-    block_size=256,
-    enforce_eager=False,
-    trust_remote_code=True, 
-    max_model_len=8192,
-    swap_space=0,
-    max_num_seqs = MAX_CONCURRENCY,
-    tensor_parallel_size=1,
-    gpu_memory_utilization=0.9,
+    enable_prefix_caching=False,
+    mm_processor_cache_gb=0,
+    logits_processors=[NGramPerReqLogitsProcessor]
 )
-
-logits_processors = [NoRepeatNGramLogitsProcessor(ngram_size=40, window_size=90, whitelist_token_ids= {128821, 128822})] #window for fast；whitelist_token_ids: <td>,</td>
 
 sampling_params = SamplingParams(
     temperature=0.0,
     max_tokens=8192,
-    logits_processors=logits_processors,
+    extra_args=dict(
+        ngram_size=30,
+        window_size=90,
+        whitelist_token_ids={128821, 128822},  # whitelist: <td>, </td>
+    ),
     skip_special_tokens=False,
 )
 
@@ -83,7 +79,7 @@ def process_single_image(image):
     prompt_in = prompt
     cache_item = {
         "prompt": prompt_in,
-        "multi_modal_data": {"image": DeepseekOCRProcessor().tokenize_with_images(images = [image], bos=True, eos=True, cropping=CROP_MODE)},
+        "multi_modal_data": {"image": image},
     }
     return cache_item
 

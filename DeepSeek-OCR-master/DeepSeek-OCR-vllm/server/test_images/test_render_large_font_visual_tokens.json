@@ -1,0 +1,9 @@
+{
+  "shape": [
+    1,
+    111,
+    1280
+  ],
+  "dtype": "float32",
+  "source_image": "test_render_large_font.png"
+}

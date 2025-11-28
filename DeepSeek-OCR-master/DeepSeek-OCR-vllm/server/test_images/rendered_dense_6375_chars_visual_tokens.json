@@ -1,0 +1,9 @@
+{
+  "shape": [
+    1,
+    111,
+    1280
+  ],
+  "dtype": "float32",
+  "source_image": "rendered_dense_6375_chars.png"
+}

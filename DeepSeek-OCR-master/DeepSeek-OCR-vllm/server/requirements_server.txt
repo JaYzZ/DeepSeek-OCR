@@ -1,0 +1,13 @@
+# DeepSeek-OCR Server Requirements
+# Install with: pip install -r requirements_server.txt
+
+# Core dependencies
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+
+# Additional utilities
+requests
+tqdm
+aiofiles

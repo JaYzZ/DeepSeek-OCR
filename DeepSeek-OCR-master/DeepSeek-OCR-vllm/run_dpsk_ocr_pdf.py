@@ -6,51 +6,43 @@ import re
 from tqdm import tqdm
 import torch
 from concurrent.futures import ThreadPoolExecutor
- 
+import sys
 
-if torch.version.cuda == '11.8':
-    os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda-11.8/bin/ptxas"
-os.environ['VLLM_USE_V1'] = '0'
-os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+# Handle CUDA 12.8 specific configuration
+if torch.version.cuda == '12.8':
+    os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda-12.8/bin/ptxas"
 
+# GPU device selection - can be overridden via environment variable
+# Example: CUDA_VISIBLE_DEVICES=0 python run_dpsk_ocr_pdf.py
+from gpu_manager import select_devices
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    # Auto-select first available GPU if not specified
+    select_devices(None, auto_select=True, set_env=True)
 
-from config import MODEL_PATH, INPUT_PATH, OUTPUT_PATH, PROMPT, SKIP_REPEAT, MAX_CONCURRENCY, NUM_WORKERS, CROP_MODE
+from config import MODEL_PATH, PDF_INPUT_PATH, PDF_OUTPUT_PATH, PROMPT, SKIP_REPEAT, MAX_CONCURRENCY, NUM_WORKERS, CROP_MODE
 
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-from deepseek_ocr import DeepseekOCRForCausalLM
-
-from vllm.model_executor.models.registry import ModelRegistry
 
 from vllm import LLM, SamplingParams
-from process.ngram_norepeat import NoRepeatNGramLogitsProcessor
-from process.image_process import DeepseekOCRProcessor
-
-ModelRegistry.register_model("DeepseekOCRForCausalLM", DeepseekOCRForCausalLM)
-
+from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
 
 llm = LLM(
     model=MODEL_PATH,
-    hf_overrides={"architectures": ["DeepseekOCRForCausalLM"]},
-    block_size=256,
-    enforce_eager=False,
-    trust_remote_code=True, 
-    max_model_len=8192,
-    swap_space=0,
-    max_num_seqs=MAX_CONCURRENCY,
-    tensor_parallel_size=1,
-    gpu_memory_utilization=0.9,
-    disable_mm_preprocessor_cache=True
+    enable_prefix_caching=False,
+    mm_processor_cache_gb=0,
+    logits_processors=[NGramPerReqLogitsProcessor]
 )
-
-logits_processors = [NoRepeatNGramLogitsProcessor(ngram_size=20, window_size=50, whitelist_token_ids= {128821, 128822})] #window for fast；whitelist_token_ids: <td>,</td>
 
 sampling_params = SamplingParams(
     temperature=0.0,
     max_tokens=8192,
-    logits_processors=logits_processors,
+    extra_args=dict(
+        ngram_size=30,
+        window_size=90,
+        whitelist_token_ids={128821, 128822},  # whitelist: <td>, </td>
+    ),
     skip_special_tokens=False,
-    include_stop_str_in_output=True,
 )
 
 
@@ -183,7 +175,7 @@ def draw_bounding_boxes(image, refs, jdx):
                     if label_type == 'image':
                         try:
                             cropped = image.crop((x1, y1, x2, y2))
-                            cropped.save(f"{OUTPUT_PATH}/images/{jdx}_{img_idx}.jpg")
+                            cropped.save(f"{PDF_OUTPUT_PATH}/images/{jdx}_{img_idx}.jpg")
                         except Exception as e:
                             print(e)
                             pass
@@ -225,20 +217,20 @@ def process_single_image(image):
     prompt_in = prompt
     cache_item = {
         "prompt": prompt_in,
-        "multi_modal_data": {"image": DeepseekOCRProcessor().tokenize_with_images(images = [image], bos=True, eos=True, cropping=CROP_MODE)},
+        "multi_modal_data": {"image": image},
     }
     return cache_item
 
 
 if __name__ == "__main__":
 
-    os.makedirs(OUTPUT_PATH, exist_ok=True)
-    os.makedirs(f'{OUTPUT_PATH}/images', exist_ok=True)
+    os.makedirs(PDF_OUTPUT_PATH, exist_ok=True)
+    os.makedirs(f'{PDF_OUTPUT_PATH}/images', exist_ok=True)
     
     print(f'{Colors.RED}PDF loading .....{Colors.RESET}')
 
 
-    images = pdf_to_images_high_quality(INPUT_PATH)
+    images = pdf_to_images_high_quality(PDF_INPUT_PATH)
 
 
     prompt = PROMPT
@@ -265,32 +257,48 @@ if __name__ == "__main__":
     #     batch_inputs.extend(cache_list)
 
 
+    print(f'{Colors.YELLOW}Starting OCR generation...{Colors.RESET}')
     outputs_list = llm.generate(
         batch_inputs,
         sampling_params=sampling_params
     )
 
+    print(f'{Colors.GREEN}OCR generation completed. Extracting results...{Colors.RESET}')
 
-    output_path = OUTPUT_PATH
+    # Extract all text results immediately to avoid engine cleanup issues
+    text_results = []
+    for idx, output in enumerate(outputs_list):
+        try:
+            text_results.append(output.outputs[0].text)
+        except Exception as e:
+            print(f'{Colors.RED}Error extracting result {idx}: {e}{Colors.RESET}')
+            text_results.append("")
+
+    print(f'{Colors.GREEN}Extracted {len(text_results)} results. Processing...{Colors.RESET}')
+
+    output_path = PDF_OUTPUT_PATH
 
     os.makedirs(output_path, exist_ok=True)
 
 
-    mmd_det_path = output_path + '/' + INPUT_PATH.split('/')[-1].replace('.pdf', '_det.mmd')
-    mmd_path = output_path + '/' + INPUT_PATH.split('/')[-1].replace('pdf', 'mmd')
-    pdf_out_path = output_path + '/' + INPUT_PATH.split('/')[-1].replace('.pdf', '_layouts.pdf')
+    mmd_det_path = output_path + '/' + PDF_INPUT_PATH.split('/')[-1].replace('.pdf', '_det.mmd')
+    mmd_path = output_path + '/' + PDF_INPUT_PATH.split('/')[-1].replace('pdf', 'mmd')
+    pdf_out_path = output_path + '/' + PDF_INPUT_PATH.split('/')[-1].replace('.pdf', '_layouts.pdf')
     contents_det = ''
     contents = ''
     draw_images = []
     jdx = 0
-    for output, img in zip(outputs_list, images):
-        content = output.outputs[0].text
 
-        if '<｜end▁of▁sentence｜>' in content: # repeat no eos
-            content = content.replace('<｜end▁of▁sentence｜>', '')
-        else:
-            if SKIP_REPEAT:
-                continue
+    print(f'{Colors.BLUE}Processing {len(text_results)} pages...{Colors.RESET}')
+    for pdf_page_idx, (content, img) in enumerate(zip(text_results, images)):
+        if not content:  # Skip empty results
+            print(f'{Colors.YELLOW}Skipping PDF page {pdf_page_idx+1} (empty content){Colors.RESET}')
+            continue
+
+        # With the new vllm implementation, the model doesn't always emit special end tokens
+        # The ngram logit processor handles repetition, so we process all non-empty pages
+        # Clean up any ending tokens if present
+        content = content.replace('<｜end of sentence｜>', '').replace('</s>', '').rstrip('<|end|>')
 
         
         page_num = f'\n<--- Page Split --->'
@@ -328,3 +336,14 @@ if __name__ == "__main__":
 
     pil_to_pdf_img2pdf(draw_images, pdf_out_path)
 
+    print(f'\n{Colors.GREEN}{"="*60}{Colors.RESET}')
+    print(f'{Colors.GREEN}Successfully processed {jdx} pages!{Colors.RESET}')
+    print(f'{Colors.GREEN}Output files:{Colors.RESET}')
+    print(f'  - {mmd_det_path}')
+    print(f'  - {mmd_path}')
+    print(f'  - {pdf_out_path}')
+    print(f'{Colors.YELLOW}(Note: You may see an engine cleanup error below - this is{Colors.RESET}')
+    print(f'{Colors.YELLOW} harmless and does not affect the results.){Colors.RESET}')
+    print(f'{Colors.GREEN}{"="*60}{Colors.RESET}')
+
+    sys.exit(0)

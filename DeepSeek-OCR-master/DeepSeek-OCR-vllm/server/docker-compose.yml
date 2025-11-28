@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  deepseek-ocr:
+    build:
+      context: ../
+      dockerfile: server/Dockerfile
+    container_name: deepseek-ocr-server
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0
+    ports:
+      - "8009:8009"
+    volumes:
+      # Model cache
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      # Input/output directories
+      - ./inputs:/app/inputs
+      - ./outputs:/app/outputs
+      # Logs
+      - ./logs:/app/logs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8009/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    command: >
+      python3 deepseek_ocr_server.py
+      --host 0.0.0.0
+      --port 8009
+      --gpu-memory-utilization 0.9
+      --max-model-len 8192
+      --tensor-parallel-size 1
+
+networks:
+  default:
+    name: ocr-network
