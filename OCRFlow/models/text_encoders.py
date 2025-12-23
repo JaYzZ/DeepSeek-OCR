@@ -104,12 +104,12 @@ def load_t5_encoder(
         model = T5EncoderWithProjection.from_pretrained(
             model_path,
             config=config,
-            torch_dtype=dtype,
+            dtype=dtype,
         )
     else:
         model = T5EncoderModel.from_pretrained(
             model_path,
-            torch_dtype=dtype,
+            dtype=dtype,
         )
 
     model = model.to(device)
@@ -153,18 +153,18 @@ def load_clip_encoder(
             from transformers.models.siglip2.modeling_siglip2 import Siglip2TextModel
             model = Siglip2TextModel.from_pretrained(
                 model_path,
-                torch_dtype=dtype,
+                dtype=dtype,
             )
         else:
             model = CLIPTextModel.from_pretrained(
                 model_path,
-                torch_dtype=dtype,
+                dtype=dtype,
             )
     except:
         # Fallback to CLIP
         model = CLIPTextModel.from_pretrained(
             model_path,
-            torch_dtype=dtype,
+            dtype=dtype,
         )
 
     model = model.to(device)

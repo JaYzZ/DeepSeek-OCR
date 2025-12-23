@@ -33,12 +33,12 @@ import hashlib
 import pickle
 from dataclasses import dataclass
 
-# Import fast renderer
-from OCRFlow.utils.fast_renderer import (
-    render_text_optimized,
-    FastBatchRenderer,
-    _init_global_font,
-)
+# Text rendering is provided by ./Renderer.
+try:
+    from Renderer import VelloRenderer  # type: ignore
+except Exception:  # pragma: no cover
+    VelloRenderer = None
+from Renderer.pil_renderer import PILRenderer, render_to_pil
 
 logger = logging.getLogger(__name__)
 
@@ -57,12 +57,31 @@ def render_text_to_image(
     **kwargs
 ) -> Image.Image:
     """Render text to PIL Image (uses optimized renderer)"""
-    return render_text_optimized(
-        text,
-        width=width,
-        height=height,
-        font_size=font_size,
-    )
+    return render_to_pil(text, width=width, height=height, font_size=font_size)
+
+
+class _BatchTextRenderer:
+    """Local batch renderer (Vello when available, else PILRenderer)."""
+
+    def __init__(self, num_workers: int = 4, font_size: int = 18, width: int = 640, height: int = 640):
+        self.font_size = font_size
+        self.width = width
+        self.height = height
+        self._vello = None
+        if VelloRenderer is not None:
+            try:
+                self._vello = VelloRenderer(width=width, height=height)
+            except Exception:
+                self._vello = None
+        self._pil = None if self._vello is not None else PILRenderer(
+            num_workers=num_workers, width=width, height=height
+        )
+
+    def render_batch(self, texts: List[str]) -> List[Image.Image]:
+        if self._vello is not None:
+            arrays = self._vello.render_batch(list(texts))
+            return [Image.fromarray(arr) for arr in arrays]
+        return self._pil.render_batch_pil(texts)  # type: ignore[union-attr]
 
 
 class DirectVisionEncoder:
@@ -97,18 +116,14 @@ class DirectVisionEncoder:
 
         self.model = AutoModel.from_pretrained(
             self.model_path,
-            torch_dtype=self.dtype,
+            dtype=self.dtype,
             device_map=self.device,
             trust_remote_code=True
         )
         self.model.eval()
 
         # Import processor
-        import sys
-        ocr_path = Path(__file__).parent.parent.parent / "DeepSeek-OCR-master" / "DeepSeek-OCR-vllm"
-        sys.path.insert(0, str(ocr_path))
-
-        from process.image_process import DeepseekOCRProcessor
+        from OCRInfer.process.image_process import DeepseekOCRProcessor
         self.processor = DeepseekOCRProcessor()
 
         self._initialized = True
@@ -200,7 +215,7 @@ class DirectVisionEncoder:
         # Render texts to images (use parallel for batches > 2)
         if use_parallel and len(truncated) > 2:
             if self._renderer is None:
-                self._renderer = FastBatchRenderer(num_workers=4, font_size=18)
+                self._renderer = _BatchTextRenderer(num_workers=4, font_size=18)
             images = self._renderer.render_batch(truncated)
         else:
             images = [render_text_to_image(text) for text in truncated]
@@ -241,7 +256,7 @@ class DirectEncoderDataset(IterableDataset):
         shuffle: bool = True,
         max_samples: Optional[int] = None,
         cache_dir: Optional[str] = None,
-        encode_batch_size: int = 8,
+        encode_batch_size: int = 24,
     ):
         """
         Args:

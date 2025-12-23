@@ -2,6 +2,11 @@
 __pycache__/
 */__pycache__/
 
+# Environment files (contains secrets)
+.env
+.env.local
+**/.env
+
 # Directories with generated content
 pdf/
 **/pdf/
@@ -40,3 +45,7 @@ training_log.txt
 *.log
 logs/
 **/logs/
+*/target/*
+.claude/*
+swanlog/*
+**/.pytest_cache/*

@@ -1,344 +1,292 @@
-# OCRFlow: Visual Token Learning
+# OCRFlow
 
-Train transformer models on visual tokens from DeepSeek-OCR for large-scale text understanding.
-
-## Overview
-
-**OCRFlow** learns visual token representations using text datasets and DeepSeek-OCR as the encoder. Two training paradigms:
-
-### 1. BERT (Bidirectional) - Reconstruction
-- Masked token prediction (like BERT MLM)
-- Bidirectional attention
-- Good for understanding/encoding
-
-### 2. Markovian Decoder (Autoregressive) - Generation
-- Next-token prediction (like GPT)
-- Causal attention (Markovian thinking)
-- Good for generation/reasoning
-
-**Both support:**
-- ✅ **Large-scale pretraining** on text corpora (FineWeb-Edu, etc.)
-- ✅ **GPT-style training practices** (large batches, cosine LR, etc.)
-- ✅ **~305M params** (fast training)
-- ✅ **No need for document images** (text-only datasets)
+High-performance training system for OCR models with GPU-accelerated rendering and optimized encoder-decoder architecture.
 
 ## Quick Start
 
-### 1. Start DeepSeek-OCR Server
+```bash
+# 1. Install dependencies
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
+
+# 2. Build Vello renderer (12x faster than PIL) - see SETUP.md
+sudo apt-get install -y libvulkan-dev fonts-noto-cjk
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source $HOME/.cargo/env
+cd utils/vello_renderer && pip install maturin && maturin develop --release
+
+# 3. Run training (7 encoder + 1 training GPU)
+python examples/train.py --max_steps 50000
+
+# 4. Monitor training in tmux
+tmux attach -t ocrflow_training
+```
+
+**Note:** First run takes 7-21 min for torch.compile warmup. Subsequent runs start instantly (0s warmup).
+
+## Features
+
+- **High Performance**: 12x faster rendering with Vello, ~2,079 pairs/s training throughput
+- **Memory Efficient**: Vision encoder only (401M params vs 7B full model), ~800MB per encoder GPU
+- **Zero Warmup**: torch.compile cache artifacts enable 0s startup on subsequent runs
+- **Multilingual**: Full CJK support (Chinese, Japanese, Korean) via Noto Sans fonts
+- **MAR Training**: Masked autoregressive self-supervised learning with diffusion-based prediction
+- **Dedicated Pool**: Separate encoding workers (GPUs 1-7) and training worker (GPU 0)
+
+## Performance
+
+### Rendering Speed
+| Renderer | Speed (img/s) | Speedup vs PIL | CJK Support |
+|----------|---------------|----------------|-------------|
+| PIL (default) | 130 | 1x | ✅ |
+| Skia | 778 | 6x | ✅ |
+| **Vello** | **1,565** | **12x** | **✅** |
+
+### Training Throughput
+| Configuration | Encoding Speed | Training Speed | GPU Util |
+|---------------|----------------|----------------|----------|
+| 8 GPUs (7+1) | 2,079 pairs/s | 2,278 pairs/s | 91% |
+| 4 GPUs (3+1) | 891 pairs/s | 2,278 pairs/s | 39% |
+| 2 GPUs (1+1) | 297 pairs/s | 2,278 pairs/s | 13% |
+
+### Memory Usage
+- **Encoder GPUs (1-7):** ~800MB each (vision encoder only, no LLM)
+- **Training GPU (0):** ~20GB (full model + optimizer)
+- **System RAM:** ~8GB (dataset + cache)
+
+## Architecture
+
+```
+┌────────────────────────────────────────────────────┐
+│                 OCRFlow Training                   │
+├────────────────────────────────────────────────────┤
+│                                                    │
+│  ┌──────────────┐         ┌──────────────┐       │
+│  │ Vello        │  1,565  │ Vision       │  297  │
+│  │ Renderer     │─ img/s ─│ Encoder      │pairs/s│
+│  │ (CPU-based)  │         │ (GPU 1-7)    │×7 GPUs│
+│  └──────────────┘         └──────┬───────┘       │
+│                                   │               │
+│                                   ▼               │
+│                          ┌─────────────────┐     │
+│                          │ Rolling Cache   │     │
+│                          │ (50K pairs)     │     │
+│                          └────────┬────────┘     │
+│                                   │               │
+│                                   ▼               │
+│                          ┌─────────────────┐     │
+│                          │ Training Worker │     │
+│                          │ (GPU 0)         │     │
+│                          │ - Next-chunk    │     │
+│                          │ - MAR diffusion │     │
+│                          └─────────────────┘     │
+│                                                    │
+│  Throughput: ~2,079 pairs/s                       │
+│  Training GPU Util: ~91%                          │
+└────────────────────────────────────────────────────┘
+```
+
+## System Requirements
+
+### Minimum Requirements
+- **OS**: Ubuntu 20.04+ / Linux
+- **Python**: 3.10+
+- **CUDA**: 12.1+ (for GPU acceleration)
+- **RAM**: 32GB+
+- **GPU**: 1x NVIDIA GPU with 24GB+ VRAM (for basic training)
+
+### Recommended for Full Training
+- **GPUs**: 8x NVIDIA H100/A100 (7 for encoding + 1 for training)
+- **RAM**: 128GB+
+- **Storage**: 500GB+ SSD (for datasets)
+
+## Training Configuration
+
+### Basic Training
 
 ```bash
-cd DeepSeek-OCR-master/DeepSeek-OCR-vllm/server
-python deepseek_ocr_server.py --port 8010 --gpu-devices 0
+# Basic training (8 GPUs)
+python examples/train.py --max_steps 50000
+
+# Custom configuration
+python examples/train.py \
+    --max_steps 100000 \
+    --encode_batch_size 24 \
+    --train_batch_size 16 \
+    --learning_rate 1e-4
 ```
 
-### 2a. Train BERT (Bidirectional Reconstruction)
+### With MAR (Masked Autoregressive) Training
+
+Add self-supervised vision learning with diffusion-based prediction:
 
 ```bash
-python OCRFlow/examples/train.py \
-    --dataset_type fineweb \
-    --train_data /share/project/xiyan/huggingface/HuggingFaceFW/fineweb-edu \
-    --server_url http://localhost:8010 \
-    --cache_dir ./vistok_cache \
-    --output_dir ./checkpoints/bert_fineweb \
-    --model_size large \
-    --batch_size 32 \
-    --gradient_accumulation_steps 4 \
-    --learning_rate 2e-4 \
-    --use_masking \
-    --use_amp \
-    --max_steps 50000
+python examples/train.py \
+    --max_steps 50000 \
+    --enable_mar \
+    --mar_loss_weight 0.1
 ```
 
-### 2b. Train Markovian Decoder (Autoregressive Generation)
+**Benefits:**
+- Self-supervised vision learning on 100 pure visual tokens
+- Diffusion-based continuous token prediction (not simple L2)
+- High mask ratios (70-100%) via truncated Gaussian
+- Better vision representations
+- ~10% training overhead
+
+### Configuration Options
+
+Key parameters in `examples/train.py`:
+
+```python
+# Encoder configuration
+ENCODER_GPUS = [1, 2, 3, 4, 5, 6, 7]  # GPUs for vision encoding
+TRAINING_GPU = 0                       # GPU for training
+
+# Dataset configuration
+CACHE_SIZE = 50000                     # Rolling cache size
+ENCODE_BATCH_SIZE = 24                 # Batch size per encoder (optimal: 329 img/s)
+TRAIN_BATCH_SIZE = 16                  # Training batch size
+
+# Optimization
+LEARNING_RATE = 1e-4
+MAX_STEPS = 50000
+GRADIENT_ACCUMULATION = 4
+```
+
+## Troubleshooting
+
+### Quick Diagnostics
 
 ```bash
-python OCRFlow/examples/train_markovian.py \
-    --dataset_type fineweb \
-    --train_data /share/project/xiyan/huggingface/HuggingFaceFW/fineweb-edu \
-    --server_url http://localhost:8010 \
-    --cache_dir ./vistok_cache \
-    --output_dir ./checkpoints/markovian_fineweb \
-    --model_size large \
-    --batch_size 32 \
-    --gradient_accumulation_steps 4 \
-    --learning_rate 2e-4 \
-    --use_amp \
-    --max_steps 50000
+# 1. Check Python environment
+python --version  # Should be 3.10+
+
+# 2. Check PyTorch and CUDA
+python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}')"
+
+# 3. Check Vello renderer
+python -c "from Renderer import VelloRenderer; print('Vello: OK')"
+
+# 4. Check vision encoder
+python -c "from OCRInfer.encoder.dpsk_ocr_encoder import DPSKOCREncoder; print('Encoder: OK')"
 ```
 
-## Architectures
+### Common Issues
 
-### 1. BERT (Bidirectional) - for Understanding
-
-```
-Input: Text → DeepSeek OCR → Visual Tokens [111, 1280]
-       ↓
-Mask 15% randomly → [111, 1280]
-       ↓
-BERT Transformer (bidirectional attention)
-       ↓
-Output: Reconstructed Visual Tokens [111, 1280]
-       ↓
-Loss: MSE on masked positions
+**Vello renderer not found:**
+```bash
+cd ../Renderer
+maturin develop --release
 ```
 
-### 2. Markovian Decoder (Autoregressive) - for Generation
-
-```
-Input: Text → DeepSeek OCR → Visual Tokens [111, 1280]
-       ↓
-Input: [v1, v2, ..., vN-1]
-Target: [v2, v3, ..., vN]
-       ↓
-GPT Transformer (causal attention)
-       ↓
-Output: Next Token Predictions [110, 1280]
-       ↓
-Loss: MSE on next-token prediction
+**CJK characters show as boxes:**
+```bash
+sudo apt-get install -y fonts-noto-cjk
+cd utils/vello_renderer && maturin develop --release
 ```
 
-**Model Sizes (both architectures):**
-- **base**: 768 hidden, 12 layers, ~150M params
-- **large**: 1024 hidden, 24 layers, ~305M params
-- **xl**: 1280 hidden, 32 layers, ~550M params
+**Training OOM (Out of Memory):**
+```python
+# Reduce batch sizes in examples/train.py
+ENCODE_BATCH_SIZE = 12  # Default: 24 (optimal)
+TRAIN_BATCH_SIZE = 8   # Default: 16
+CACHE_SIZE = 25000     # Default: 50000
+```
 
-## Training Features
+**torch.compile warmup taking too long (first run):**
+- Expected: 1-3 minutes per GPU (one-time)
+- If hanging > 5 minutes, check CUDA compatibility and GPU memory
+- Subsequent runs will be instant (0s warmup)
 
-### GPT-Style Best Practices
-
-1. **Large Effective Batch Sizes**
-   - Use gradient accumulation: `--gradient_accumulation_steps 4`
-   - Effective batch: 32 × 4 = 128 samples
-
-2. **Cosine LR Schedule**
-   - Warmup: 5% of total steps (adjustable)
-   - Decay to 10% of peak LR
-   - `--warmup_ratio 0.05 --min_lr_ratio 0.1`
-
-3. **GPT-Style Optimizer**
-   - AdamW with β2=0.95 (not 0.999)
-   - Weight decay: 0.1
-   - `--beta2 0.95 --weight_decay 0.1`
-
-4. **Mixed Precision Training**
-   - BF16/FP16 automatic mixed precision
-   - `--use_amp`
-
-5. **Masked Token Prediction**
-   - BERT-style 15% masking
-   - `--use_masking --mask_ratio 0.15`
-
-## Dataset Support
-
-### 1. FineWeb-Edu (Recommended for Large-Scale Training)
+### Monitor Training
 
 ```bash
-python OCRFlow/examples/train.py \
-    --dataset_type fineweb \
-    --train_data /path/to/fineweb-edu \
-    --cache_dir ./vistok_cache \
-    --min_tokens 100 \
-    --max_tokens 1200 \
-    --max_steps 100000
+# Watch GPU utilization
+watch -n 1 nvidia-smi
+
+# Check training logs
+tail -f logs/training_*.log
+
+# Check encoder throughput (should see ~297 pairs/s per encoder)
+grep "pairs/s" logs/training_*.log
+
+# Verify Vello is being used
+grep "Vello renderer" logs/training_*.log
 ```
 
-**Features:**
-- Streaming from parquet files (memory efficient)
-- Automatic caching of visual tokens
-- Filters by text length (curriculum learning)
-- High-quality educational web content
-
-### 2. Custom Text Dataset
+## Benchmarking
 
 ```bash
-python OCRFlow/examples/train.py \
-    --dataset_type vistok \
-    --train_data ./data/train \
-    --val_data ./data/val
+# Benchmark renderers (see Renderer/ module at repo root)
+python ../Renderer/benchmark_renderers.py
+
+# Expected output:
+# Vello Renderer: 1,565 img/s (GPU)
+# Skia Renderer: 778 img/s (CPU)
+# PIL Renderer: 130 img/s (CPU)
 ```
-
-**Format:** Place `.jsonl` file or `.txt` files in data directory:
-```json
-{"text": "Your text content here..."}
-{"text": "Another document..."}
-```
-
-## Training Arguments
-
-### Dataset
-- `--dataset_type`: `fineweb` or `vistok`
-- `--train_data`: Path to training data
-- `--server_url`: DeepSeek OCR server URL (default: `http://localhost:8010`)
-- `--cache_dir`: Cache directory for visual tokens
-
-### Model
-- `--model_size`: `base`, `large`, or `xl`
-- `--use_masking`: Enable BERT-style masked prediction
-- `--mask_ratio`: Masking ratio (default: 0.15)
-
-### Training
-- `--batch_size`: Batch size per GPU (default: 32)
-- `--gradient_accumulation_steps`: Accumulation steps (default: 4)
-- `--learning_rate`: Peak LR (default: 2e-4)
-- `--weight_decay`: Weight decay (default: 0.1)
-- `--beta2`: Adam beta2 (default: 0.95)
-- `--warmup_ratio`: Warmup fraction (default: 0.05)
-- `--num_epochs`: Training epochs (default: 10)
-- `--max_steps`: Max steps (overrides epochs)
-- `--use_amp`: Enable mixed precision
-
-### System
-- `--output_dir`: Output directory
-- `--resume_from`: Resume from checkpoint
-- `--save_every`: Save checkpoint every N steps (default: 1000)
-- `--log_every`: Log metrics every N steps (default: 100)
-
-## Inference
-
-```bash
-python OCRFlow/examples/infer_bert_baseline.py \
-    --checkpoint ./checkpoints/final_model.pt \
-    --text "# Test Document\n\nSample text for reconstruction." \
-    --server_url http://localhost:8010 \
-    --model_size large
-```
-
-## Performance Tips
-
-1. **Enable Caching**: Always use `--cache_dir` to avoid repeated server calls
-2. **Increase Batch Size**: Use gradient accumulation for larger effective batches
-3. **Mixed Precision**: Use `--use_amp` for faster training
-4. **FineWeb Streaming**: For large-scale training, FineWeb streams data efficiently
 
 ## File Structure
 
 ```
 OCRFlow/
-├── models/
-│   └── bert_baseline.py          # BERT model implementation
-├── training/
-│   ├── vistok_dataset.py         # Pre-converted vistok dataset
-│   └── fineweb_dataset.py        # FineWeb-Edu streaming dataset
+├── README.md                      # This file
+├── SETUP.md                       # Vello renderer setup guide
 ├── examples/
-│   ├── train.py                  # Unified training script
-│   └── infer_bert_baseline.py   # Inference script
-└── README.md                     # This file
+│   └── train.py                   # Main training script
+├── training/
+│   ├── rolling_cache_dataset.py   # Dataset with rolling cache
+│   ├── mar_diffusion.py           # MAR training with diffusion loss
+│   └── diffloss.py                # Diffusion loss module
+├── utils/
+│   └── image_augmentation.py      # Document-style augmentation
+├── scripts/
+│   ├── precompute_vistok.py       # Offline vistok cache builder (optional)
+│   ├── prepare_text_data.py       # HF text download helpers (optional)
+│   └── start_training.sh          # tmux training launcher
+└── requirements.txt               # Python dependencies
+
+Note: All renderers (Vello/Skia/PIL) are in ../Renderer/ module at repo root
 ```
 
-## How It Works
+## Performance Optimization
 
-### Training Pipeline
+### 1. Use Vello Renderer (12x faster)
 
-```
-FineWeb-Edu Text
-    ↓
-Filter by length (100-1200 tokens)
-    ↓
-DeepSeek OCR Server:8010
-    ↓ /text-to-vistok
-Visual Tokens [111, 1280]
-    ↓ Cache to disk
-BERT Model
-    ↓
-Reconstructed Tokens
-    ↓
-MSE Loss (masked or full)
-```
+See [SETUP.md](SETUP.md) for installation instructions.
 
-### Visual Token Format
+### 2. Encoder Throughput
 
-- **Input shape**: `[111, 1280]` per chunk
-- **111 tokens**: 100 visual + 10 newline + 1 separator
-- **1280 dims**: DeepSeek OCR projection dimension
-- **~1000 text tokens** → 1 visual chunk (111 tokens)
+OCRFlow uses the OCRInfer `DPSKOCREncoder` directly for text→vistok. If you
+need higher throughput, precompute vistok caches with
+`scripts/precompute_vistok.py` and train from disk.
 
-## Text Rendering Settings (FastBatchRenderer)
+### 3. Optimize GPU Allocation
 
-For Markovian training with 50-900 words per image on 640x640:
-
-### Validated OCR Roundtrip Settings
-
-| Words | Max Font Size | OCR Accuracy |
-|-------|---------------|--------------|
-| 900 | 9 | 97.3% |
-| 500 | 10 | 98%+ |
-| 200 | 14 | 98%+ |
-
-**OCR Prompt**: Always use `<image>\nTranscribe the text in the image.`
-
-### Key Findings
-
-1. **Maximum font size for 900 words on 640x640**: Font size 9
-   - 57 lines needed, 60 max lines available
-   - Text remains readable for OCR
-
-2. **OCR Prompt**: `<image>\nTranscribe the text in the image.`
-   - Achieves 97.3% word accuracy on 900-word images
-   - Produces correct word count (no hallucination)
-   - "Free OCR" prompt hallucinates on dense text (>500 words) - DO NOT USE
-
-3. **Adaptive Font Sizing**: `FastBatchRenderer` with `adaptive=True`:
-   - Automatically calculates font size to fit all content
-   - Range: min_font_size=9 to max_font_size=24
-   - For 900 words: automatically selects font 9
-
-### Usage Example
-
+Use 7 encoder GPUs + 1 training GPU for ~91% training GPU utilization:
 ```python
-from OCRFlow.utils.ultra_fast_renderer import UltraFastRenderer, render_to_pil
-
-# High-throughput batch rendering (200+ img/s with 16 workers)
-renderer = UltraFastRenderer(num_workers=16, min_font_size=9, max_font_size=20)
-images = renderer.render_batch_pil(texts)  # List[PIL.Image]
-
-# Single image rendering
-img = render_to_pil(text, min_font_size=9, max_font_size=20)
-
-# With prefetching for pipelined training
-from OCRFlow.utils.ultra_fast_renderer import PrefetchingRenderer
-prefetch_renderer = PrefetchingRenderer(num_workers=16)
-prefetch_renderer.start(first_batch)
-for next_batch in batches:
-    images = prefetch_renderer.get_and_prefetch(next_batch)
-    # GPU encodes while next batch renders
+ENCODER_GPUS = [1, 2, 3, 4, 5, 6, 7]
+TRAINING_GPU = 0
 ```
 
-### Renderer Performance
+### 4. Tune Batch Sizes
 
-| Renderer | Workers | Rate | Use Case |
-|----------|---------|------|----------|
-| FastBatchRenderer | 8 | ~124 img/s | Default |
-| UltraFastRenderer | 8 | ~131 img/s | Optimized |
-| UltraFastRenderer | 16 | **~213 img/s** | High throughput |
-
-VisionEncoderOnly uses UltraFastRenderer by default for maximum throughput.
-
-## Why This Approach?
-
-1. **Leverage Large Text Corpora**: Train on billions of text tokens (FineWeb-Edu, etc.)
-2. **Simple Baseline**: BERT is simpler than diffusion/flow models
-3. **Fast Training**: 305M params, trains in hours not days
-4. **Proven Practices**: GPT-style training works well
-5. **Scalable**: Text-only datasets are abundant
-
-## Next Steps
-
-After training the BERT baseline:
-
-1. **Evaluate** reconstruction quality
-2. **Compare** with MMDiT + Sana/Qwen approaches
-3. **Scale up** model size or training data
-4. **Fine-tune** on downstream tasks
-
-## Citation
-
-If you use OCRFlow, please cite DeepSeek-OCR:
-
-```bibtex
-@article{wei2025deepseek,
-  title={DeepSeek-OCR: Contexts Optical Compression},
-  author={Wei, Haoran and Sun, Yaofeng and Li, Yukun},
-  journal={arXiv preprint arXiv:2510.18234},
-  year={2025}
-}
+Balance memory and throughput:
+```python
+ENCODE_BATCH_SIZE = 24  # Per encoder GPU (optimal: 329 img/s on H100)
+TRAIN_BATCH_SIZE = 16   # Training GPU
 ```
+
+## Support
+
+For help:
+1. Check [SETUP.md](SETUP.md) for Vello renderer installation
+2. Review [Troubleshooting](#troubleshooting) section
+3. Run diagnostic commands above
+4. Check logs in `logs/`
+
+---
+
+**Version:** 1.0.0
+**Last Updated:** 2025-12-05

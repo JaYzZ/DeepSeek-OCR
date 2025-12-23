@@ -19,16 +19,9 @@ from typing import Optional, Tuple
 import sys
 import os
 
-# Add DeepSeek OCR path
-deepseek_vllm_path = os.path.join(
-    os.path.dirname(__file__),
-    "../../DeepSeek-OCR-master/DeepSeek-OCR-vllm"
-)
-sys.path.insert(0, os.path.abspath(deepseek_vllm_path))
-
-from deepencoder.sam_vary_sdpa import build_sam_vit_b
-from deepencoder.clip_sdpa import build_clip_l
-from deepencoder.build_linear import MlpProjector
+from OCRInfer.encoder.sam_vary_sdpa import build_sam_vit_b
+from OCRInfer.encoder.clip_sdpa import build_clip_l
+from OCRInfer.encoder.build_linear import MlpProjector
 from addict import Dict
 
 

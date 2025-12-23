@@ -1,11 +1,55 @@
 """
-Text Rendering Utilities
-Render text chunks as images for vision encoder processing
+Text Rendering Utilities for DeepSeek-OCR Server
+
+Provides high-performance text-to-image rendering with automatic backend selection:
+- Vello GPU renderer (~1565 img/s) - Primary if available
+- Skia renderer (~778 img/s) - Secondary fallback
+- PIL fallback (~130 img/s) - Last resort
+
+The Renderer module handles backend selection and fallback logic.
 """
 
-import textwrap
-from typing import Tuple
-from PIL import Image, ImageDraw, ImageFont
+import logging
+from typing import Tuple, Optional
+from PIL import Image
+
+# Try to use the Renderer module (with GPU acceleration and Skia fallback)
+try:
+    from Renderer import VelloRenderer, VELLO_AVAILABLE
+    RENDERER_AVAILABLE = True
+except ImportError:
+    RENDERER_AVAILABLE = False
+    VELLO_AVAILABLE = False
+
+try:
+    from Renderer import render_text_skia_pil, SKIA_AVAILABLE
+except ImportError:
+    SKIA_AVAILABLE = False
+    render_text_skia_pil = None
+
+logger = logging.getLogger(__name__)
+
+# Global renderer instance (lazy-loaded)
+_renderer_instance = None
+
+
+def _get_renderer(width: int = 640, height: int = 640):
+    """Get or create the global renderer instance"""
+    global _renderer_instance
+
+    if not RENDERER_AVAILABLE:
+        logger.debug("Renderer module not available, using PIL fallback")
+        return None
+
+    if _renderer_instance is None:
+        try:
+            _renderer_instance = VelloRenderer(width=width, height=height)
+            logger.info(f"✓ Initialized Vello GPU renderer: {_renderer_instance}")
+        except Exception as e:
+            logger.warning(f"Failed to initialize GPU renderer: {e}")
+            _renderer_instance = None
+
+    return _renderer_instance
 
 
 def render_text_to_image(
@@ -21,8 +65,66 @@ def render_text_to_image(
     """
     Render text as a document-style image
 
+    Uses best available renderer: Vello GPU → Skia → PIL.
+
     Args:
         text: Text content to render (600-1300 words recommended)
+        width: Image width in pixels
+        height: Image height in pixels
+        font_size: Font size (only used for PIL fallback)
+        padding: Padding around text (used by Skia and PIL)
+        line_spacing: Additional spacing between lines (only used for PIL fallback)
+        bg_color: Background color RGB tuple (PIL fallback only)
+        text_color: Text color RGB tuple (PIL fallback only)
+
+    Returns:
+        PIL Image with rendered text
+    """
+    # Try GPU-accelerated Vello renderer first
+    renderer = _get_renderer(width, height)
+    if renderer is not None:
+        try:
+            return renderer.render_batch_pil([text])[0]
+        except Exception as e:
+            logger.warning(f"Vello GPU renderer failed: {e}, trying Skia...")
+
+    # Try Skia renderer second
+    if SKIA_AVAILABLE and render_text_skia_pil is not None:
+        try:
+            logger.info("Using Skia renderer")
+            return render_text_skia_pil(text, width=width, height=height, padding=padding)
+        except Exception as e:
+            logger.warning(f"Skia renderer failed: {e}, falling back to PIL")
+
+    # Fallback to PIL (always available)
+    logger.info("Using PIL renderer (last resort)")
+    return _render_text_pil(
+        text=text,
+        width=width,
+        height=height,
+        font_size=font_size,
+        padding=padding,
+        line_spacing=line_spacing,
+        bg_color=bg_color,
+        text_color=text_color,
+    )
+
+
+def _render_text_pil(
+    text: str,
+    width: int = 640,
+    height: int = 640,
+    font_size: int = 20,
+    padding: int = 30,
+    line_spacing: int = 6,
+    bg_color: Tuple[int, int, int] = (255, 255, 255),
+    text_color: Tuple[int, int, int] = (0, 0, 0),
+) -> Image.Image:
+    """
+    Render text using PIL (fallback implementation)
+
+    Args:
+        text: Text content to render
         width: Image width in pixels
         height: Image height in pixels
         font_size: Font size
@@ -34,6 +136,9 @@ def render_text_to_image(
     Returns:
         PIL Image with rendered text
     """
+    import textwrap
+    from PIL import ImageDraw, ImageFont
+
     # Create image with white background
     image = Image.new('RGB', (width, height), bg_color)
     draw = ImageDraw.Draw(image)
@@ -42,9 +147,10 @@ def render_text_to_image(
     try:
         # Try common system fonts
         font_paths = [
-            "/usr/share/fonts/truetype/lato/Lato-Regular.ttf",  # Available on this system
+            "/usr/share/fonts/truetype/lato/Lato-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
             "/System/Library/Fonts/Helvetica.ttc",
             "C:\\Windows\\Fonts\\arial.ttf",
         ]

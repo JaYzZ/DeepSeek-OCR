@@ -192,14 +192,40 @@ def main():
 
     logger.info(f"Found {len(parquet_files)} parquet files")
 
-    # Initialize encoder
-    logger.info("Initializing vision encoder...")
-    from OCRFlow.utils.vision_encoder import create_vision_encoder
-    encoder = create_vision_encoder(
+    # Initialize encoder + renderer directly.
+    logger.info("Initializing DPSK OCR encoder...")
+    from PIL import Image
+    from OCRInfer.encoder.dpsk_ocr_encoder import DPSKOCREncoder
+    from Renderer.pil_renderer import PILRenderer, render_to_pil
+    try:
+        from Renderer import VelloRenderer  # type: ignore
+    except Exception:
+        VelloRenderer = None
+
+    encoder = DPSKOCREncoder(
         model_path=args.encoder_model,
         device=args.device,
-        num_render_workers=args.num_render_workers,
+        dtype=torch.bfloat16,
     )
+
+    vello = None
+    if VelloRenderer is not None:
+        try:
+            vello = VelloRenderer(width=640, height=640, padding=20)
+            logger.info("Using VelloRenderer for precompute")
+        except Exception:
+            vello = None
+    pil_renderer = None if vello is not None else PILRenderer(
+        width=640, height=640, num_workers=args.num_render_workers
+    )
+
+    def render_texts(texts: List[str]) -> List[Image.Image]:
+        if vello is not None:
+            arrays = vello.render_batch(list(texts))
+            return [Image.fromarray(arr) for arr in arrays]
+        if pil_renderer is not None:
+            return pil_renderer.render_batch_pil(list(texts))
+        return [render_to_pil(t, width=640, height=640) for t in texts]
 
     # Process documents
     logger.info("Processing documents...")
@@ -244,7 +270,8 @@ def main():
             if len(pending_chunks) >= args.batch_size:
                 # Encode batch
                 try:
-                    tokens_list = encoder.encode_texts(pending_chunks, chunk_size=6000)
+                    images = render_texts([t[:6000] for t in pending_chunks])
+                    tokens_list = encoder.encode_images(images, return_global=False, return_local=True)
 
                     # Save each chunk
                     for i, (chunk_text, tokens) in enumerate(zip(pending_chunks, tokens_list)):
@@ -282,7 +309,8 @@ def main():
     # Process remaining chunks
     if pending_chunks:
         try:
-            tokens_list = encoder.encode_texts(pending_chunks, chunk_size=6000)
+            images = render_texts([t[:6000] for t in pending_chunks])
+            tokens_list = encoder.encode_images(images, return_global=False, return_local=True)
 
             for i, (chunk_text, tokens) in enumerate(zip(pending_chunks, tokens_list)):
                 if tokens is None:

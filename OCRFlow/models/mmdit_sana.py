@@ -124,7 +124,7 @@ class MMDiTOCRFlowSANA(nn.Module):
         self.sana_transformer = SanaTransformer2DModel.from_pretrained(
             sana_model_path,
             subfolder="transformer",
-            torch_dtype=torch.float32  # Use float32 for training
+            dtype=torch.float32  # Use float32 for training
         )
 
         # Extract architecture info

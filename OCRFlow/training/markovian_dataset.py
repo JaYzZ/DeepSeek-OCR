@@ -21,7 +21,7 @@ Example:
     Each pair is one training sample for single-step Markovian prediction.
 
 Memory Efficiency:
-- Uses VisionEncoderOnly (~400M params) instead of full model (~7B)
+- Uses DPSKOCREncoder (~400M params) instead of full model (~7B)
 - Saves ~13GB VRAM compared to loading full DeepSeek-OCR
 
 Usage:
@@ -148,7 +148,7 @@ class MarkovianChunkDataset(IterableDataset):
     Each document is split into variable-length chunks, and all consecutive
     pairs (C_i, C_{i+1}) are yielded as training samples.
 
-    Uses memory-efficient VisionEncoderOnly (~400M params) instead of full model (~7B).
+    Uses memory-efficient DPSKOCREncoder (~400M params) instead of full model (~7B).
     """
 
     def __init__(
@@ -164,7 +164,7 @@ class MarkovianChunkDataset(IterableDataset):
         shuffle: bool = True,
         max_samples: Optional[int] = None,
         cache_dir: Optional[str] = None,
-        encode_batch_size: int = 16,
+        encode_batch_size: int = 24,
         num_render_workers: int = 16,  # High parallelism for text rendering
         mixed_length: bool = False,  # Enable mixed-length chunks for short answer capability
     ):
@@ -280,13 +280,43 @@ class MarkovianChunkDataset(IterableDataset):
     def _init_encoder(self):
         """Lazily initialize the encoder"""
         if self.encoder is None:
-            from OCRFlow.utils.vision_encoder import create_vision_encoder
-            logger.info(f"Initializing VisionEncoderOnly on {self.device} with {self.num_render_workers} render workers...")
-            self.encoder = create_vision_encoder(
+            from PIL import Image
+            from OCRInfer.encoder.dpsk_ocr_encoder import DPSKOCREncoder
+            from Renderer.pil_renderer import PILRenderer, render_to_pil
+            try:
+                from Renderer import VelloRenderer  # type: ignore
+            except Exception:
+                VelloRenderer = None
+
+            logger.info(
+                f"Initializing DPSK OCR encoder on {self.device} with {self.num_render_workers} render workers..."
+            )
+            self.encoder = DPSKOCREncoder(
                 model_path=self.model_path,
                 device=self.device,
-                num_render_workers=self.num_render_workers,
+                dtype=torch.bfloat16,
             )
+
+            vello = None
+            if VelloRenderer is not None:
+                try:
+                    vello = VelloRenderer(width=640, height=640, padding=20)
+                    logger.info("MarkovianChunkDataset using VelloRenderer")
+                except Exception:
+                    vello = None
+            pil_renderer = None if vello is not None else PILRenderer(
+                width=640, height=640, num_workers=self.num_render_workers
+            )
+
+            def render_texts(texts: List[str]) -> List[Image.Image]:
+                if vello is not None:
+                    arrays = vello.render_batch(list(texts))
+                    return [Image.fromarray(arr) for arr in arrays]
+                if pil_renderer is not None:
+                    return pil_renderer.render_batch_pil(list(texts))
+                return [render_to_pil(t, width=640, height=640) for t in texts]
+
+            self._render_texts = render_texts
 
     def _encode_chunk(self, chunk_text: str) -> Optional[torch.Tensor]:
         """Encode a single chunk text to visual tokens"""
@@ -301,7 +331,8 @@ class MarkovianChunkDataset(IterableDataset):
         try:
             # Truncate to ~6000 chars (roughly 900 words * 6-7 chars/word)
             truncated = chunk_text[:6000]
-            tensors = self.encoder.encode_texts([truncated], chunk_size=6000)
+            images = self._render_texts([truncated])
+            tensors = self.encoder.encode_images(images, return_global=False, return_local=True)
             if tensors:
                 tensor = tensors[0].cpu()
                 self._save_to_cache(text_hash, tensor)
@@ -330,7 +361,8 @@ class MarkovianChunkDataset(IterableDataset):
         # Encode uncached
         if uncached_texts:
             try:
-                tensors = self.encoder.encode_texts(uncached_texts, chunk_size=6000)
+                images = self._render_texts(uncached_texts)
+                tensors = self.encoder.encode_images(images, return_global=False, return_local=True)
                 for idx, tensor in zip(uncached_indices, tensors):
                     tensor_cpu = tensor.cpu()
                     results[idx] = tensor_cpu
@@ -465,7 +497,7 @@ def create_markovian_dataloader(
     Create dataloader for Markovian chunk training.
 
     Each batch contains (input_chunks, target_chunks) pairs for single-step prediction.
-    Uses memory-efficient VisionEncoderOnly (~400M params) instead of full model (~7B).
+    Uses memory-efficient DPSKOCREncoder (~400M params) instead of full model (~7B).
 
     Args:
         dataset_type: "fineweb", "openwebmath", or "multi"

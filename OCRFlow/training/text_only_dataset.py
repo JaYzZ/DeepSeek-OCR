@@ -13,7 +13,7 @@ import random
 from typing import Optional, Tuple, List
 import torchvision.transforms as T
 
-from OCRFlow.utils.text_rendering import render_text_to_image, render_markdown_to_image
+from Renderer.pil_renderer import render_to_pil
 
 
 class TextOnlyDataset(Dataset):
@@ -136,14 +136,15 @@ class TextOnlyDataset(Dataset):
         # Render text to image
         try:
             if self.use_markdown:
-                img = render_markdown_to_image(
-                    text,
-                    width=self.image_size,
-                    height=self.image_size,
-                    base_font_size=self.font_size,
-                )
+                    # Renderer stack does not special-case markdown; treat as plain text.
+                    img = render_to_pil(
+                        text,
+                        width=self.image_size,
+                        height=self.image_size,
+                        font_size=self.font_size,
+                    )
             else:
-                img = render_text_to_image(
+                img = render_to_pil(
                     text,
                     width=self.image_size,
                     height=self.image_size,
@@ -152,7 +153,7 @@ class TextOnlyDataset(Dataset):
         except Exception as e:
             # Fallback to simple rendering if markdown fails
             print(f"Warning: Rendering failed for sample {idx}, using fallback: {e}")
-            img = render_text_to_image(
+            img = render_to_pil(
                 text,
                 width=self.image_size,
                 height=self.image_size,
