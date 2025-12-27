@@ -31,17 +31,19 @@ TEXT_OCR_INSTRUCTIONS = [
 ]
 
 # Task 3: Image-text matching question templates (variance)
+# Format: (question_template, separator_style)
+# separator_style: 0=newline, 1=space, 2=colon+space
 MATCHING_QUESTIONS = [
-    "Is the text caption correct for the image?",
-    "Does the caption accurately describe the image?",
-    "Is this caption matching the image content?",
-    "Does the text correctly describe what's in the image?",
-    "Is the description appropriate for the image?",
-    "Does this text match the image?",
-    "Is the caption suitable for the image?",
-    "Does the given text describe the image correctly?",
-    "Is this an accurate caption for the image?",
-    "Does the caption align with the image content?",
+    ("Is the following caption correct for the image?", 1),
+    ("Does this caption accurately describe the image?", 1),
+    ("Is this caption matching the image content?", 1),
+    ("Does the text correctly describe what's in the image?", 1),
+    ("Is the description appropriate for the image?", 1),
+    ("Does this text match the image?", 1),
+    ("Caption to verify:", 2),
+    ("Check if this caption is correct:", 1),
+    ("Verify the caption:", 2),
+    ("Is this an accurate description?", 1),
 ]
 
 # Task 3: Positive answer templates (variance)
@@ -67,52 +69,61 @@ NEGATIVE_ANSWERS = [
 ]
 
 
-def create_blip3o_collate_fn(tokenizer, ocr_adapter, task_ratios=(0.4, 0.4, 0.2), seed=42):
+def create_blip3o_collate_fn(tokenizer, ocr_adapter):
     """
-    Create collate function for BLIP3o dataset.
+    Create SIMPLE collate function for BLIP3o dataset - just batch raw samples.
 
-    Task distribution (per batch, not per sample):
-    - Task 1 (40% of batches): Image captioning
-    - Task 2 (40% of batches): Text rendering OCR
-    - Task 3 (20% of batches): Contrastive matching (1 pos + 3 neg per sample → 4x batch size)
+    Task logic is handled in the training loop, NOT here.
 
     Args:
-        tokenizer: Tokenizer for text
-        ocr_adapter: OCR adapter for encoding images/text
-        task_ratios: (Task1, Task2, Task3) probabilities for batch task selection
-        seed: Random seed for reproducibility
+        tokenizer: Tokenizer (not used, kept for compatibility)
+        ocr_adapter: OCR adapter (not used, kept for compatibility)
 
     Returns:
-        Collate function that returns:
-            - input_ids: [batch_size, seq_len]
-            - attention_mask: [batch_size, seq_len]
-            - labels: [batch_size, seq_len]
-            - ocr_image_features: List of (final_feats, deepstack_feats) tuples
-            - task_id: int (1, 2, or 3) for loss tracking
+        Collate function that returns raw batched samples
     """
-    rng = random.Random(seed)
-    batch_counter = [0]  # Mutable counter for deterministic task selection
-
     def collate_fn(batch):
         """
-        Collate function that handles all task-specific formatting.
+        Simple collate: just return the batch as-is.
 
         Input batch: List of {"image": PIL.Image, "caption": str, "source": str}
-        Output batch: {"input_ids", "attention_mask", "labels", "ocr_image_features", "task_id"}
+        Output batch: Same list (no processing)
         """
-        # Determine task for THIS ENTIRE BATCH (not per sample)
-        # Use batch counter for deterministic task selection across epochs
+        return batch
+
+    return collate_fn
+
+
+def create_blip3o_collate_fn_OLD_MOVED_TO_TRAINING(tokenizer, ocr_adapter, task_ratios=(0.4, 0.4, 0.2), seed=42):
+    """
+    OLD VERSION - TASK LOGIC MOVED TO TRAINING LOOP
+
+    This function is kept for reference but should not be used.
+    Task selection and formatting now happens in train_one_epoch().
+    """
+    rng = random.Random(seed)
+    batch_counter = [0]
+
+    def collate_fn(batch):
+        # DEPRECATED - use simple collate above
         batch_counter[0] += 1
         task_seed = seed + batch_counter[0]
         task_rng = random.Random(task_seed)
         task_choice = task_rng.random()
 
-        if task_choice < task_ratios[0]:
-            task = 1  # Image captioning
-        elif task_choice < task_ratios[0] + task_ratios[1]:
-            task = 2  # Text rendering OCR
+        if task_ratios[2] > 0:
+            if task_choice < task_ratios[0]:
+                task = 1
+            elif task_choice < task_ratios[0] + task_ratios[1]:
+                task = 2
+            else:
+                task = 3
         else:
-            task = 3  # Contrastive matching
+            task_1_prob = task_ratios[0] / (task_ratios[0] + task_ratios[1])
+            if task_choice < task_1_prob:
+                task = 1
+            else:
+                task = 2
 
         batch_input_ids = []
         batch_labels = []
@@ -120,7 +131,7 @@ def create_blip3o_collate_fn(tokenizer, ocr_adapter, task_ratios=(0.4, 0.4, 0.2)
 
         if task == 3:
             # Task 3: Contrastive matching - 1 positive + 3 negatives per sample
-            # This creates 4x accumulation to avoid OOM
+            # PURE VISION FORMAT: [Natural image] + [Rendered "{instruction}: {caption}"] -> Yes/No
             for sample in batch:
                 image = sample["image"]
                 pos_caption = sample["caption"]
@@ -139,53 +150,54 @@ def create_blip3o_collate_fn(tokenizer, ocr_adapter, task_ratios=(0.4, 0.4, 0.2)
                         caption_to_use = neg_sample["caption"]
                         answer = task_rng.choice(NEGATIVE_ANSWERS)
 
-                    # Encode real image (no instruction for Task 3)
+                    # Encode natural image (NO text instruction)
                     img_input_ids, img_ocr_features = ocr_adapter.prepare_qwen_inputs_from_images(
-                        instruction="",
+                        instruction="",  # EMPTY - pure vision!
                         images=[image],
                         tokenizer=tokenizer,
                         return_deepstack=True,
                         render_instruction=False
                     )
 
-                    # Encode caption as rendered text (no instruction)
-                    caption_input_ids, caption_ocr_features = ocr_adapter.prepare_qwen_inputs(
-                        instruction="",
-                        dense_text=caption_to_use,
+                    # Encode rendered template with natural formatting
+                    question, sep_style = task_rng.choice(MATCHING_QUESTIONS)
+                    if sep_style == 0:  # newline
+                        template_text = f"{question}\n{caption_to_use}"
+                    elif sep_style == 1:  # space
+                        template_text = f"{question} {caption_to_use}"
+                    else:  # 2: colon+space
+                        template_text = f"{question} {caption_to_use}"
+
+                    template_input_ids, template_ocr_features = ocr_adapter.prepare_qwen_inputs(
+                        instruction="",  # EMPTY - pure vision!
+                        dense_text=template_text,
                         tokenizer=tokenizer,
                         return_deepstack=True,
                         render_instruction=False
                     )
 
-                    # Question (random template)
-                    question = task_rng.choice(MATCHING_QUESTIONS)
-                    question_ids = tokenizer(question, add_special_tokens=False, return_tensors="pt").input_ids.squeeze(0)
-
-                    # Answer
+                    # Answer (text tokens)
                     answer_ids = tokenizer(answer, add_special_tokens=False, return_tensors="pt").input_ids.squeeze(0)
 
-                    # Concatenate: image_tokens + caption_tokens + question_tokens + answer_tokens
+                    # Concatenate: image_vision_tokens + template_vision_tokens + answer_text_tokens
                     full_input_ids = torch.cat([
                         img_input_ids.squeeze(0),
-                        caption_input_ids.squeeze(0),
-                        question_ids,
+                        template_input_ids.squeeze(0),
                         answer_ids
                     ], dim=0)
 
-                    # Combine OCR features from both image and rendered caption
-                    if isinstance(img_ocr_features, tuple) and isinstance(caption_ocr_features, tuple):
-                        # Both have (final_feats, deepstack_feats) format
-                        combined_final = img_ocr_features[0] + caption_ocr_features[0]
-                        combined_deepstack = img_ocr_features[1] + caption_ocr_features[1]
+                    # Combine OCR features from image and template
+                    if isinstance(img_ocr_features, tuple) and isinstance(template_ocr_features, tuple):
+                        combined_final = img_ocr_features[0] + template_ocr_features[0]
+                        combined_deepstack = img_ocr_features[1] + template_ocr_features[1]
                         ocr_features = (combined_final, combined_deepstack)
                     else:
-                        # Fallback (shouldn't happen with return_deepstack=True)
                         ocr_features = img_ocr_features
 
-                    # Labels: mask everything except answer
+                    # Labels: mask vision tokens, predict answer only
                     labels = full_input_ids.clone()
-                    answer_start_idx = len(img_input_ids.squeeze(0)) + len(caption_input_ids.squeeze(0)) + len(question_ids)
-                    labels[:answer_start_idx] = -100  # Mask image + caption + question
+                    vision_token_count = len(img_input_ids.squeeze(0)) + len(template_input_ids.squeeze(0))
+                    labels[:vision_token_count] = -100  # Mask all vision tokens
 
                     batch_input_ids.append(full_input_ids)
                     batch_labels.append(labels)
@@ -193,6 +205,9 @@ def create_blip3o_collate_fn(tokenizer, ocr_adapter, task_ratios=(0.4, 0.4, 0.2)
 
         elif task == 1:
             # Task 1: Image captioning
+            # PURE VISION FORMAT: Randomly choose instruction position
+            # Type 1: [Natural image] + [Rendered instruction] -> Caption
+            # Type 2: [Rendered instruction] + [Natural image] -> Caption
             for sample in batch:
                 image = sample["image"]
                 caption = sample["caption"]
@@ -200,24 +215,76 @@ def create_blip3o_collate_fn(tokenizer, ocr_adapter, task_ratios=(0.4, 0.4, 0.2)
                 # Random instruction template
                 instruction = task_rng.choice(IMAGE_CAPTION_INSTRUCTIONS)
 
-                # Encode image with instruction rendered as vision tokens
-                input_ids, ocr_features = ocr_adapter.prepare_qwen_inputs_from_images(
-                    instruction=instruction,
+                # Encode natural image (NO text instruction)
+                img_input_ids, img_ocr_features = ocr_adapter.prepare_qwen_inputs_from_images(
+                    instruction="",  # EMPTY - pure vision!
                     images=[image],
                     tokenizer=tokenizer,
                     return_deepstack=True,
-                    render_instruction=True  # Render instruction as image
+                    render_instruction=False
                 )
 
-                # Target caption
+                # Encode rendered instruction as vision tokens
+                inst_input_ids, inst_ocr_features = ocr_adapter.prepare_qwen_inputs(
+                    instruction="",  # EMPTY - pure vision!
+                    dense_text=instruction,
+                    tokenizer=tokenizer,
+                    return_deepstack=True,
+                    render_instruction=False
+                )
+
+                # Target caption (text tokens)
                 response_ids = tokenizer(caption, add_special_tokens=False, return_tensors="pt").input_ids.squeeze(0)
 
-                # Concatenate: vision_tokens + response_tokens
-                full_input_ids = torch.cat([input_ids.squeeze(0), response_ids], dim=0)
+                # Qwen3-VL chat tokens: <|im_start|>user\n ... <|im_end|>\n<|im_start|>assistant\n
+                user_start_ids = torch.tensor([151644, 872, 198], dtype=torch.long)  # <|im_start|>user\n
+                user_end_ids = torch.tensor([151645, 198], dtype=torch.long)         # <|im_end|>\n
+                assistant_start_ids = torch.tensor([151644, 77091, 198], dtype=torch.long)  # <|im_start|>assistant\n
 
-                # Labels: mask vision tokens, predict caption
+                # Random ordering: instruction first (50%) or last (50%)
+                instruction_first = task_rng.random() < 0.5
+
+                if instruction_first:
+                    # Type 1: <|im_start|>user\n[Instruction][Image]<|im_end|>\n<|im_start|>assistant\n[Caption]
+                    full_input_ids = torch.cat([
+                        user_start_ids,
+                        inst_input_ids.squeeze(0),
+                        img_input_ids.squeeze(0),
+                        user_end_ids,
+                        assistant_start_ids,
+                        response_ids
+                    ], dim=0)
+                    # Combine OCR features: instruction first
+                    if isinstance(img_ocr_features, tuple) and isinstance(inst_ocr_features, tuple):
+                        combined_final = inst_ocr_features[0] + img_ocr_features[0]
+                        combined_deepstack = inst_ocr_features[1] + img_ocr_features[1]
+                        ocr_features = (combined_final, combined_deepstack)
+                    else:
+                        ocr_features = inst_ocr_features
+                else:
+                    # Type 2: <|im_start|>user\n[Image][Instruction]<|im_end|>\n<|im_start|>assistant\n[Caption]
+                    full_input_ids = torch.cat([
+                        user_start_ids,
+                        img_input_ids.squeeze(0),
+                        inst_input_ids.squeeze(0),
+                        user_end_ids,
+                        assistant_start_ids,
+                        response_ids
+                    ], dim=0)
+                    # Combine OCR features: image first
+                    if isinstance(img_ocr_features, tuple) and isinstance(inst_ocr_features, tuple):
+                        combined_final = img_ocr_features[0] + inst_ocr_features[0]
+                        combined_deepstack = img_ocr_features[1] + inst_ocr_features[1]
+                        ocr_features = (combined_final, combined_deepstack)
+                    else:
+                        ocr_features = img_ocr_features
+
+                # Labels: mask vision tokens + chat tokens, predict caption only
                 labels = full_input_ids.clone()
-                labels[:len(input_ids.squeeze(0))] = -100
+                # Mask: user_start (3) + vision_tokens + user_end (2) + assistant_start (3)
+                vision_token_count = len(img_input_ids.squeeze(0)) + len(inst_input_ids.squeeze(0))
+                chat_and_vision_count = 3 + vision_token_count + 2 + 3  # Total tokens before caption
+                labels[:chat_and_vision_count] = -100  # Mask everything before caption
 
                 batch_input_ids.append(full_input_ids)
                 batch_labels.append(labels)
@@ -225,30 +292,85 @@ def create_blip3o_collate_fn(tokenizer, ocr_adapter, task_ratios=(0.4, 0.4, 0.2)
 
         else:  # task == 2
             # Task 2: Text rendering OCR
+            # PURE VISION FORMAT: Randomly choose instruction position
+            # Type 1: [Rendered caption] + [Rendered instruction] -> Caption
+            # Type 2: [Rendered instruction] + [Rendered caption] -> Caption
             for sample in batch:
                 caption = sample["caption"]
 
                 # Random instruction template
                 instruction = task_rng.choice(TEXT_OCR_INSTRUCTIONS)
 
-                # Encode rendered text with instruction as vision tokens
-                input_ids, ocr_features = ocr_adapter.prepare_qwen_inputs(
-                    instruction=instruction,
+                # Encode rendered caption as vision tokens (NO text instruction)
+                caption_input_ids, caption_ocr_features = ocr_adapter.prepare_qwen_inputs(
+                    instruction="",  # EMPTY - pure vision!
                     dense_text=caption,
                     tokenizer=tokenizer,
                     return_deepstack=True,
-                    render_instruction=True  # Render instruction as image
+                    render_instruction=False
                 )
 
-                # Target: same caption
+                # Encode rendered instruction as vision tokens
+                inst_input_ids, inst_ocr_features = ocr_adapter.prepare_qwen_inputs(
+                    instruction="",  # EMPTY - pure vision!
+                    dense_text=instruction,
+                    tokenizer=tokenizer,
+                    return_deepstack=True,
+                    render_instruction=False
+                )
+
+                # Target: same caption (text tokens)
                 response_ids = tokenizer(caption, add_special_tokens=False, return_tensors="pt").input_ids.squeeze(0)
 
-                # Concatenate: vision_tokens + response_tokens
-                full_input_ids = torch.cat([input_ids.squeeze(0), response_ids], dim=0)
+                # Qwen3-VL chat tokens: <|im_start|>user\n ... <|im_end|>\n<|im_start|>assistant\n
+                user_start_ids = torch.tensor([151644, 872, 198], dtype=torch.long)  # <|im_start|>user\n
+                user_end_ids = torch.tensor([151645, 198], dtype=torch.long)         # <|im_end|>\n
+                assistant_start_ids = torch.tensor([151644, 77091, 198], dtype=torch.long)  # <|im_start|>assistant\n
 
-                # Labels: mask vision tokens, predict caption
+                # Random ordering: instruction first (50%) or last (50%)
+                instruction_first = task_rng.random() < 0.5
+
+                if instruction_first:
+                    # Type 1: <|im_start|>user\n[Instruction][Caption]<|im_end|>\n<|im_start|>assistant\n[Response]
+                    full_input_ids = torch.cat([
+                        user_start_ids,
+                        inst_input_ids.squeeze(0),
+                        caption_input_ids.squeeze(0),
+                        user_end_ids,
+                        assistant_start_ids,
+                        response_ids
+                    ], dim=0)
+                    # Combine OCR features: instruction first
+                    if isinstance(caption_ocr_features, tuple) and isinstance(inst_ocr_features, tuple):
+                        combined_final = inst_ocr_features[0] + caption_ocr_features[0]
+                        combined_deepstack = inst_ocr_features[1] + caption_ocr_features[1]
+                        ocr_features = (combined_final, combined_deepstack)
+                    else:
+                        ocr_features = inst_ocr_features
+                else:
+                    # Type 2: <|im_start|>user\n[Caption][Instruction]<|im_end|>\n<|im_start|>assistant\n[Response]
+                    full_input_ids = torch.cat([
+                        user_start_ids,
+                        caption_input_ids.squeeze(0),
+                        inst_input_ids.squeeze(0),
+                        user_end_ids,
+                        assistant_start_ids,
+                        response_ids
+                    ], dim=0)
+                    # Combine OCR features: caption first
+                    if isinstance(caption_ocr_features, tuple) and isinstance(inst_ocr_features, tuple):
+                        combined_final = caption_ocr_features[0] + inst_ocr_features[0]
+                        combined_deepstack = caption_ocr_features[1] + inst_ocr_features[1]
+                        ocr_features = (combined_final, combined_deepstack)
+                    else:
+                        ocr_features = caption_ocr_features
+
+                # Labels: mask vision tokens + chat tokens, predict caption only
                 labels = full_input_ids.clone()
-                labels[:len(input_ids.squeeze(0))] = -100
+                # Mask: user_start (3) + vision_tokens + user_end (2) + assistant_start (3)
+                vision_token_count = len(caption_input_ids.squeeze(0)) + len(inst_input_ids.squeeze(0))
+                chat_and_vision_count = 3 + vision_token_count + 2 + 3  # Total tokens before caption
+                labels[:chat_and_vision_count] = -100  # Mask everything before caption
 
                 batch_input_ids.append(full_input_ids)
                 batch_labels.append(labels)

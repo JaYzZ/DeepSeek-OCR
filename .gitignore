@@ -20,6 +20,7 @@ assets/
 # Output directories
 outputs/
 **/outputs/
+**/results/
 
 # Log files
 *.log

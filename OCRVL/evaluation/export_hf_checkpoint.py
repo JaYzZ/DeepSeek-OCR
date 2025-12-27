@@ -73,10 +73,18 @@ def export_ocrvl_to_hf(
     import sys
     sys.path.insert(0, str(checkpoint_path.parent.parent.parent))
     from OCRVL.model.language_model.ocr_qwen3_vl import OCRQwen3VLForConditionalGeneration
+    from transformers import AutoProcessor
 
     model = OCRQwen3VLForConditionalGeneration.from_pretrained(
         str(base_model_path),
         torch_dtype=torch.bfloat16,
+        trust_remote_code=True
+    )
+
+    # Load processor (includes tokenizer with chat_template)
+    print("Loading processor from base model...")
+    processor = AutoProcessor.from_pretrained(
+        str(base_model_path),
         trust_remote_code=True
     )
 
@@ -103,22 +111,10 @@ def export_ocrvl_to_hf(
         safe_serialization=True,  # Use safetensors format
     )
 
-    # Copy tokenizer and processor files
-    print("Copying tokenizer and processor files...")
-    files_to_copy = [
-        "tokenizer_config.json",
-        "tokenizer.json",
-        "special_tokens_map.json",
-        "preprocessor_config.json",
-        "merges.txt",
-        "vocab.json",
-    ]
-
-    for filename in files_to_copy:
-        src = base_model_path / filename
-        if src.exists():
-            shutil.copy(src, output_path / filename)
-            print(f"  ✓ Copied {filename}")
+    # Save processor (this includes tokenizer with chat_template)
+    print("Saving processor...")
+    processor.save_pretrained(str(output_path))
+    print("  ✓ Saved processor with chat_template")
 
     # Save metadata
     metadata = {

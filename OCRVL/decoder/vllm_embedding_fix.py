@@ -59,7 +59,7 @@ def apply_vllm_embedding_fix():
 
                 # FIX 4: Validate embedding dimensions match expected format
                 # vLLM expects [seq_len, hidden_size * (1 + deepstack_levels)]
-                expected_hidden_size = self.visual.merger.d_model * (1 + len(self.visual.deepstack_visual_indexes))
+                expected_hidden_size = self.visual.merger.hidden_size * (1 + len(self.visual.deepstack_visual_indexes))
                 if image_embeds.shape[-1] != expected_hidden_size:
                     logger.warning(
                         f"Embedding dimension mismatch: got {image_embeds.shape[-1]}, "
