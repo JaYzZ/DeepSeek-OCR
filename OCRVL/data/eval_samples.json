@@ -1,0 +1,100 @@
+[
+  {
+    "id": "counting_001",
+    "image_path": "coco/train2017/000000000009.jpg",
+    "question": "How many people are visible in this image?",
+    "answer": "There are people visible in the image.",
+    "category": "counting",
+    "difficulty": "easy"
+  },
+  {
+    "id": "spatial_001",
+    "image_path": "coco/train2017/000000000025.jpg",
+    "question": "What objects are in the foreground of this image?",
+    "answer": "The image shows objects in the foreground.",
+    "category": "spatial_relationship",
+    "difficulty": "medium"
+  },
+  {
+    "id": "action_001",
+    "image_path": "coco/train2017/000000000030.jpg",
+    "question": "What is happening in this image?",
+    "answer": "The image shows a scene with activity.",
+    "category": "action_recognition",
+    "difficulty": "easy"
+  },
+  {
+    "id": "reasoning_001",
+    "image_path": "coco/train2017/000000000034.jpg",
+    "question": "What might be the purpose of this scene?",
+    "answer": "This appears to be a functional space.",
+    "category": "reasoning",
+    "difficulty": "hard"
+  },
+  {
+    "id": "object_detail_001",
+    "image_path": "coco/train2017/000000000036.jpg",
+    "question": "Describe the main object in this image.",
+    "answer": "The main object has distinct features.",
+    "category": "object_description",
+    "difficulty": "medium"
+  },
+  {
+    "id": "scene_001",
+    "image_path": "coco/train2017/000000000042.jpg",
+    "question": "What type of setting is this?",
+    "answer": "This is a specific type of setting.",
+    "category": "scene_understanding",
+    "difficulty": "easy"
+  },
+  {
+    "id": "attribute_001",
+    "image_path": "coco/train2017/000000000049.jpg",
+    "question": "What are the main colors in this image?",
+    "answer": "The image contains various colors.",
+    "category": "attribute",
+    "difficulty": "easy"
+  },
+  {
+    "id": "multi_object_001",
+    "image_path": "coco/train2017/000000000061.jpg",
+    "question": "What different objects can you identify?",
+    "answer": "There are multiple objects visible.",
+    "category": "multi_object",
+    "difficulty": "medium"
+  },
+  {
+    "id": "comparison_001",
+    "image_path": "coco/train2017/000000000064.jpg",
+    "question": "Compare the sizes of objects in this image.",
+    "answer": "The objects have different relative sizes.",
+    "category": "comparison",
+    "difficulty": "medium"
+  },
+  {
+    "id": "temporal_001",
+    "image_path": "coco/train2017/000000000071.jpg",
+    "question": "What time of day does this appear to be?",
+    "answer": "The lighting suggests a specific time of day.",
+    "category": "temporal_reasoning",
+    "difficulty": "hard"
+  },
+  {
+    "id": "ocr_doclaynet_000",
+    "image_path": "docling-project/DocLayNet/PNG/c6effb847ae7e4a80431696984fa90c98bb08c266481b9a03842422459c43bdd.png",
+    "question": "Read the text:",
+    "answer": "NOTES TO THE FINANCIAL STATEMENTS Finance receivables that originated outside the U.S. were $52.7 billion and $47.5 billion at December 31, 2004 and 2003, respectively. Other finance receivables consi...",
+    "category": "document_ocr",
+    "difficulty": "medium",
+    "doc_category": "financial_reports"
+  },
+  {
+    "id": "ocr_doclaynet_001",
+    "image_path": "docling-project/DocLayNet/PNG/f446422ed85e300319d3aff929762b8527cbc9ec26f55703b36df3e7447cc2d5.png",
+    "question": "Read the text:",
+    "answer": "While the success of the Grand Theft attention to detail and ability to recognize Auto franchise is extremely rewarding, what makes games compelling. creating a blockbuster of this magnitude Rockstar'...",
+    "category": "document_ocr",
+    "difficulty": "medium",
+    "doc_category": "financial_reports"
+  }
+]

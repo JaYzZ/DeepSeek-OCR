@@ -83,10 +83,11 @@ print(tokenizer.decode(out[0], skip_special_tokens=True))
 
 ## Training Pipeline
 
-OCRVL provides two-stage training:
+OCRVL provides three-stage training:
 
 1. **Stage 1: Alignment** - Train connectors on BLIP3o captioning dataset
 2. **Stage 2: Instruction Tuning** - Train on LLaVA-Instruct-150K for VQA
+3. **Stage 3: Thinking Training** - Train thinking projection for Chain-of-Thought reasoning
 
 ### Stage 1: Connector Alignment
 
@@ -165,6 +166,95 @@ RENDER=0 \
 
 **Output:** `OCRVL/checkpoints/alignment_llava_YYYYMMDD_HHMMSS/step_N/`
 
+### Stage 3: Thinking Training
+
+Train thinking projection MLP for Chain-of-Thought reasoning with latent tokens:
+
+```bash
+# Continue from instruction tuning checkpoint (Stage 2)
+RESUME_CHECKPOINT=OCRVL/checkpoints/llava_20251231_010301/instruction/step_latest \
+  OUTPUT_DIR=OCRVL/checkpoints/thinking_stage3 \
+  NUM_GPUS=4 \
+  GPU_IDS=0,1,2,3 \
+  bash OCRVL/scripts/train_thinking.sh
+
+# Configuration via environment variables:
+# - RESUME_CHECKPOINT: Path to Phase 2 checkpoint (required)
+# - OUTPUT_DIR: Output directory for checkpoints
+# - NUM_GPUS: Number of GPUs (default: 4)
+# - LORA: Use LoRA for LLM (default: 1)
+# - LR: Learning rate (default: 1e-4 for thinking projection)
+# - THINKING_LOSS_WEIGHT: Weight for thinking loss (default: 1.0)
+# - MAX_SAMPLES: Max samples to load (default: 100000)
+# - BATCH_SIZE: Per-GPU batch size (default: 4)
+# - GRAD_ACCUM: Gradient accumulation steps (default: 4)
+
+# Example: Fast testing (1000 samples)
+MAX_SAMPLES=1000 \
+  RESUME_CHECKPOINT=OCRVL/checkpoints/.../step_latest \
+  bash OCRVL/scripts/train_thinking.sh
+
+# Example: Full training (8 GPUs)
+NUM_GPUS=8 \
+  GPU_IDS=0,1,2,3,4,5,6,7 \
+  BATCH_SIZE=8 \
+  RESUME_CHECKPOINT=OCRVL/checkpoints/.../step_latest \
+  bash OCRVL/scripts/train_thinking.sh
+```
+
+**Training Details:**
+- **Dataset**: LLaVA-CoT-100K with `<REASONING>` and `<CONCLUSION>` tags
+- **Dual Loss**: MSE for thinking alignment + CE for answer tokens
+- **New Component**: Thinking projection (hidden_dim 4096 → latent_dim 1280, ~10.5M params)
+- **Architecture**: Maps model hidden states to OCR-encoded latent tokens
+- **Default Setup**: 4 GPUs × 4 batch × 4 accum = 64 effective batch
+- **Training Time**: ~2-3 hours (4 GPUs, 100K samples)
+
+**Hyperparameter Guidelines:**
+
+| Component | Recommended LR | Notes |
+|-----------|---------------|-------|
+| Thinking projection (new) | 1e-4 | Primary trainable component |
+| LoRA adapters | 2e-5 (via alpha/r) | Set via `lora_alpha=128, lora_r=64` |
+
+**Thinking Loss Weight:**
+- `0.5`: Prioritize answer quality (if thinking loss dominates)
+- `1.0`: Balanced (recommended, default)
+- `2.0`: Prioritize thinking alignment (if thinking loss too low)
+
+**Expected Losses:**
+- Initial: `thinking_loss` 0.5-1.0, `answer_loss` 2.0-3.0, `total_loss` 2.5-4.0
+- Converged: `thinking_loss` 0.05-0.15, `answer_loss` 1.0-1.5, `total_loss` 1.05-1.65
+
+**Training Stages Comparison:**
+
+| Stage | Focus | Trainable Params | LR | Data | Time |
+|-------|-------|------------------|-----|------|------|
+| 1. Alignment | OCR Connector | 22M (13M+9M LoRA) | 1e-3 | BLIP3o 5% | 30min |
+| 2. Instruction | Connector + LoRA | 22M | 2e-4 | LLaVA-150K | 2h |
+| 3. Thinking | Thinking Proj + LoRA | 60.5M (10.5M+50M) | 1e-4 | LLaVA-CoT-100K | 2-3h |
+
+**Output:** `OCRVL/checkpoints/thinking_YYYYMMDD_HHMMSS/step_N/`
+- `connectors.pt` - Includes thinking projection weights
+- `lora_adapters/` - LoRA adapters (r=64, alpha=128)
+- `training_state.pt` - Optimizer/scheduler state
+
+**Dataset Format:**
+```json
+{
+  "id": "...",
+  "image": "sqa/train/20839/image.png",
+  "conversations": [
+    {"from": "human", "value": "Question text..."},
+    {"from": "gpt", "value": "<SUMMARY>...</SUMMARY><REASONING>reasoning text</REASONING><CONCLUSION>answer</CONCLUSION>"}
+  ]
+}
+```
+
+The training extracts:
+- **Reasoning** (`<REASONING>` tag) → Rendered + DPSK OCR encoded → Supervision latents
+- **Conclusion** (`<CONCLUSION>` tag) → Answer tokens for CE loss
+
 ### Direct Training (Low-level)
 
 For custom training configurations:
@@ -240,12 +330,12 @@ EVAL_MODEL=gpt-4o \
 
 ### Trainable Components
 
-The model has 3 separate modules:
+The model has 4 separate modules:
 
 1. **OCR Encoder** (DeepSeek-OCR, ~400M params)
    - CLIP ViT (304M) + SAM ViT (89M) + Projector (2.6M)
    - **Frozen during training** (pretrained weights)
-   - Encodes both rendered text and real images to 111×1280 visual tokens
+   - Encodes both rendered text and real images to 100×1280 visual tokens (10×10 grid, no separators)
 
 2. **Connectors** (~13M params)
    - `ocr_connector`: 1280→2048 (final features)
@@ -253,12 +343,44 @@ The model has 3 separate modules:
    - **Always trainable**
    - Maps OCR visual tokens to Qwen3-VL LLM space
 
-3. **Qwen3-VL LLM** (2B params)
-   - **LoRA mode** (default): Only LoRA adapters trainable (~8.7M)
+3. **Thinking Projection** (~10.5M params, Stage 3 only)
+   - Maps LLM hidden states (4096-dim) to OCR latent space (1280-dim)
+   - **Trainable in Stage 3** for Chain-of-Thought reasoning
+   - Enables generation of latent thinking tokens
+
+4. **Qwen3-VL LLM** (2B params)
+   - **LoRA mode** (default): Only LoRA adapters trainable (~8.7M Stage 1-2, ~50M Stage 3)
    - **Full mode**: All LLM params trainable (2B)
    - Controlled by `LORA=1/0` or `--use_lora / --no-use_lora`
 
-**Total Trainable (default):** ~22M params (13M connectors + 8.7M LoRA)
+**Total Trainable:**
+- **Stage 1-2:** ~22M params (13M connectors + 9M LoRA)
+- **Stage 3:** ~60.5M params (13M connectors + 10.5M thinking projection + 50M LoRA with higher rank)
+
+### Sequence Format
+
+OCRVL uses **Qwen3-VL official format**: all images concatenated in **ONE** user block.
+
+**Training & Evaluation Format (consistent):**
+```
+<|im_start|>user
+<|vision_start|>[IMAGE1_TOKENS]<|vision_end|><|vision_start|>[IMAGE2_TOKENS]<|vision_end|>
+<|im_end|>
+<|im_start|>assistant
+[Response text]
+<|im_end|>
+```
+
+**RENDER=1 Mode (default):**
+- Real image + rendered question as two images in one user block
+- Random ordering: 50% real-first, 50% rendered-first (for robustness)
+- Example: `<|im_start|>user[PHOTO][RENDERED_Q&A]<|im_end|><|im_start|>assistant[Answer]<|im_end|>`
+
+**RENDER=0 Mode:**
+- Real image + text prompt (no rendering)
+- Example: `<|im_start|>user[PHOTO]What is shown?<|im_end|><|im_start|>assistant[Answer]<|im_end|>`
+
+**Critical:** Training and evaluation must use identical formats to avoid distribution mismatch.
 
 ### Checkpoint Structure
 
@@ -299,6 +421,7 @@ OCRVL/checkpoints/alignment_long_20251227_142721/
 - BLIP3o: `/share/project/xiyan/huggingface/BLIP3o/`
 - LLaVA: `/share/project/xiyan/data/llava_instruct/llava_instruct_150k.json`
 - COCO: `/share/project/xiyan/data/coco/train2014/`
+- LLaVA-CoT: `/share/project/xiyan/huggingface/Xkev/LLaVA-CoT-100k/train.jsonl`
 
 ### LLaVA-Instruct-150K (Instruction Stage)
 
@@ -311,6 +434,27 @@ OCRVL/checkpoints/alignment_long_20251227_142721/
 --llava_render_questions          # RENDER=1 (default, questions as images)
 --no-llava_render_questions       # RENDER=0 (text prompts)
 ```
+
+### LLaVA-CoT-100K (Thinking Stage)
+
+```bash
+# Dataset configuration
+--thinking_jsonl_path /path/to/train.jsonl
+--thinking_image_dir /path/to/images
+--thinking_max_samples 100000        # Use all samples (default)
+--thinking_loss_weight 1.0           # Balance thinking and answer losses
+
+# Example: Custom dataset with lower sample count
+--thinking_jsonl_path /path/to/custom_cot.jsonl \
+--thinking_image_dir /path/to/images \
+--thinking_max_samples 10000
+```
+
+**Format Requirements:**
+- JSONL format with `<REASONING>` and `<CONCLUSION>` tags
+- Each sample has `id`, `image`, and `conversations` fields
+- Assistant response must contain reasoning in `<REASONING>` tags
+- Final answer must be in `<CONCLUSION>` tags
 
 ## vLLM Integration
 
@@ -405,16 +549,18 @@ MASTER_PORT=29501 bash OCRVL/scripts/train_instruction.sh
 
 ### Training
 
-- **Start with alignment**: Always train Stage 1 (BLIP3o) before Stage 2 (LLaVA)
-- **Use LoRA by default**: 22M trainable params vs 2B (full LLM)
+- **Follow the stages**: Train Stage 1 (alignment) → Stage 2 (instruction) → Stage 3 (thinking) sequentially
+- **Use LoRA by default**: Stage 1-2: 22M params, Stage 3: 60.5M params (vs 2B full LLM)
 - **Validate at step 0**: Initial checkpoint saved to verify saving works before long training
-- **Monitor GPU usage**: ~6-7 GB per GPU with default settings
-- **Effective batch size**: Keep ≥1024 for stable training (adjust GPUs × batch × accum)
+- **Monitor GPU usage**: ~6-7 GB per GPU (Stage 1-2), ~18-20 GB per GPU (Stage 3)
+- **Effective batch size**: Keep ≥64 for Stage 3, ≥1024 for Stage 1-2 (adjust GPUs × batch × accum)
+- **Stage 3 requires Stage 2**: Must resume from instruction-tuned checkpoint
 
 ### Dataset
 
 - **Alignment**: 5% of BLIP3o long is sufficient for connector alignment
 - **Instruction**: Use full LLaVA-Instruct-150K (no sampling)
+- **Thinking**: Full LLaVA-CoT-100K (100K samples, 1 epoch)
 - **RENDER=1 recommended**: Pure vision mode matches training better than text prompts
 
 ### Evaluation
@@ -430,9 +576,17 @@ MASTER_PORT=29501 bash OCRVL/scripts/train_instruction.sh
 - Initial checkpoint saved at step 0 for validation
 
 **GPU out of memory:**
-- Reduce `BATCH_SIZE` (default: 8 for alignment, 4 for instruction)
+- Reduce `BATCH_SIZE` (default: 8 for alignment, 4 for instruction/thinking)
 - Increase `GRAD_ACCUM` to maintain effective batch size
 - Use `LORA=1` (default) instead of full LLM training
+- Stage 3 uses more memory (~18-20GB per GPU) due to thinking projection
+
+**Thinking loss not decreasing (Stage 3):**
+- Verify `RESUME_CHECKPOINT` has instruction-tuned weights (Stage 2 checkpoint)
+- Check dataset has `<REASONING>` and `<CONCLUSION>` tags
+- Increase learning rate: `LR=2e-4` (default is 1e-4)
+- Adjust `THINKING_LOSS_WEIGHT` (try 0.5 or 2.0 instead of 1.0)
+- Monitor both `thinking_loss` and `answer_loss` - both should decrease
 
 **vLLM repetitive output:**
 - Fixed with NGramPerReqLogitsProcessor in evaluation scripts
@@ -447,7 +601,9 @@ OCRVL/
 ├── train.py                     # Main training script
 ├── scripts/
 │   ├── train_alignment.sh       # Stage 1: BLIP3o alignment
-│   └── train_instruction.sh     # Stage 2: LLaVA instruction tuning
+│   ├── train_instruction.sh     # Stage 2: LLaVA instruction tuning
+│   ├── train_thinking.sh        # Stage 3: Thinking training
+│   └── train_llava.sh          # Full 3-stage pipeline
 ├── model/
 │   ├── ocr_llava_arch.py       # OCR-aware model architecture
 │   └── language_model/
@@ -457,6 +613,7 @@ OCRVL/
 │   ├── blip3o_collate.py       # BLIP3o collate function
 │   ├── blip3o_tasks.py         # Task formatting (caption/OCR/match)
 │   ├── llava_instruct_dataset.py  # LLaVA dataset loader
+│   ├── thinking_dataset.py     # LLaVA-CoT dataset with reasoning extraction
 │   └── ocr_text_adapter.py     # Text rendering + encoding
 ├── decoder/
 │   ├── __init__.py             # vLLM processor exports
@@ -468,7 +625,9 @@ OCRVL/
 │   ├── eval_mathvision_vllm.py
 │   └── eval_odinw_vllm.py
 └── checkpoints/                # Training outputs
-    └── alignment_*/step_*/
+    ├── alignment_*/step_*/
+    ├── instruction_*/step_*/
+    └── thinking_*/step_*/
 ```
 
 ## See Also

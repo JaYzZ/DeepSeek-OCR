@@ -57,6 +57,7 @@ import os
 import sys
 import logging
 import argparse
+import math
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 import json
@@ -84,11 +85,27 @@ try:
 except ImportError:
     HAS_PEFT = False
 
-import swanlab
+try:
+    import swanlab
+    HAS_SWANLAB = True
+except ImportError:
+    HAS_SWANLAB = False
+    swanlab = None
 
 # Add project root
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
+
+# ============================================================================
+# CUDA Configuration for Better Error Detection
+# ============================================================================
+# Enable verbose CUDA error reporting
+os.environ.setdefault('CUDA_LAUNCH_BLOCKING', '0')  # Keep async for speed
+# Memory allocation strategy to reduce fragmentation
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:128,expandable_segments:True')
+# Enable NCCL debug on failure
+os.environ.setdefault('NCCL_DEBUG', 'WARN')
+# ============================================================================
 
 from OCRVL.model.language_model.ocr_qwen3_vl import (
     OCRQwen3VLForConditionalGeneration,
@@ -403,16 +420,16 @@ def freeze_parameters(model, freeze_encoder=True, freeze_llm=True):
 
 
 def unfreeze_connectors(model):
-    """Unfreeze connector parameters after they're created (works for both regular and LoRA-wrapped models)"""
+    """Unfreeze connector and thinking projection parameters after they're created (works for both regular and LoRA-wrapped models)"""
     unfrozen_params = 0
     unfrozen_names = []
 
-    logger.info("Unfreezing connector parameters...")
+    logger.info("Unfreezing connector and thinking projection parameters...")
 
-    # Step 1: Unfreeze via named_parameters (for properly registered connectors)
+    # Step 1: Unfreeze via named_parameters (for properly registered connectors and thinking projection)
     for name, param in model.named_parameters():
-        # Match connector parameters (ocr_connector or deepstack connectors)
-        if 'connector' in name.lower() and ('ocr_connector' in name or 'deepstack' in name):
+        # Match connector parameters (ocr_connector or deepstack connectors) OR thinking_projection
+        if ('connector' in name.lower() and ('ocr_connector' in name or 'deepstack' in name)) or 'thinking_projection' in name:
             if not param.requires_grad:
                 param.requires_grad = True
                 unfrozen_params += param.numel()
@@ -443,21 +460,41 @@ def unfreeze_connectors(model):
                 else:
                     logger.info(f"  ⚠️  Already trainable: {full_name}: {param.numel():,} params")
 
-    logger.info(f"✓ Unfroze {unfrozen_params:,} connector parameters ({len(unfrozen_names)} tensors)")
+    # Step 3: Handle thinking_projection if not caught by Step 1
+    if hasattr(model, 'peft_config'):
+        base_model = model.base_model.model.model
+    else:
+        base_model = model.model
+
+    if hasattr(base_model, 'thinking_projection') and base_model.thinking_projection is not None:
+        logger.info(f"  Found thinking_projection module")
+        for name, param in base_model.thinking_projection.named_parameters():
+            full_name = f"thinking_projection.{name}"
+            if not param.requires_grad:
+                param.requires_grad = True
+                unfrozen_params += param.numel()
+                unfrozen_names.append(full_name)
+                logger.info(f"  ✓ Unfroze {full_name}: {param.numel():,} params")
+            else:
+                logger.info(f"  ⚠️  Already trainable: {full_name}: {param.numel():,} params")
+
+    logger.info(f"✓ Unfroze {unfrozen_params:,} parameters ({len(unfrozen_names)} tensors)")
 
     # Verify by recounting trainable params
     total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     lora_trainable = sum(p.numel() for n, p in model.named_parameters() if 'lora_' in n and p.requires_grad)
     connector_trainable = sum(p.numel() for n, p in model.named_parameters() if 'connector' in n.lower() and p.requires_grad)
+    thinking_trainable = sum(p.numel() for n, p in model.named_parameters() if 'thinking_projection' in n and p.requires_grad)
 
     logger.info(f"  Verification after unfreezing:")
     logger.info(f"    Total trainable: {total_trainable:,}")
     logger.info(f"    LoRA trainable: {lora_trainable:,}")
     logger.info(f"    Connector trainable: {connector_trainable:,}")
-    logger.info(f"    Expected total: {lora_trainable + connector_trainable:,}")
+    logger.info(f"    Thinking projection trainable: {thinking_trainable:,}")
+    logger.info(f"    Expected total: {lora_trainable + connector_trainable + thinking_trainable:,}")
 
-    if total_trainable != lora_trainable + connector_trainable:
-        other = total_trainable - lora_trainable - connector_trainable
+    if total_trainable != lora_trainable + connector_trainable + thinking_trainable:
+        other = total_trainable - lora_trainable - connector_trainable - thinking_trainable
         logger.warning(f"    ⚠️  Unexpected trainable params: {other:,} (should be 0!)")
         logger.warning("    Listing first 10 unexpected trainable params:")
         count = 0
@@ -535,12 +572,22 @@ def apply_lora_to_llm(model, args):
     return model
 
 
-def save_checkpoint(model, optimizer, scaler, global_step, output_dir, args):
-    """Save training checkpoint (only from rank 0)"""
+def save_checkpoint(model, optimizer, scaler, global_step, output_dir, args, checkpoint_name=None, scheduler=None, ocr_adapter=None, tokenizer=None):
+    """Save training checkpoint (only from rank 0)
+
+    Args:
+        checkpoint_name: Optional override for checkpoint directory name (e.g., "step_latest").
+                        If None, uses f"step_{global_step}"
+        scheduler: Optional learning rate scheduler to save
+        ocr_adapter: Optional OCR adapter for checkpoint evaluation
+        tokenizer: Optional tokenizer for checkpoint evaluation
+    """
     if not is_main_process():
         return
 
-    checkpoint_dir = Path(output_dir) / f"step_{global_step}"
+    if checkpoint_name is None:
+        checkpoint_name = f"step_{global_step}"
+    checkpoint_dir = Path(output_dir) / checkpoint_name
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -570,6 +617,11 @@ def save_checkpoint(model, optimizer, scaler, global_step, output_dir, args):
             }
             logger.info(f"  ✓ Saving {len(target_model._ocr_deepstack_connectors)} deepstack connectors")
 
+        # Save thinking projection if it exists
+        if hasattr(target_model, 'thinking_projection') and target_model.thinking_projection is not None:
+            connector_state['thinking_projection'] = target_model.thinking_projection.state_dict()
+            logger.info(f"  ✓ Saving thinking_projection with {sum(p.numel() for p in target_model.thinking_projection.parameters())} params")
+
         if not connector_state:
             logger.warning(f"  ⚠️  No connectors found to save! target_model type: {type(target_model)}")
             logger.warning(f"  ⚠️  target_model attributes: {dir(target_model)[:10]}...")
@@ -587,14 +639,58 @@ def save_checkpoint(model, optimizer, scaler, global_step, output_dir, args):
             model_to_save.save_pretrained(checkpoint_dir / "model")
             logger.info(f"  ✓ Saved full model to {checkpoint_dir / 'model'}")
 
-        # Save optimizer and scaler
-        torch.save({
+        # Save optimizer, scaler, and scheduler
+        training_state = {
             'optimizer': optimizer.state_dict(),
             'scaler': scaler.state_dict(),
             'global_step': global_step,
             'args': vars(args),
-        }, checkpoint_dir / "training_state.pt")
+        }
+
+        # Add scheduler state if available
+        if scheduler is not None:
+            training_state['scheduler'] = scheduler.state_dict()
+            logger.info(f"  ✓ Saving scheduler state")
+
+        torch.save(training_state, checkpoint_dir / "training_state.pt")
         logger.info(f"  ✓ Saved training_state.pt ({(checkpoint_dir / 'training_state.pt').stat().st_size / 1024 / 1024:.2f} MB)")
+
+        # Run checkpoint evaluation if enabled
+        if hasattr(args, 'enable_checkpoint_eval') and args.enable_checkpoint_eval:
+            if ocr_adapter is not None and tokenizer is not None:
+                logger.info("")
+                logger.info("Running checkpoint evaluation...")
+                try:
+                    from OCRVL.training.checkpoint_eval import run_checkpoint_evaluation
+
+                    # Determine image base directory for evaluation samples
+                    # Use LLaVA image directory if available, otherwise try to construct correct path
+                    if hasattr(args, 'llava_image_dir') and args.llava_image_dir:
+                        eval_image_base = args.llava_image_dir
+                        # If it's just the huggingface root, append the LLaVA-Instruct-150K/images path
+                        if eval_image_base.endswith('/huggingface'):
+                            eval_image_base = f"{eval_image_base}/liuhaotian/LLaVA-Instruct-150K/images"
+                    elif hasattr(args, 'blip3o_base_path'):
+                        # For BLIP3o training, eval samples should still use LLaVA images
+                        eval_image_base = "/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images"
+                    else:
+                        # Fallback to default LLaVA images path
+                        eval_image_base = "/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images"
+
+                    run_checkpoint_evaluation(
+                        model=model,
+                        tokenizer=tokenizer,
+                        ocr_adapter=ocr_adapter,
+                        checkpoint_dir=checkpoint_dir,
+                        eval_samples_path=args.checkpoint_eval_samples,
+                        image_base_dir=eval_image_base,
+                        global_step=global_step,
+                        args=args,
+                        max_samples=args.checkpoint_eval_max_samples,
+                    )
+                except Exception as e:
+                    logger.warning(f"  ⚠️  Checkpoint evaluation failed: {e}")
+                    logger.warning(f"  Training will continue without evaluation")
 
         logger.info(f"✓ Checkpoint saved successfully to {checkpoint_dir}")
 
@@ -632,6 +728,18 @@ def load_connectors(model, connector_path):
             if k in target_model._ocr_deepstack_connectors:
                 target_model._ocr_deepstack_connectors[k].load_state_dict(v)
 
+    # Load thinking projection if it exists in checkpoint
+    if 'thinking_projection' in state:
+        # Initialize projection first if not already initialized
+        if not hasattr(target_model, 'thinking_projection') or target_model.thinking_projection is None:
+            target_model._maybe_get_thinking_projection(
+                device=next(target_model.parameters()).device,
+                dtype=next(target_model.parameters()).dtype
+            )
+        target_model.thinking_projection.load_state_dict(state['thinking_projection'])
+        if is_main_process():
+            logger.info("  ✓ Loaded thinking_projection")
+
     if is_main_process():
         logger.info("✓ Loaded connector weights")
 
@@ -649,6 +757,7 @@ def load_checkpoint_with_lora(model, checkpoint_path, args):
         model: Model with loaded connectors and LoRA adapters (if applicable)
         optimizer_state: Optimizer state dict to restore
         scaler_state: GradScaler state dict to restore
+        scheduler_state: Scheduler state dict to restore
         global_step: Global step to resume from
     """
     checkpoint_path = Path(checkpoint_path)
@@ -690,15 +799,19 @@ def load_checkpoint_with_lora(model, checkpoint_path, args):
     training_state_path = checkpoint_path / "training_state.pt"
     optimizer_state = None
     scaler_state = None
+    scheduler_state = None
     global_step = 0
 
     if args.resume_training_state and training_state_path.exists():
         training_state = torch.load(training_state_path, map_location='cpu')
         optimizer_state = training_state.get('optimizer', None)
         scaler_state = training_state.get('scaler', None)
+        scheduler_state = training_state.get('scheduler', None)
         global_step = training_state.get('global_step', 0)
         if is_main_process():
             logger.info(f"  ✓ Loaded training state (resuming from step {global_step})")
+            if scheduler_state is not None:
+                logger.info(f"  ✓ Found scheduler state in checkpoint")
     elif args.resume_training_state and is_main_process():
         logger.warning(f"  Training state not found: {training_state_path}")
     elif is_main_process():
@@ -708,13 +821,17 @@ def load_checkpoint_with_lora(model, checkpoint_path, args):
     if dist.is_initialized():
         dist.barrier()
 
-    return model, optimizer_state, scaler_state, global_step
+    return model, optimizer_state, scaler_state, scheduler_state, global_step
 
 
-def train_one_epoch(model, dataloader, optimizer, scaler, args, global_step, max_steps, epoch_num, expected_total_steps, tokenizer, ocr_adapter):
-    """Train for one epoch with comprehensive logging and task formatting"""
+def train_one_epoch(model, dataloader, optimizer, scaler, args, global_step, max_steps, epoch_num, expected_total_steps, tokenizer, ocr_adapter, scheduler=None):
+    """Train for one epoch with comprehensive logging and task formatting
+
+    Args:
+        scheduler: Optional learning rate scheduler
+    """
     import time
-    from OCRVL.data.blip3o_tasks import format_task1_batch, format_task2_batch, format_task3_batch
+    # Note: BLIP3o task formatters are imported conditionally below when dataset_type == "blip3o"
 
     model.train()
     running_loss = 0.0
@@ -726,9 +843,10 @@ def train_one_epoch(model, dataloader, optimizer, scaler, args, global_step, max
     total_samples = 0
     grad_norm_sum = 0.0
     grad_norm_count = 0
+    steps_in_epoch = 0  # Track steps completed in current epoch (for ETA calculation)
 
     # Track task-specific losses (for BLIP3o multi-task training)
-    task_losses = {1: [], 2: [], 3: []}  # Task 1: Image cap, Task 2: Text OCR, Task 3: Contrastive
+    task_losses = {1: [], 2: []}  # Task 1: Image captioning, Task 2: OCR transcription
 
     # Task selection RNG (seeded for reproducibility)
     import random
@@ -741,75 +859,438 @@ def train_one_epoch(model, dataloader, optimizer, scaler, args, global_step, max
     else:
         progress_bar = dataloader
 
-    for batch_idx, raw_batch in enumerate(progress_bar):
-        if global_step >= max_steps:
-            break
+    # Batch encoding optimization: prefetch and encode in large batches
+    dataloader_iter = iter(progress_bar)
 
-        # TASK FORMATTING: Only for BLIP3o dataset (multi-task training)
-        if args.dataset_type == "blip3o":
-            # TASK SELECTION: Select task based on task_ratios
-            task_choice = task_rng.random()
-            if args.task_ratios[2] > 0:
-                # Task 3 enabled: select from all 3 tasks
-                if task_choice < args.task_ratios[0]:
-                    task = 1
-                elif task_choice < args.task_ratios[0] + args.task_ratios[1]:
-                    task = 2
+    while global_step < max_steps:
+        # Prefetch gradient_accumulation_steps batches
+        prefetch_batches = []
+        try:
+            for _ in range(args.gradient_accumulation_steps):
+                prefetch_batches.append(next(dataloader_iter))
+        except StopIteration:
+            if not prefetch_batches:
+                break  # End of epoch
+
+        # For LLaVA: batch-encode all images at once
+        if args.dataset_type == "llava":
+            # Collect all images from all micro-batches
+            all_images = []
+            batch_metadata = []
+            
+            for raw_batch in prefetch_batches:
+                if "images_to_encode" in raw_batch:
+                    start_idx = len(all_images)
+                    batch_images = []
+                    for sample_images in raw_batch["images_to_encode"]:
+                        batch_images.extend(sample_images)
+                    all_images.extend(batch_images)
+                    batch_metadata.append({
+                        'batch': raw_batch,
+                        'start': start_idx,
+                        'count': len(batch_images)
+                    })
                 else:
-                    task = 3
-            else:
-                # Task 3 disabled: only select task 1 or 2
-                task_1_prob = args.task_ratios[0] / (args.task_ratios[0] + args.task_ratios[1])
-                if task_choice < task_1_prob:
-                    task = 1
+                    batch_metadata.append({
+                        'batch': raw_batch,
+                        'start': -1,
+                        'count': 0
+                    })
+            
+            # SINGLE BATCH ENCODING (32x more efficient!)
+            if all_images:
+                print(f"[Batch Encoding] Encoding {len(all_images)} images in one batch (grad_accum={args.gradient_accumulation_steps})")
+                all_encoded = ocr_adapter.images_to_ocr_features(all_images)
+                
+                # Distribute features back to batches
+                for meta in batch_metadata:
+                    if meta['count'] > 0:
+                        start, end = meta['start'], meta['start'] + meta['count']
+                        if isinstance(all_encoded, tuple):
+                            meta['features'] = (all_encoded[0][start:end], all_encoded[1][start:end])
+                        else:
+                            meta['features'] = all_encoded[start:end]
+                    else:
+                        meta['features'] = None
+            
+            # Process each micro-batch with pre-encoded features
+            for meta in batch_metadata:
+                sub_batch = meta['batch']
+                
+                if meta['features'] is not None:
+                    ocr_features = meta['features']
+                elif "ocr_image_features" in sub_batch:
+                    ocr_features = sub_batch["ocr_image_features"]
                 else:
-                    task = 2
+                    continue
+                
+                input_ids = sub_batch["input_ids"].to(args.device)
+                attention_mask = sub_batch["attention_mask"].to(args.device)
+                labels = sub_batch["labels"].to(args.device)
+                
+                batch_size = input_ids.size(0)
+                total_samples += batch_size
+                
+                # Forward + Backward
+                with autocast('cuda', dtype=torch.bfloat16, enabled=args.use_amp):
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask,
+                                  labels=labels, ocr_image_features=ocr_features)
+                    loss = outputs.loss / args.gradient_accumulation_steps
 
-            # FORMAT BATCH: Call appropriate task formatting function
-            if task == 1:
-                formatted_batches = format_task1_batch(raw_batch, tokenizer, ocr_adapter, sample_rng)
-            elif task == 2:
-                formatted_batches = format_task2_batch(raw_batch, tokenizer, ocr_adapter, sample_rng)
-            else:  # task == 3
-                formatted_batches = format_task3_batch(raw_batch, tokenizer, ocr_adapter, sample_rng)
-        else:
-            # For LLaVA and other datasets: batch already formatted by collate function
-            formatted_batches = [raw_batch]
-            task = 1  # Set task=1 for logging compatibility
+                # Numerical stability check - detect NaN/Inf before backward pass
+                # CRITICAL: Must always do backward() to maintain NCCL sync across DDP ranks
+                batch_is_valid = True
+                if not torch.isfinite(loss):
+                    logger.warning(f"⚠️  Step {global_step} (LLaVA): Non-finite loss detected: {loss.item()}")
+                    logger.warning(f"   Input IDs shape: {input_ids.shape}, Labels shape: {labels.shape}")
+                    loss = loss * 0.0  # Zero out loss but still do backward for DDP sync
+                    batch_is_valid = False
 
-        # PROCESS SUB-BATCHES: Loop through formatted batches (1 for task 1/2, 4 for task 3)
-        for sub_batch in formatted_batches:
-            # Move to device
-            input_ids = sub_batch["input_ids"].to(args.device)
-            attention_mask = sub_batch["attention_mask"].to(args.device)
-            labels = sub_batch["labels"].to(args.device)
-            ocr_features = sub_batch["ocr_image_features"]
+                # Backward pass - MUST ALWAYS EXECUTE to maintain DDP gradient synchronization
+                # If we skip backward(), this rank won't participate in NCCL ALLREDUCE and other ranks will hang
+                if args.use_amp:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
-            batch_size = input_ids.size(0)
-            total_samples += batch_size
+                accumulation_counter += 1
 
-            with autocast('cuda', dtype=torch.bfloat16, enabled=args.use_amp):
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                    ocr_image_features=ocr_features,
-                )
-                loss = outputs.loss / args.gradient_accumulation_steps  # Scale loss
+                # Track loss only if batch was valid
+                if batch_is_valid:
+                    loss_value = loss.detach().item() * args.gradient_accumulation_steps
+                    if math.isfinite(loss_value):
+                        running_loss += loss_value
+                        task_losses[1].append(loss_value)
+                    else:
+                        logger.warning(f"⚠️  Step {global_step} (LLaVA): Non-finite loss value after backward")
+                        batch_is_valid = False
 
-            # Backward pass for this sub-batch
-            if args.use_amp:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            # Clean up LLaVA batch processing variables to prevent memory accumulation
+            del all_images, all_encoded, batch_metadata
 
-            accumulation_counter += 1
-            running_loss += loss.item() * args.gradient_accumulation_steps  # Unscale for logging
+        # For BLIP3o and DocLayNet: process through BLIP3o task formatters (both are image-caption pairs)
+        elif args.dataset_type in ["blip3o", "doclaynet"]:
+            for raw_batch in prefetch_batches:
+                # Check if this is a mixed batch (has dataset_source markers)
+                is_mixed = 'dataset_source' in raw_batch[0] if raw_batch else False
 
-            # Track task-specific loss
-            task_losses[task].append(loss.item() * args.gradient_accumulation_steps)
+                if is_mixed:
+                    # Mixed batch: separate by source
+                    blip3o_samples = [s for s in raw_batch if s.get('dataset_source') == 'blip3o']
+                    doclaynet_samples = [s for s in raw_batch if s.get('dataset_source') == 'doclaynet']
 
-        # Update weights after accumulation_steps (after processing all sub-batches)
+                    # Remove source markers
+                    for s in blip3o_samples:
+                        s.pop('dataset_source', None)
+                    for s in doclaynet_samples:
+                        s.pop('dataset_source', None)
+
+                    formatted_batches = []
+
+                    # BLIP3o: Process BOTH tasks (caption + OCR)
+                    if blip3o_samples:
+                        from OCRVL.data.blip3o_tasks import format_caption_batch, format_ocr_batch
+                        caption_batches = format_caption_batch(blip3o_samples, tokenizer, sample_rng)
+                        ocr_batches = format_ocr_batch(blip3o_samples, tokenizer, sample_rng)
+                        formatted_batches.extend(caption_batches + ocr_batches)
+
+                    # DocLayNet: Process ONLY OCR task (document image + OCR instruction -> text)
+                    if doclaynet_samples:
+                        from OCRVL.data.blip3o_tasks import format_ocr_batch
+                        doclaynet_ocr_batches = format_ocr_batch(doclaynet_samples, tokenizer, sample_rng)
+                        formatted_batches.extend(doclaynet_ocr_batches)
+
+                else:
+                    # Pure BLIP3o or DocLayNet batch
+                    from OCRVL.data.blip3o_tasks import format_caption_batch, format_ocr_batch
+
+                    if args.dataset_type == "blip3o":
+                        # BLIP3o: Process BOTH tasks
+                        caption_batches = format_caption_batch(raw_batch, tokenizer, sample_rng)
+                        ocr_batches = format_ocr_batch(raw_batch, tokenizer, sample_rng)
+                        formatted_batches = caption_batches + ocr_batches
+                    else:
+                        # DocLayNet: Process ONLY OCR task
+                        formatted_batches = format_ocr_batch(raw_batch, tokenizer, sample_rng)
+
+            # PROCESS SUB-BATCHES: Loop through formatted batches
+            for sub_batch_idx, sub_batch in enumerate(formatted_batches):
+                # Determine task ID for logging
+                # BLIP3o alternates: caption (1), OCR (2), caption (1), OCR (2), ...
+                # DocLayNet: all OCR (2)
+                task = (sub_batch_idx % 2) + 1 if args.dataset_type == "blip3o" else 2
+
+                # BLIP3o/DocLayNet: Encode images on GPU (moved from task format functions)
+                if args.dataset_type in ["blip3o", "doclaynet"] and "images" in sub_batch:
+                    # Batch-encode all images at once
+                    all_images = sub_batch["images"]  # PIL images
+                    image_counts = sub_batch["image_counts"]  # [2, 2, 2, ...] (each sample has 2 images)
+                    response_texts = sub_batch["response_texts"]
+                    orderings = sub_batch["orderings"]
+                    tokenizer = sub_batch["tokenizer"]
+    
+                    # Encode all images in one batch call
+                    all_encoded_features = ocr_adapter.images_to_ocr_features(all_images)
+    
+                    # Assemble final batches
+                    batch_input_ids = []
+                    batch_labels = []
+                    batch_ocr_features = []
+    
+                    # Qwen chat tokens
+                    user_start_ids = torch.tensor([151644, 872, 198], dtype=torch.long)  # <|im_start|>user\n
+                    user_end_ids = torch.tensor([151645, 198], dtype=torch.long)  # <|im_end|>\n
+                    assistant_start_ids = torch.tensor([151644, 77091, 198], dtype=torch.long)  # <|im_start|>assistant\n
+                    assistant_end_ids = torch.tensor([151645, 198], dtype=torch.long)  # <|im_end|>\n
+    
+                    img_idx = 0
+                    for sample_idx, num_images in enumerate(image_counts):
+                        # Get encoded features for this sample's images
+                        sample_features = []
+                        for _ in range(num_images):
+                            if isinstance(all_encoded_features, tuple):
+                                feat = all_encoded_features[0][img_idx]
+                                deepstack = [all_encoded_features[1][img_idx]] if len(all_encoded_features) > 1 else []
+                                sample_features.append((feat, deepstack))
+                            else:
+                                sample_features.append(all_encoded_features[img_idx])
+                            img_idx += 1
+    
+                        # Qwen3-VL official format: All images in ONE user block
+                        # <|im_start|>user<img1><img2><|im_end|><|im_start|>assistant<response><|im_end|>
+    
+                        # Start ONE user block
+                        sequence_parts = [user_start_ids]
+                        label_parts = [torch.full_like(user_start_ids, -100)]
+    
+                        combined_feats = []
+                        combined_deepstack = []
+    
+                        # Add all vision tokens to ONE user block
+                        for feat_data in sample_features:
+                            if isinstance(feat_data, tuple):
+                                feat, deepstack = feat_data
+                            else:
+                                feat = feat_data
+                                deepstack = []
+    
+                            # Create vision token block
+                            num_tokens = feat.shape[0]
+                            vision_block = "<|vision_start|>" + "<|image_pad|>" * num_tokens + "<|vision_end|>"
+                            vision_ids = tokenizer(vision_block, return_tensors="pt", add_special_tokens=False).input_ids.squeeze(0)
+                            sequence_parts.append(vision_ids)
+                            label_parts.append(torch.full_like(vision_ids, -100))
+    
+                            combined_feats.append(feat)
+                            combined_deepstack.extend(deepstack)
+    
+                        # Close user block
+                        sequence_parts.append(user_end_ids)
+                        label_parts.append(torch.full_like(user_end_ids, -100))
+
+                        # Response text + EOS token
+                        response = response_texts[sample_idx]
+                        response_ids = tokenizer(response, add_special_tokens=False, return_tensors="pt").input_ids.squeeze(0)
+                        eos_token = torch.tensor([tokenizer.eos_token_id], dtype=torch.long)  # <|im_end|> (151645)
+                        response_ids = torch.cat([response_ids, eos_token], dim=0)  # Add EOS so model learns when to stop
+
+                        # Assistant block
+                        sequence_parts.extend([assistant_start_ids, response_ids])
+                        label_parts.extend([
+                            torch.full_like(assistant_start_ids, -100),
+                            response_ids.clone()  # Compute loss on response + EOS
+                        ])
+
+                        # Concatenate
+                        full_input_ids = torch.cat(sequence_parts, dim=0)
+                        labels = torch.cat(label_parts, dim=0)
+
+                        batch_input_ids.append(full_input_ids)
+                        batch_labels.append(labels)
+    
+                        # Combine OCR features for this sample
+                        if combined_deepstack:
+                            ocr_features = (combined_feats, combined_deepstack)
+                        else:
+                            ocr_features = combined_feats
+                        batch_ocr_features.append(ocr_features)
+    
+                    # Pad sequences
+                    max_len = max(ids.size(0) for ids in batch_input_ids)
+                    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    
+                    padded_input_ids = []
+                    padded_labels = []
+                    attention_masks = []
+    
+                    for input_ids, labels in zip(batch_input_ids, batch_labels):
+                        seq_len = input_ids.size(0)
+                        padding_len = max_len - seq_len
+    
+                        padded_input_ids.append(
+                            torch.cat([input_ids, torch.full((padding_len,), pad_token_id, dtype=input_ids.dtype)])
+                        )
+                        padded_labels.append(
+                            torch.cat([labels, torch.full((padding_len,), -100, dtype=labels.dtype)])
+                        )
+                        attention_masks.append(
+                            torch.cat([torch.ones(seq_len, dtype=torch.long), torch.zeros(padding_len, dtype=torch.long)])
+                        )
+    
+                    # Combine all OCR features
+                    final_feats_combined = []
+                    deepstack_feats_combined = []
+                    for ocr_feat in batch_ocr_features:
+                        if isinstance(ocr_feat, tuple):
+                            final, ds = ocr_feat
+                            final_feats_combined.extend(final)
+                            deepstack_feats_combined.extend(ds)
+                        else:
+                            final_feats_combined.extend(ocr_feat)
+    
+                    combined_ocr_features = (final_feats_combined, deepstack_feats_combined) if deepstack_feats_combined else final_feats_combined
+    
+                    # Prepare final batch
+                    input_ids = torch.stack(padded_input_ids)
+                    attention_mask = torch.stack(attention_masks)
+                    labels = torch.stack(padded_labels)
+                    ocr_features = combined_ocr_features
+                    latent_supervision = None
+                    latent_positions = None
+
+                # LLaVA: Encode images and immediately forward (no reassembly delay)
+                elif args.dataset_type == "llava" and "images_to_encode" in sub_batch:
+                    # Flatten all images for batch encoding
+                    all_images = []
+                    for sample_images in sub_batch["images_to_encode"]:
+                        all_images.extend(sample_images)
+
+                    # Batch-encode all images - returns list of features
+                    all_encoded = ocr_adapter.images_to_ocr_features(all_images)
+
+                    # Prepare OCR features (model accepts list of features directly)
+                    if isinstance(all_encoded, tuple):
+                        final_feats, deepstack_feats = all_encoded
+                        ocr_features = (final_feats, deepstack_feats)
+                    else:
+                        ocr_features = all_encoded
+
+                    # Get sequences from collate_fn
+                    input_ids = sub_batch["input_ids"]
+                    attention_mask = sub_batch["attention_mask"]
+                    labels = sub_batch["labels"]
+                    latent_supervision = None
+                    latent_positions = None
+
+                # DocLayNet: Encode document images
+                elif args.dataset_type == "doclaynet" and "images_to_encode" in sub_batch:
+                    # Batch-encode all document images
+                    all_encoded = ocr_adapter.images_to_ocr_features(sub_batch["images_to_encode"])
+
+                    # Prepare OCR features
+                    if isinstance(all_encoded, tuple):
+                        final_feats, deepstack_feats = all_encoded
+                        ocr_features = (final_feats, deepstack_feats)
+                    else:
+                        ocr_features = all_encoded
+
+                    # Get sequences from collate_fn
+                    input_ids = sub_batch["input_ids"]
+                    attention_mask = sub_batch["attention_mask"]
+                    labels = sub_batch["labels"]
+                    latent_supervision = None
+                    latent_positions = None
+
+                # Thinking: Encode real images for context + use pre-encoded thinking text
+                elif args.dataset_type == "thinking" and "images" in sub_batch:
+                    # Encode real images from dataset (e.g., COCO, GQA, etc.)
+                    all_images = sub_batch["images"]
+                    all_encoded = ocr_adapter.images_to_ocr_features(all_images)
+
+                    # Prepare OCR features for real images
+                    if isinstance(all_encoded, tuple):
+                        final_feats, deepstack_feats = all_encoded
+                        ocr_features = (final_feats, deepstack_feats)
+                    else:
+                        ocr_features = all_encoded
+
+                    # Get sequences and thinking-specific data from collate_fn
+                    input_ids = sub_batch["input_ids"]
+                    attention_mask = sub_batch["attention_mask"]
+                    labels = sub_batch["labels"]
+                    latent_supervision = sub_batch["latent_supervision"]
+                    latent_positions = sub_batch["latent_positions"]
+
+                else:
+                    # Other datasets: use pre-encoded features from batch
+                    ocr_features = sub_batch["ocr_image_features"]
+                    input_ids = sub_batch["input_ids"]
+                    attention_mask = sub_batch["attention_mask"]
+                    labels = sub_batch["labels"]
+                    latent_supervision = None
+                    latent_positions = None
+    
+                # Move to device
+                input_ids = input_ids.to(args.device)
+                attention_mask = attention_mask.to(args.device)
+                labels = labels.to(args.device)
+
+                batch_size = input_ids.size(0)
+                total_samples += batch_size
+
+                # Forward pass
+                with autocast('cuda', dtype=torch.bfloat16, enabled=args.use_amp):
+                    # Check if thinking data is available
+                    has_thinking = latent_supervision is not None and latent_positions is not None
+
+                    if has_thinking:
+                        outputs = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels,
+                            ocr_image_features=ocr_features,
+                            latent_supervision=latent_supervision,
+                            latent_positions=latent_positions.to(args.device),
+                            thinking_loss_weight=args.thinking_loss_weight,
+                        )
+                    else:
+                        outputs = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels,
+                            ocr_image_features=ocr_features,
+                        )
+                    loss = outputs.loss / args.gradient_accumulation_steps
+
+                # Numerical stability check - detect NaN/Inf before backward pass
+                # CRITICAL: Must always do backward() to maintain NCCL sync across DDP ranks
+                batch_is_valid = True
+                if not torch.isfinite(loss):
+                    logger.warning(f"⚠️  Step {global_step}: Non-finite loss detected: {loss.item()}")
+                    logger.warning(f"   Input IDs shape: {input_ids.shape}, Labels shape: {labels.shape}")
+                    loss = loss * 0.0  # Zero out loss but still do backward for DDP sync
+                    batch_is_valid = False
+
+                # Backward pass - MUST ALWAYS EXECUTE to maintain DDP gradient synchronization
+                # If we skip backward(), this rank won't participate in NCCL ALLREDUCE and other ranks will hang
+                if args.use_amp:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+                accumulation_counter += 1
+
+                # Track loss only if batch was valid
+                if batch_is_valid:
+                    loss_value = loss.detach().item() * args.gradient_accumulation_steps
+                    if math.isfinite(loss_value):
+                        running_loss += loss_value
+                        task_losses[task].append(loss_value)
+                    else:
+                        logger.warning(f"⚠️  Step {global_step}: Non-finite loss value after backward")
+                        batch_is_valid = False
+    
+            # Update weights after accumulation_steps (after processing all sub-batches)
         if accumulation_counter >= args.gradient_accumulation_steps:
             grad_norm = None
             if args.use_amp:
@@ -833,12 +1314,32 @@ def train_one_epoch(model, dataloader, optimizer, scaler, args, global_step, max
                 grad_norm_count += 1
 
             optimizer.zero_grad()
+
+            # Learning rate scheduling (after optimizer step)
+            if scheduler is not None:
+                # Warmup: linearly increase LR from 0 to args.lr over warmup_steps
+                if args.lr_warmup_steps > 0 and global_step < args.lr_warmup_steps:
+                    warmup_lr = args.lr * (global_step / args.lr_warmup_steps)
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = warmup_lr
+                else:
+                    # After warmup, use cosine annealing
+                    scheduler.step()
+
             accumulation_counter = 0
             global_step += 1
+            steps_in_epoch += 1  # Increment epoch step counter
+
+            # Memory cleanup: Clear prefetch batches and intermediate tensors after gradient update
+            # This prevents memory accumulation across training steps
+            del prefetch_batches
+            # Periodic GPU cache cleanup (every 10 steps to avoid overhead)
+            if global_step % 10 == 0:
+                torch.cuda.empty_cache()
 
         # Enhanced logging (only on rank 0)
         if global_step % args.log_interval == 0 and is_main_process() and accumulation_counter == 0:
-            avg_loss = running_loss / args.log_interval
+            avg_loss = running_loss / (args.log_interval * args.gradient_accumulation_steps)
             step_time = time.time() - step_start_time
             samples_per_sec = (args.log_interval * args.batch_size * args.gradient_accumulation_steps * (dist.get_world_size() if dist.is_initialized() else 1)) / step_time
 
@@ -855,13 +1356,12 @@ def train_one_epoch(model, dataloader, optimizer, scaler, args, global_step, max
             # Calculate average task-specific losses (for BLIP3o multi-task tracking)
             avg_task1_loss = sum(task_losses[1]) / max(len(task_losses[1]), 1) if task_losses[1] else 0.0
             avg_task2_loss = sum(task_losses[2]) / max(len(task_losses[2]), 1) if task_losses[2] else 0.0
-            avg_task3_loss = sum(task_losses[3]) / max(len(task_losses[3]), 1) if task_losses[3] else 0.0
 
             # ETA
             elapsed_time = time.time() - epoch_start_time
-            steps_done = batch_idx + 1
-            steps_remaining_epoch = len(dataloader) - steps_done
-            eta_epoch = (elapsed_time / steps_done) * steps_remaining_epoch if steps_done > 0 else 0
+            steps_remaining_total = expected_total_steps - global_step
+            # Use steps_in_epoch (not global_step) for time-per-step calculation
+            eta = (elapsed_time / steps_in_epoch) * steps_remaining_total if steps_in_epoch > 0 else 0
 
             # Progress bar
             if hasattr(progress_bar, 'set_postfix'):
@@ -880,7 +1380,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, args, global_step, max
                 f"GradNorm: {avg_grad_norm:.3f} | "
                 f"Speed: {samples_per_sec:.1f} samples/s | "
                 f"GPU: {gpu_mem_allocated:.2f}GB/{gpu_mem_reserved:.2f}GB | "
-                f"ETA: {eta_epoch/60:.1f}min"
+                f"ETA: {eta/60:.1f}min"
             )
 
             if args.use_wandb and HAS_WANDB:
@@ -893,7 +1393,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, args, global_step, max
                     "step": global_step
                 })
 
-            if args.use_swanlab:
+            if args.use_swanlab and HAS_SWANLAB:
                 log_dict = {
                     "train/loss": avg_loss,
                     "train/lr": current_lr,
@@ -906,21 +1406,19 @@ def train_one_epoch(model, dataloader, optimizer, scaler, args, global_step, max
                 if task_losses[1]:
                     log_dict["train/task1_image_caption_loss"] = avg_task1_loss
                 if task_losses[2]:
-                    log_dict["train/task2_text_ocr_loss"] = avg_task2_loss
-                if task_losses[3]:
-                    log_dict["train/task3_contrastive_loss"] = avg_task3_loss
+                    log_dict["train/task2_ocr_transcription_loss"] = avg_task2_loss
 
                 swanlab.log(log_dict, step=global_step)
 
             running_loss = 0.0
             grad_norm_sum = 0.0
             grad_norm_count = 0
-            task_losses = {1: [], 2: [], 3: []}  # Reset task-specific losses
+            task_losses = {1: [], 2: []}  # Reset task-specific losses
             step_start_time = time.time()
 
         # Checkpointing (only on rank 0, with barrier)
         if global_step % args.save_interval == 0 and accumulation_counter == 0:
-            save_checkpoint(model, optimizer, scaler, global_step, args.output_dir, args)
+            save_checkpoint(model, optimizer, scaler, global_step, args.output_dir, args, scheduler=scheduler, ocr_adapter=ocr_adapter, tokenizer=tokenizer)
             # Synchronize all processes after checkpoint
             if dist.is_initialized():
                 dist.barrier()
@@ -949,7 +1447,11 @@ def train_stage_alignment(args):
 
     if is_main_process():
         logger.info("=" * 70)
-        logger.info("Stage 1: Connector Alignment")
+        # More accurate description based on what's actually being trained
+        if args.use_lora:
+            logger.info("Stage: Instruction Tuning (LoRA + Connectors)")
+        else:
+            logger.info("Stage: Connector Alignment")
         logger.info("=" * 70)
         logger.info(f"Distributed training: world_size={world_size}, rank={rank}, local_rank={local_rank}")
 
@@ -960,14 +1462,30 @@ def train_stage_alignment(args):
     tokenizer = AutoTokenizer.from_pretrained(args.qwen_model_path, trust_remote_code=True)
     # Qwen3-VL already has vision tokens: <|vision_start|>, <|vision_end|>, <|image_pad|>
 
+    # Add special tokens for thinking-with-latent-tokens training
+    special_tokens = {"additional_special_tokens": ["<think>", "</think>"]}
+    num_added = tokenizer.add_special_tokens(special_tokens)
+    if is_main_process() and num_added > 0:
+        logger.info(f"✓ Added {num_added} special tokens: <think>, </think>")
+
     # Load model
     model = OCRQwen3VLForConditionalGeneration.from_pretrained(
         args.qwen_model_path,
         dtype=torch.bfloat16,
         device_map=device,
-        trust_remote_code=True
+        trust_remote_code=True,
+        attn_implementation="flash_attention_2"  # Enable Flash Attention for 1.5-2x speedup
     )
-    # No need to resize embeddings - using Qwen3-VL's native vision tokens
+
+    # Resize embeddings if special tokens were added
+    if num_added > 0:
+        model.resize_token_embeddings(len(tokenizer))
+        if is_main_process():
+            logger.info(f"✓ Resized token embeddings to {len(tokenizer)}")
+
+    # Store special token IDs for dataset use
+    args.think_start_id = tokenizer.convert_tokens_to_ids("<think>")
+    args.think_end_id = tokenizer.convert_tokens_to_ids("</think>")
 
     # Freeze encoder and LLM
     freeze_parameters(model, freeze_encoder=True, freeze_llm=True)
@@ -1002,10 +1520,11 @@ def train_stage_alignment(args):
     resume_global_step = 0
     optimizer_state_to_load = None
     scaler_state_to_load = None
+    scheduler_state_to_load = None
 
     if args.load_checkpoint:
         # Load connectors and LoRA adapters if present
-        model, optimizer_state_to_load, scaler_state_to_load, resume_global_step = load_checkpoint_with_lora(
+        model, optimizer_state_to_load, scaler_state_to_load, scheduler_state_to_load, resume_global_step = load_checkpoint_with_lora(
             model, args.load_checkpoint, args
         )
         if is_main_process():
@@ -1021,6 +1540,20 @@ def train_stage_alignment(args):
     if is_main_process():
         logger.info(f"Total trainable parameters: {trainable_params:,}")
 
+    # Enable gradient checkpointing if requested (before DDP wrapping)
+    if args.use_gradient_checkpointing:
+        # Get base model (unwrap LoRA if needed)
+        model_to_checkpoint = model.base_model.model if hasattr(model, 'peft_config') else model
+
+        # Enable gradient checkpointing on the LLM
+        if hasattr(model_to_checkpoint, 'gradient_checkpointing_enable'):
+            model_to_checkpoint.gradient_checkpointing_enable()
+            if is_main_process():
+                logger.info("✓ Enabled gradient checkpointing (saves ~30-40% memory, ~20% slower)")
+        else:
+            if is_main_process():
+                logger.warning("⚠️  Model does not support gradient_checkpointing_enable, skipping")
+
     # Wrap model with DDP for distributed training
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
@@ -1035,7 +1568,7 @@ def train_stage_alignment(args):
 
         from OCRVL.data.blip3o_dataset import BLIP3oDataset
 
-        dataset = BLIP3oDataset(
+        blip3o_dataset = BLIP3oDataset(
             dataset_type=args.blip3o_dataset,
             base_path=args.blip3o_base_path,
             mix_ratio=args.blip3o_mix_ratio,
@@ -1043,6 +1576,41 @@ def train_stage_alignment(args):
             num_proc=args.num_workers,
             seed=args.seed,
         )
+
+        if is_main_process():
+            logger.info(f"✓ BLIP3o dataset loaded: {len(blip3o_dataset):,} samples")
+
+        # Check if mixing with DocLayNet
+        if args.blip3o_mix_doclaynet:
+            if is_main_process():
+                logger.info("Loading DocLayNet for mixed training...")
+
+            from OCRVL.data.doclaynet_dataset import DocLayNetOCRDataset
+            from OCRVL.data.mixed_alignment_dataset import MixedAlignmentDataset
+
+            doclaynet_dataset = DocLayNetOCRDataset(
+                split=args.doclaynet_split,
+                data_dir=args.doclaynet_data_dir,
+                max_text_length=3072,
+                seed=args.seed,
+            )
+
+            if is_main_process():
+                logger.info(f"✓ DocLayNet dataset loaded: {len(doclaynet_dataset):,} samples")
+                logger.info("Creating mixed alignment dataset...")
+
+            # Create mixed dataset
+            dataset = MixedAlignmentDataset(
+                blip3o_dataset=blip3o_dataset,
+                doclaynet_dataset=doclaynet_dataset,
+                seed=args.seed,
+            )
+
+            if is_main_process():
+                logger.info(f"✓ Mixed dataset created: {len(dataset):,} total samples")
+        else:
+            # Use BLIP3o only
+            dataset = blip3o_dataset
 
         if is_main_process():
             logger.info("✓ Dataset loaded. Now initializing OCR adapter...")
@@ -1061,13 +1629,10 @@ def train_stage_alignment(args):
         # Create custom collate function for BLIP3o (SIMPLE - task logic in training loop)
         from OCRVL.data.blip3o_collate import create_blip3o_collate_fn
 
-        # Configure task ratios based on args.enable_match_task
-        # These will be passed to training loop, not collate
+        # Configure task info for logging
         if args.enable_match_task:
-            args.task_ratios = (0.4, 0.4, 0.2)  # Task 1: 40%, Task 2: 40%, Task 3: 20%
             task_info = "Task 1/2/3 (with image-text matching)"
         else:
-            args.task_ratios = (0.5, 0.5, 0.0)  # Task 1: 50%, Task 2: 50%, Task 3: disabled
             task_info = "Task 1/2 only (matching disabled)"
 
         blip3o_collate_fn = create_blip3o_collate_fn(
@@ -1079,25 +1644,113 @@ def train_stage_alignment(args):
             logger.info(f"  Task configuration: {task_info}")
 
     elif args.dataset_type == "llava":
+        # Detect dataset name from JSON path
+        json_filename = Path(args.llava_json_path).stem
+        if "665k" in json_filename.lower() or "mix665k" in json_filename.lower():
+            dataset_name = "LLaVA v1.5 Mix-665K"
+        elif "150k" in json_filename.lower():
+            dataset_name = "LLaVA-Instruct-150K"
+        else:
+            dataset_name = f"LLaVA ({json_filename})"
+
         if is_main_process():
-            logger.info("Loading LLaVA-Instruct-150K dataset...")
+            logger.info(f"Loading {dataset_name} dataset...")
 
         from OCRVL.data.llava_instruct_dataset import LLaVAInstructDataset, create_llava_collate_fn
 
         dataset = LLaVAInstructDataset(
             json_path=args.llava_json_path,
             image_dir=args.llava_image_dir,
-            single_turn_ratio=args.llava_single_turn_ratio,
-            max_turns=args.llava_max_turns,
             render_questions=args.llava_render_questions,
             seed=args.seed,
         )
 
         if is_main_process():
             render_mode = "RENDER=1 (questions as images)" if args.llava_render_questions else "RENDER=0 (text prompts)"
-            logger.info(f"✓ Dataset loaded: {len(dataset)} samples ({render_mode}). Now initializing OCR adapter...")
+            logger.info(f"✓ Dataset loaded: {len(dataset)} samples ({render_mode})")
 
-        # Load OCR adapter (needed on all ranks for collate function)
+        # Load OCR adapter on ALL ranks (needed for batched encoding in collate_fn)
+        # Each rank needs its own encoder for parallel processing
+        if is_main_process():
+            logger.info("Initializing OCR adapter for batched encoding in collate_fn...")
+
+        ocr_adapter = Qwen3VLOCRTextAdapter(
+            encoder_model_path=args.dpsk_model_path,
+            device=args.device,
+            use_deepstack=True
+        )
+
+        if is_main_process():
+            logger.info("✓ OCR adapter initialized")
+            logger.info("✓ Batched encoding: 8 GPUs × batch_size images encoded in parallel")
+
+        # Create LLaVA collate function (CPU-only, no encoding)
+        llava_collate_fn = create_llava_collate_fn(
+            tokenizer=tokenizer,
+        )
+        if is_main_process():
+            logger.info(f"✓ Created LLaVA collate function (CPU-only, encoding moved to training loop)")
+            logger.info(f"  Render mode: {'RENDER=1 (questions as images)' if args.llava_render_questions else 'RENDER=0 (text prompts)'}")
+
+    elif args.dataset_type == "thinking":
+        # LLaVA-CoT dataset for thinking-with-latent-tokens training
+        if is_main_process():
+            logger.info(f"Loading LLaVA-CoT dataset for thinking training...")
+            logger.info(f"  JSONL: {args.thinking_jsonl_path}")
+            logger.info(f"  Image dir: {args.thinking_image_dir}")
+
+        # Load OCR adapter for encoding thinking text
+        ocr_adapter = Qwen3VLOCRTextAdapter(
+            encoder_model_path=args.dpsk_model_path,
+            device=args.device,
+            use_deepstack=True
+        )
+
+        if is_main_process():
+            logger.info("✓ OCR adapter initialized for thinking text encoding")
+
+        from OCRVL.data.thinking_dataset import LLaVACoTDataset, llava_cot_collate_fn
+
+        dataset = LLaVACoTDataset(
+            jsonl_path=args.thinking_jsonl_path,
+            image_base_dir=args.thinking_image_dir,
+            tokenizer=tokenizer,
+            ocr_adapter=ocr_adapter,
+            max_samples=args.thinking_max_samples,
+        )
+
+        if is_main_process():
+            logger.info(f"✓ Dataset loaded: {len(dataset)} samples")
+            logger.info(f"  Thinking loss weight: {args.thinking_loss_weight}")
+
+        # Create collate function
+        thinking_collate_fn = lambda batch: llava_cot_collate_fn(batch, ocr_adapter=ocr_adapter)
+
+        if is_main_process():
+            logger.info(f"✓ Created thinking collate function")
+
+    elif args.dataset_type == "doclaynet":
+        # DocLayNet dataset for document OCR alignment training
+        if is_main_process():
+            logger.info(f"Loading DocLayNet dataset for document OCR training...")
+            logger.info(f"  Data dir: {args.doclaynet_data_dir}")
+            logger.info(f"  Split: {args.doclaynet_split}")
+
+        from OCRVL.data.doclaynet_dataset import DocLayNetOCRDataset
+
+        dataset = DocLayNetOCRDataset(
+            split=args.doclaynet_split,
+            data_dir=args.doclaynet_data_dir,
+            max_text_length=3072,
+            seed=args.seed,
+        )
+
+        if is_main_process():
+            logger.info(f"✓ Dataset loaded: {len(dataset)} samples")
+            logger.info("  Note: DocLayNet will be processed through BLIP3o task formatters")
+            logger.info("  (Document image → layout description, same as image captioning)")
+
+        # Load OCR adapter for BLIP3o-style processing
         ocr_adapter = Qwen3VLOCRTextAdapter(
             encoder_model_path=args.dpsk_model_path,
             device=args.device,
@@ -1107,19 +1760,16 @@ def train_stage_alignment(args):
         if is_main_process():
             logger.info("✓ OCR adapter initialized")
 
-        # Create LLaVA collate function with random ordering
-        llava_collate_fn = create_llava_collate_fn(
+        # Use BLIP3o collate function (DocLayNet is just image-caption pairs)
+        from OCRVL.data.blip3o_collate import create_blip3o_collate_fn
+
+        blip3o_collate_fn = create_blip3o_collate_fn(
             tokenizer=tokenizer,
             ocr_adapter=ocr_adapter,
         )
-        if is_main_process():
-            logger.info(f"✓ Created LLaVA collate function with random image-question ordering")
-            logger.info(f"  Single-turn ratio: {args.llava_single_turn_ratio}")
-            logger.info(f"  Max turns: {args.llava_max_turns if args.llava_max_turns else 'unlimited'}")
-            logger.info(f"  Render mode: {'RENDER=1 (questions as images)' if args.llava_render_questions else 'RENDER=0 (text prompts)'}")
 
-        # Set task_ratios for LLaVA (no multi-task, just single VQA task)
-        args.task_ratios = (1.0, 0.0, 0.0)
+        if is_main_process():
+            logger.info(f"✓ Using BLIP3o collate function for DocLayNet")
 
     else:  # custom
         logger.info(f"Loading dataset from {args.data_path}...")
@@ -1140,17 +1790,9 @@ def train_stage_alignment(args):
 
         dataset = AlignmentDataset(texts, tokenizer, ocr_adapter)
 
-        # Set task_ratios for custom dataset (no multi-task)
-        args.task_ratios = (1.0, 0.0, 0.0)
-
     # DataLoader
-    # BLIP3o and LLaVA use encoding in collate_fn (CUDA), so num_workers must be 0
-    if args.num_workers > 0 and args.dataset_type in ["blip3o", "llava"]:
-        if is_main_process():
-            logger.warning(f"  Setting num_workers=0 (was {args.num_workers}) because {args.dataset_type} uses CUDA in collate_fn")
-        dataloader_num_workers = 0
-    else:
-        dataloader_num_workers = args.num_workers
+    # All datasets now support num_workers > 0 (encoding moved to training loop)
+    dataloader_num_workers = args.num_workers
 
     # Use DistributedSampler for multi-GPU training
     sampler = DistributedSampler(dataset, shuffle=True) if world_size > 1 else None
@@ -1161,6 +1803,10 @@ def train_stage_alignment(args):
         active_collate_fn = blip3o_collate_fn  # Custom collate with task logic
     elif args.dataset_type == "llava":
         active_collate_fn = llava_collate_fn  # LLaVA collate with random ordering
+    elif args.dataset_type == "thinking":
+        active_collate_fn = thinking_collate_fn  # Thinking collate with CoT processing
+    elif args.dataset_type == "doclaynet":
+        active_collate_fn = blip3o_collate_fn  # Use BLIP3o collate (DocLayNet is image-caption pairs)
     else:
         active_collate_fn = collate_fn  # Default collate
 
@@ -1222,16 +1868,18 @@ def train_stage_alignment(args):
             logger.info(f"  Dataset: BLIP3o {args.blip3o_dataset} - {sample_pct_str}")
         elif args.dataset_type == "llava":
             logger.info(f"  Dataset: LLaVA-Instruct-150K")
-            logger.info(f"  Single-turn ratio: {args.llava_single_turn_ratio}")
-            logger.info(f"  Max turns: {args.llava_max_turns if args.llava_max_turns else 'unlimited'}")
             logger.info(f"  Render mode: {'RENDER=1 (questions as images)' if args.llava_render_questions else 'RENDER=0 (text prompts)'}")
+        elif args.dataset_type == "doclaynet":
+            logger.info(f"  Dataset: DocLayNet {args.doclaynet_split} split ({dataset_size:,} samples)")
+            logger.info(f"  Data dir: {args.doclaynet_data_dir}")
         logger.info(f"=" * 70)
 
     # Optimizer
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=args.lr,
-        weight_decay=args.weight_decay
+        weight_decay=args.weight_decay,
+        fused=True  # Use fused kernel for 5-10% speedup
     )
 
     # Restore optimizer state if resuming
@@ -1253,6 +1901,52 @@ def train_stage_alignment(args):
     if is_main_process():
         logger.info("  GradScaler disabled (model uses bfloat16, not float16)")
 
+    # Learning rate scheduler
+    scheduler = None
+    scheduler_state_to_load = None
+    if args.use_lr_scheduler:
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+
+        # Calculate total steps for scheduler
+        total_steps = actual_max_steps - resume_global_step
+
+        # Calculate warmup steps from ratio
+        warmup_steps = int(total_steps * args.warmup_ratio)
+
+        if is_main_process():
+            logger.info("=" * 70)
+            logger.info("Learning Rate Scheduler")
+            logger.info("=" * 70)
+            logger.info(f"  Type: CosineAnnealingLR")
+            logger.info(f"  Initial LR: {args.lr}")
+            logger.info(f"  Min LR (eta_min): {args.lr_scheduler_min_lr}")
+            logger.info(f"  Total steps: {total_steps}")
+            if warmup_steps > 0:
+                logger.info(f"  Warmup ratio: {args.warmup_ratio} ({warmup_steps} steps)")
+                logger.info(f"  Warmup will linearly increase LR from 0 to {args.lr}")
+            logger.info("=" * 70)
+
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=total_steps,
+            eta_min=args.lr_scheduler_min_lr
+        )
+
+        # Store warmup_steps in args for use in training loop
+        args.lr_warmup_steps = warmup_steps
+
+        # Load scheduler state if available from checkpoint
+        if scheduler_state_to_load is not None:
+            scheduler.load_state_dict(scheduler_state_to_load)
+            if is_main_process():
+                logger.info("  ✓ Restored scheduler state from checkpoint")
+
+    else:
+        args.lr_warmup_steps = 0  # No warmup if scheduler disabled
+        if is_main_process():
+            logger.info("  Learning rate scheduler: Disabled (constant LR)")
+
+
     # Training loop
     import time
     training_start_time = time.time()
@@ -1264,7 +1958,7 @@ def train_stage_alignment(args):
         logger.info("=" * 70)
         logger.info("Saving initial checkpoint for validation...")
         logger.info("=" * 70)
-    save_checkpoint(model, optimizer, scaler, global_step, args.output_dir, args)
+    save_checkpoint(model, optimizer, scaler, global_step, args.output_dir, args, scheduler=scheduler, ocr_adapter=ocr_adapter, tokenizer=tokenizer)
     if is_main_process():
         checkpoint_dir = Path(args.output_dir) / f"step_{global_step}"
         logger.info(f"✓ Initial checkpoint saved: {checkpoint_dir}")
@@ -1288,14 +1982,15 @@ def train_stage_alignment(args):
 
         global_step = train_one_epoch(
             model, dataloader, optimizer, scaler, args, global_step,
-            actual_max_steps, epoch + 1, total_steps, tokenizer, ocr_adapter
+            actual_max_steps, epoch + 1, total_steps, tokenizer, ocr_adapter,
+            scheduler=scheduler
         )
 
         if global_step >= actual_max_steps:
             break
 
     # Final save
-    save_checkpoint(model, optimizer, scaler, global_step, args.output_dir, args)
+    save_checkpoint(model, optimizer, scaler, global_step, args.output_dir, args, checkpoint_name="step_latest", scheduler=scheduler, ocr_adapter=ocr_adapter, tokenizer=tokenizer)
 
     # Training completion summary
     total_training_time = time.time() - training_start_time
@@ -1306,7 +2001,7 @@ def train_stage_alignment(args):
         logger.info(f"  Total steps: {global_step}")
         logger.info(f"  Total time: {total_training_time/60:.2f} minutes ({total_training_time/3600:.2f} hours)")
         logger.info(f"  Average time per step: {total_training_time/max(global_step,1):.2f} seconds")
-        logger.info(f"  Final checkpoint: {args.output_dir}/step_{global_step}")
+        logger.info(f"  Final checkpoint: {args.output_dir}/step_latest (step {global_step})")
         logger.info(f"=" * 70)
 
     # Cleanup distributed training
@@ -1330,7 +2025,8 @@ def train_stage_vit(args):
         args.qwen_model_path,
         dtype=torch.bfloat16,
         device_map=device,
-        trust_remote_code=True
+        trust_remote_code=True,
+        attn_implementation="flash_attention_2"  # Enable Flash Attention for 1.5-2x speedup
     )
     # No need to resize embeddings - using Qwen3-VL's native vision tokens
 
@@ -1404,8 +2100,8 @@ def main():
 
     # Data
     parser.add_argument("--dataset-type", type=str, default=None,
-                       choices=["blip3o", "llava", "custom"],
-                       help="Dataset type: blip3o, llava, or custom (default: auto-detect from other args)")
+                       choices=["blip3o", "llava", "thinking", "doclaynet", "custom"],
+                       help="Dataset type: blip3o, llava, thinking, doclaynet, or custom (default: auto-detect from other args)")
     parser.add_argument("--data_path", type=str, default=None,
                        help="Path to training data (text file or jsonl) - used when dataset-type=custom")
 
@@ -1425,6 +2121,8 @@ def main():
                        help="Use real images from BLIP3o (vs rendering captions)")
     parser.add_argument("--blip3o_image_caption_ratio", type=float, default=0.5,
                        help="Ratio of real images to rendered captions (0=all rendered, 1=all real)")
+    parser.add_argument("--blip3o_mix_doclaynet", action="store_true", default=False,
+                       help="Mix DocLayNet dataset with BLIP3o for alignment training (trains on both in 1 epoch)")
     parser.add_argument("--enable_feature_cache", action="store_true", default=False,
                        help="Enable in-memory caching of encoded features (uses ~3GB RAM per GPU, speeds up epoch 2+)")
     parser.add_argument("--enable_match_task", action="store_true", default=False,
@@ -1435,16 +2133,34 @@ def main():
                        default="/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_instruct_150k.json",
                        help="Path to llava_instruct_150k.json")
     parser.add_argument("--llava_image_dir", type=str,
-                       default="/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images/train2014",
-                       help="Directory containing COCO train2014 images")
-    parser.add_argument("--llava_single_turn_ratio", type=float, default=0.5,
-                       help="Ratio of single-turn to multi-turn samples (default: 0.5 = 50% single, 50% multi)")
-    parser.add_argument("--llava_max_turns", type=int, default=None,
-                       help="Maximum number of conversational turns (None = all turns)")
+                       default="/share/project/xiyan/huggingface",
+                       help="Base directory containing datasets (e.g., huggingface root). For 665K, images span coco/vg/gqa/textvqa/ocr_vqa.")
+    parser.add_argument("--llava_image_index", type=str, default=None,
+                       help="Optional JSON mapping from dataset-relative image path (e.g. 'coco/train2017/xxxx.jpg') to absolute local file path.")
     parser.add_argument("--llava_render_questions", action="store_true", default=True,
                        help="Render questions as images (RENDER=1). Use --no-llava_render_questions for RENDER=0.")
     parser.add_argument("--no-llava_render_questions", dest="llava_render_questions", action="store_false",
                        help="Use text prompts instead of rendering (RENDER=0)")
+
+    # Thinking (LLaVA-CoT) dataset configuration
+    parser.add_argument("--thinking_jsonl_path", type=str,
+                       default="/share/project/xiyan/huggingface/Xkev/LLaVA-CoT-100k/train.jsonl",
+                       help="Path to LLaVA-CoT JSONL file")
+    parser.add_argument("--thinking_image_dir", type=str,
+                       default="/share/project/xiyan/huggingface",
+                       help="Base directory containing LLaVA-CoT images")
+    parser.add_argument("--thinking_loss_weight", type=float, default=1.0,
+                       help="Weight for thinking alignment loss (MSE between projected hidden states and OCR-encoded reasoning)")
+    parser.add_argument("--thinking_max_samples", type=int, default=None,
+                       help="Maximum number of samples to load from thinking dataset (None = all)")
+
+    # DocLayNet dataset configuration
+    parser.add_argument("--doclaynet_data_dir", type=str,
+                       default="/share/project/xiyan/huggingface/docling-project/DocLayNet",
+                       help="Root directory of extracted DocLayNet_core.zip (contains COCO/ and PNG/ subdirectories)")
+    parser.add_argument("--doclaynet_split", type=str, default="train",
+                       choices=["train", "val", "test"],
+                       help="DocLayNet split: train (69,375), val (6,489), or test (4,999)")
 
     # Training config
     parser.add_argument("--seed", type=int, default=42,
@@ -1460,6 +2176,14 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--use_amp", action="store_true", default=True)
+
+    # Learning rate scheduler
+    parser.add_argument("--use_lr_scheduler", action="store_true", default=False,
+                       help="Enable cosine annealing learning rate scheduler")
+    parser.add_argument("--lr_scheduler_min_lr", type=float, default=0.0,
+                       help="Minimum learning rate for cosine annealing (eta_min)")
+    parser.add_argument("--warmup_ratio", type=float, default=0.03,
+                       help="Ratio of total steps for linear warmup (e.g., 0.03 = 3%% of training)")
 
     # Logging
     parser.add_argument("--log_interval", type=int, default=50)
@@ -1482,6 +2206,15 @@ def main():
                             "By default (False), only loads model weights (connectors/LoRA). "
                             "Enable this to continue training from exact same point.")
 
+    # Checkpoint evaluation (optional, for training transparency)
+    parser.add_argument("--enable_checkpoint_eval", action="store_true", default=False,
+                       help="Enable checkpoint evaluation: run inference on fixed VQA samples during checkpoint saves")
+    parser.add_argument("--checkpoint_eval_samples", type=str,
+                       default="OCRVL/data/eval_samples.json",
+                       help="Path to JSON file containing evaluation samples")
+    parser.add_argument("--checkpoint_eval_max_samples", type=int, default=12,
+                       help="Maximum number of evaluation samples to run per checkpoint (default: 12, includes 10 VQA + 2 DocLayNet OCR)")
+
     # LoRA configuration (optional, disabled by default)
     parser.add_argument("--use_lora", action="store_true", default=False,
                        help="Enable LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning. "
@@ -1496,10 +2229,16 @@ def main():
                        help="Comma-separated list of modules to apply LoRA to (default: all attention+MLP layers). "
                             "Example: 'q_proj,k_proj,v_proj,o_proj'")
 
+    # Gradient checkpointing
+    parser.add_argument("--use_gradient_checkpointing", action="store_true", default=False,
+                       help="Enable gradient checkpointing to reduce memory usage (~30-40% less memory, ~20% slower training). "
+                            "Recommended for large batch sizes or limited GPU memory.")
+
     # System
     parser.add_argument("--device", type=str, default="cuda:0",
                        help="Device (will be overridden by local_rank in distributed training)")
-    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--num_workers", type=int, default=16,
+                       help="Number of data loading workers (default: 16 for parallel loading)")
 
     args = parser.parse_args()
 
@@ -1546,8 +2285,8 @@ def main():
     if is_main:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-        # Setup file logging
-        file_handler = logging.FileHandler(Path(args.output_dir) / "training.log")
+        # Setup file logging (mode='w' to truncate existing log)
+        file_handler = logging.FileHandler(Path(args.output_dir) / "training.log", mode='w')
         file_handler.setLevel(logging.INFO)
         file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         logger.addHandler(file_handler)
@@ -1563,17 +2302,20 @@ def main():
 
     # Initialize swanlab (only on rank 0)
     if args.use_swanlab and is_main:
-        from datetime import datetime
-        experiment_name = args.swanlab_experiment.replace(
-            '{timestamp}', datetime.now().strftime('%Y%m%d_%H%M%S')
-        )
-        swanlab.init(
-            project=args.swanlab_project,
-            experiment_name=experiment_name,
-            config=vars(args),
-            mode="local"  # Run in local mode (no cloud upload)
-        )
-        logger.info(f"SwanLab initialized: {args.swanlab_project}/{experiment_name} (local mode)")
+        if HAS_SWANLAB:
+            from datetime import datetime
+            experiment_name = args.swanlab_experiment.replace(
+                '{timestamp}', datetime.now().strftime('%Y%m%d_%H%M%S')
+            )
+            swanlab.init(
+                project=args.swanlab_project,
+                experiment_name=experiment_name,
+                config=vars(args),
+                mode="local"  # Run in local mode (no cloud upload)
+            )
+            logger.info(f"SwanLab initialized: {args.swanlab_project}/{experiment_name} (local mode)")
+        else:
+            logger.warning("swanlab not installed, skipping swanlab logging")
 
     # Save config (only on rank 0)
     if is_main:

@@ -255,12 +255,24 @@ class OCRVLProcessor:
         # Initialize vLLM
         self.llm = LLM(**vllm_kwargs)
 
-        # If LoRA is enabled, we need to use LoRARequest during generation
+        # If LoRA is enabled, preload the adapters into vLLM engine
         if self.use_lora:
             self.lora_request_name = "ocrvl_lora"
-            logger.info(f"  LoRA will be applied via LoRARequest during generation")
+            self.lora_int_id = 1
+
+            # CRITICAL: Pre-load LoRA adapters into vLLM engine
+            # This must be done before generation - passing LoRARequest to generate() alone isn't enough
+            from vllm.lora.request import LoRARequest
+            lora_request = LoRARequest(
+                lora_name=self.lora_request_name,
+                lora_int_id=self.lora_int_id,
+                lora_path=str(self.lora_path),
+            )
+            self.llm.llm_engine.add_lora(lora_request)
+            logger.info(f"  ✓ Pre-loaded LoRA adapters into vLLM engine: {self.lora_path.name}")
         else:
             self.lora_request_name = None
+            self.lora_int_id = None
 
     def apply_connectors(
         self,
@@ -446,13 +458,32 @@ class OCRVLProcessor:
         for prompt_embeddings, prompt_grids, prompt_text in zip(llm_embeddings_grouped, grid_thw_grouped, prompts_list):
             # Build input_ids with chat format: <|im_start|>user\n[vision]<|im_end|>\n[prompt_text]
             # Training format: <|im_start|>user\n<|vision_start|>...<|vision_end|>...<|im_end|>\n<|im_start|>assistant\n[caption]
-            prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
 
             # Qwen3-VL chat token IDs
             user_start_ids = [151644, 872, 198]  # <|im_start|>user\n
             user_end_ids = [151645, 198]         # <|im_end|>\n
+            assistant_start_ids = [151644, 77091, 198]  # <|im_start|>assistant\n
 
-            # Build vision blocks for each image (no newlines between blocks - matches training)
+            # Parse prompt_text to handle special tokens correctly
+            if prompt_text.startswith('<|im_start|>'):
+                # Prompt contains chat template tokens - parse them manually
+                # Expected: '<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n'
+                prompt_ids = []
+                if '<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n' in prompt_text:
+                    # Pure vision mode: just assistant start
+                    prompt_ids = assistant_start_ids
+                else:
+                    # Fallback: try to tokenize
+                    prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
+            else:
+                # Regular text prompt - tokenize normally
+                prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
+
+            # Qwen3-VL official format: All images in ONE user block
+            # <|im_start|>user<img1><img2>...<|im_end|>[prompt_text]
+            # Training uses same format with rendered text as one of the images
+
+            # Build vision blocks for all images (concatenated in ONE user block)
             vision_token_ids = []
             for emb in prompt_embeddings:
                 num_tokens = emb.shape[0]  # Should be 100 for each image
@@ -462,8 +493,8 @@ class OCRVLProcessor:
                     self.vision_end_id,
                 ])
 
-            # Wrap vision in user chat tokens, then append prompt (which contains assistant start)
-            # Format: <|im_start|>user\n[vision_tokens]<|im_end|>\n<|im_start|>assistant\n
+            # Wrap all vision tokens in ONE user block, then append prompt
+            # Format: <|im_start|>user\n[all_vision_tokens]<|im_end|>\n[prompt_text]
             input_ids = user_start_ids + vision_token_ids + user_end_ids + prompt_ids
 
             # Concatenate embeddings and grids
@@ -496,7 +527,7 @@ class OCRVLProcessor:
             from vllm.lora.request import LoRARequest
             lora_request = LoRARequest(
                 lora_name=self.lora_request_name,
-                lora_int_id=1,
+                lora_int_id=self.lora_int_id,
                 lora_path=str(self.lora_path),
             )
             logger.info(f"  Applying LoRA: {self.lora_path.name}")

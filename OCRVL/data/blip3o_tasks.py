@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-BLIP3o task formatting - handles task-specific encoding in training loop.
+BLIP3o task formatting - CPU-only preparation, GPU encoding moved to training loop
 
-This module provides functions to format raw BLIP3o samples into model inputs
-for different tasks. Task selection and expansion happens in the training loop.
+Returns PIL images + metadata instead of encoded features.
+This enables parallel data loading with num_workers > 0 and batch encoding.
 """
 import random
 import torch
+from PIL import Image
 
 # Task 1: Image captioning instructions (variance)
 IMAGE_CAPTION_INSTRUCTIONS = [
@@ -30,6 +31,7 @@ TEXT_OCR_INSTRUCTIONS = [
     "What is written here?",
     "Read what's written:",
     "Transcribe what you see:",
+    "Please transcribe all text in the image.",
 ]
 
 # Task 3: Image-text matching question templates (variance)
@@ -67,190 +69,222 @@ NEGATIVE_ANSWERS = [
     "No, this caption is incorrect for the image.",
 ]
 
+# Import Vello renderer for text rendering (CPU-only)
+_VELLO_RENDERER = None
+_VELLO_AVAILABLE = False
 
-def format_task1_batch(batch, tokenizer, ocr_adapter, rng):
+def _get_vello_renderer(image_size=(640, 640)):
+    """Get cached Vello renderer instance"""
+    global _VELLO_RENDERER, _VELLO_AVAILABLE
+
+    if _VELLO_RENDERER is None:
+        try:
+            from Renderer import VelloRenderer, VELLO_AVAILABLE
+            _VELLO_AVAILABLE = VELLO_AVAILABLE
+            if _VELLO_AVAILABLE:
+                _VELLO_RENDERER = VelloRenderer(width=image_size[0], height=image_size[1], padding=20)
+        except Exception:
+            _VELLO_AVAILABLE = False
+            _VELLO_RENDERER = None
+
+    return _VELLO_RENDERER
+
+def _render_text(text, image_size=(640, 640)):
+    """Render text to PIL image using Vello (CPU-only)"""
+    vr = _get_vello_renderer(image_size)
+    if vr is not None:
+        try:
+            return vr.render_batch_pil([text])[0]
+        except Exception:
+            pass
+
+    # PIL fallback
+    from PIL import ImageDraw, ImageFont
+    img = Image.new('RGB', image_size, color='white')
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
+    except Exception:
+        font = ImageFont.load_default()
+
+    margin = 16
+    max_w = image_size[0] - 2 * margin
+    y = margin
+    for line in text.split('\n'):
+        words = line.split()
+        cur = ""
+        for w in words:
+            t = (cur + " " + w) if cur else w
+            bbox = draw.textbbox((0, 0), t, font=font)
+            if bbox[2] - bbox[0] <= max_w:
+                cur = t
+            else:
+                if cur:
+                    draw.text((margin, y), cur, fill='black', font=font)
+                    y += 26
+                cur = w
+        if cur:
+            draw.text((margin, y), cur, fill='black', font=font)
+            y += 26
+        y += 6
+    return img
+
+
+def format_caption_batch(batch, tokenizer, rng):
     """
-    Task 1: Image captioning
-    Format: [Natural image] + [Rendered instruction] -> Caption (or reverse order)
-
-    Args:
-        batch: List of {"image": PIL.Image, "caption": str}
-        tokenizer: Tokenizer
-        ocr_adapter: OCR adapter for encoding
-        rng: Random number generator for variance
+    Image captioning (CPU-only preparation)
+    Format: 50% chance: [Natural image] alone -> Caption
+            50% chance: [Natural image] + [Rendered instruction] -> Caption (random order)
 
     Returns:
-        List with 1 formatted batch (for consistency with task 3 which returns 4)
+        List with 1 dict containing PIL images + metadata (no encoding)
     """
-    batch_input_ids = []
-    batch_labels = []
-    batch_ocr_features = []
+    all_images = []  # Collect PIL images for batch encoding
+    image_counts = []  # Track how many images per sample
+    response_texts = []  # Response texts
+    orderings = []  # Track image ordering per sample
 
     for sample in batch:
-        image = sample["image"]
+        natural_image = sample["image"]  # PIL Image
         caption = sample["caption"]
-        instruction = rng.choice(IMAGE_CAPTION_INSTRUCTIONS)
 
-        # Encode natural image (NO text instruction)
-        img_input_ids, img_ocr_features = ocr_adapter.prepare_qwen_inputs_from_images(
-            instruction="",
-            images=[image],
-            tokenizer=tokenizer,
-            return_deepstack=True,
-            render_instruction=False
-        )
-
-        # Encode rendered instruction as vision tokens
-        inst_input_ids, inst_ocr_features = ocr_adapter.prepare_qwen_inputs(
-            instruction="",
-            dense_text=instruction,
-            tokenizer=tokenizer,
-            return_deepstack=True,
-            render_instruction=False
-        )
-
-        # Target caption (text tokens)
-        response_ids = tokenizer(caption, add_special_tokens=False, return_tensors="pt").input_ids.squeeze(0)
-
-        # Random ordering: instruction first (50%) or last (50%)
+        # 50% chance: just use original image with no text
         if rng.random() < 0.5:
-            full_input_ids = torch.cat([inst_input_ids.squeeze(0), img_input_ids.squeeze(0), response_ids], dim=0)
-            if isinstance(img_ocr_features, tuple):
-                ocr_features = (inst_ocr_features[0] + img_ocr_features[0], inst_ocr_features[1] + img_ocr_features[1])
-            else:
-                ocr_features = inst_ocr_features
+            all_images.append(natural_image)
+            image_counts.append(1)
+            orderings.append("img_only")
         else:
-            full_input_ids = torch.cat([img_input_ids.squeeze(0), inst_input_ids.squeeze(0), response_ids], dim=0)
-            if isinstance(img_ocr_features, tuple):
-                ocr_features = (img_ocr_features[0] + inst_ocr_features[0], img_ocr_features[1] + inst_ocr_features[1])
+            # Use image + rendered instruction
+            instruction = rng.choice(IMAGE_CAPTION_INSTRUCTIONS)
+            instruction_image = _render_text(instruction)
+
+            # Random ordering
+            if rng.random() < 0.5:
+                # Instruction first
+                all_images.extend([instruction_image, natural_image])
+                orderings.append("inst_first")
             else:
-                ocr_features = img_ocr_features
+                # Image first
+                all_images.extend([natural_image, instruction_image])
+                orderings.append("img_first")
 
-        # Labels: mask vision tokens, predict caption
-        labels = full_input_ids.clone()
-        vision_token_count = len(img_input_ids.squeeze(0)) + len(inst_input_ids.squeeze(0))
-        labels[:vision_token_count] = -100
+            image_counts.append(2)
 
-        batch_input_ids.append(full_input_ids)
-        batch_labels.append(labels)
-        batch_ocr_features.append(ocr_features)
+        response_texts.append(caption)
 
-    return [_pad_and_combine(batch_input_ids, batch_labels, batch_ocr_features, tokenizer)]
+    return [{
+        "images": all_images,  # PIL images for GPU encoding
+        "image_counts": image_counts,
+        "response_texts": response_texts,
+        "orderings": orderings,
+        "tokenizer": tokenizer,
+    }]
 
 
-def format_task2_batch(batch, tokenizer, ocr_adapter, rng):
+def format_ocr_batch(batch, tokenizer, rng):
     """
-    Task 2: Text rendering OCR
-    Format: [Rendered caption] + [Rendered instruction] -> Caption (or reverse order)
+    OCR Transcription Task (CPU-only preparation)
+
+    For BLIP3o (text captions):
+        Format: Rendered caption text with embedded instruction -> Caption text
+        Renders: "{caption_text}\n\nPlease transcribe all text in the image"
+        Model outputs: caption_text
+
+    For DocLayNet (document images):
+        Format: Document image + optional rendered OCR instruction -> Layout description
+        50% chance: [Document image] alone -> Layout description
+        50% chance: [Document image] + [Rendered OCR instruction] -> Layout description (random order)
+        Model outputs: layout description
 
     Returns:
-        List with 1 formatted batch (for consistency with task 3 which returns 4)
+        List with 1 dict containing PIL images + metadata (no encoding)
     """
-    batch_input_ids = []
-    batch_labels = []
-    batch_ocr_features = []
+    all_images = []
+    image_counts = []
+    response_texts = []
+    orderings = []
 
     for sample in batch:
+        # Check if this is a real image (DocLayNet) or text caption (BLIP3o)
+        has_image = "image" in sample
         caption = sample["caption"]
-        instruction = rng.choice(TEXT_OCR_INSTRUCTIONS)
 
-        # Encode rendered caption as vision tokens
-        caption_input_ids, caption_ocr_features = ocr_adapter.prepare_qwen_inputs(
-            instruction="",
-            dense_text=caption,
-            tokenizer=tokenizer,
-            return_deepstack=True,
-            render_instruction=False
-        )
+        if has_image:
+            # DocLayNet: Real document image
+            # Format similar to caption task, but with OCR instructions
+            document_image = sample["image"]
 
-        # Encode rendered instruction as vision tokens
-        inst_input_ids, inst_ocr_features = ocr_adapter.prepare_qwen_inputs(
-            instruction="",
-            dense_text=instruction,
-            tokenizer=tokenizer,
-            return_deepstack=True,
-            render_instruction=False
-        )
+            # 50% chance: use document image with rendered OCR instruction
+            if rng.random() < 0.5:
+                # Use document image + rendered OCR instruction
+                instruction = rng.choice(TEXT_OCR_INSTRUCTIONS)
+                instruction_image = _render_text(instruction)
 
-        # Target: same caption (text tokens)
-        response_ids = tokenizer(caption, add_special_tokens=False, return_tensors="pt").input_ids.squeeze(0)
+                # Random ordering
+                if rng.random() < 0.5:
+                    # Instruction first
+                    all_images.extend([instruction_image, document_image])
+                    orderings.append("inst_first")
+                else:
+                    # Document first
+                    all_images.extend([document_image, instruction_image])
+                    orderings.append("img_first")
 
-        # Random ordering
-        if rng.random() < 0.5:
-            full_input_ids = torch.cat([inst_input_ids.squeeze(0), caption_input_ids.squeeze(0), response_ids], dim=0)
-            if isinstance(caption_ocr_features, tuple):
-                ocr_features = (inst_ocr_features[0] + caption_ocr_features[0], inst_ocr_features[1] + caption_ocr_features[1])
+                image_counts.append(2)
             else:
-                ocr_features = inst_ocr_features
+                # Just document image, no instruction
+                all_images.append(document_image)
+                image_counts.append(1)
+                orderings.append("img_only")
+
         else:
-            full_input_ids = torch.cat([caption_input_ids.squeeze(0), inst_input_ids.squeeze(0), response_ids], dim=0)
-            if isinstance(caption_ocr_features, tuple):
-                ocr_features = (caption_ocr_features[0] + inst_ocr_features[0], caption_ocr_features[1] + inst_ocr_features[1])
-            else:
-                ocr_features = caption_ocr_features
+            # BLIP3o: Text caption - render with embedded OCR instruction
+            instruction = rng.choice(TEXT_OCR_INSTRUCTIONS)
+            combined_text = f"{caption}\n\n{instruction}"
+            rendered_image = _render_text(combined_text)
 
-        # Labels: mask vision tokens, predict caption
-        labels = full_input_ids.clone()
-        vision_token_count = len(caption_input_ids.squeeze(0)) + len(inst_input_ids.squeeze(0))
-        labels[:vision_token_count] = -100
+            all_images.append(rendered_image)
+            image_counts.append(1)
+            orderings.append("ocr_single")
 
-        batch_input_ids.append(full_input_ids)
-        batch_labels.append(labels)
-        batch_ocr_features.append(ocr_features)
+        response_texts.append(caption)
 
-    return [_pad_and_combine(batch_input_ids, batch_labels, batch_ocr_features, tokenizer)]
+    return [{
+        "images": all_images,
+        "image_counts": image_counts,
+        "response_texts": response_texts,
+        "orderings": orderings,
+        "tokenizer": tokenizer,
+    }]
 
 
-def format_task3_batch(batch, tokenizer, ocr_adapter, rng):
+def format_task3_batch(batch, tokenizer, rng):
     """
-    Task 3: Contrastive matching with efficient negative sampling via caption shifting
+    Task 3: Contrastive matching (CPU-only preparation)
 
-    Given batch of N samples with (image_i, caption_i) pairs:
-    - Forward 1 (shift=0): All positives (img_i, cap_i) → "Yes"
-    - Forward 2 (shift=1): All negatives (img_i, cap_{i+1}) → "No"
-    - Forward 3 (shift=2): All negatives (img_i, cap_{i+2}) → "No"
-    - Forward 4 (shift=3): All negatives (img_i, cap_{i+3}) → "No"
-
-    Returns 4 sub-batches (one per shift) to avoid OOM.
-    Each sub-batch has N samples.
-
-    Requirement: N >= 4 for proper negative sampling
+    Returns 4 sub-batches (one per shift) with PIL images + metadata
     """
     if len(batch) < 4:
-        # Need at least 4 samples for shifting
-        # Fall back to task 1
-        return [format_task1_batch(batch, tokenizer, ocr_adapter, rng)]
+        # Fallback to caption task
+        return format_caption_batch(batch, tokenizer, rng)
 
     N = len(batch)
     images = [sample["image"] for sample in batch]
     captions = [sample["caption"] for sample in batch]
 
-    # Encode all images once (reuse across 4 forwards)
-    encoded_images = []
-    for image in images:
-        img_input_ids, img_ocr_features = ocr_adapter.prepare_qwen_inputs_from_images(
-            instruction="",
-            images=[image],
-            tokenizer=tokenizer,
-            return_deepstack=True,
-            render_instruction=False
-        )
-        encoded_images.append((img_input_ids, img_ocr_features))
-
     # Create 4 sub-batches (one for each shift: 0, 1, 2, 3)
     sub_batches = []
 
     for shift in range(4):
-        batch_input_ids = []
-        batch_labels = []
-        batch_ocr_features = []
+        all_images = []
+        image_counts = []
+        response_texts = []
+        orderings = []  # Not used for task 3 (fixed order: img + template)
 
-        # Determine if positive (shift=0) or negative (shift>0)
         is_positive = (shift == 0)
 
         for i in range(N):
-            # Get pre-encoded image
-            img_input_ids, img_ocr_features = encoded_images[i]
+            natural_image = images[i]
 
             # Get caption (shifted for negatives)
             caption_idx = (i + shift) % N
@@ -271,89 +305,20 @@ def format_task3_batch(batch, tokenizer, ocr_adapter, rng):
             else:
                 template_text = f"{question} {caption}"
 
-            template_input_ids, template_ocr_features = ocr_adapter.prepare_qwen_inputs(
-                instruction="",
-                dense_text=template_text,
-                tokenizer=tokenizer,
-                return_deepstack=True,
-                render_instruction=False
-            )
+            template_image = _render_text(template_text)
 
-            # Answer (text tokens)
-            answer_ids = tokenizer(answer, add_special_tokens=False, return_tensors="pt").input_ids.squeeze(0)
+            # Fixed order: natural image + template
+            all_images.extend([natural_image, template_image])
+            image_counts.append(2)
+            response_texts.append(answer)
+            orderings.append("img_template")
 
-            # Concatenate: image + template + answer
-            full_input_ids = torch.cat([
-                img_input_ids.squeeze(0),
-                template_input_ids.squeeze(0),
-                answer_ids
-            ], dim=0)
+        sub_batches.append({
+            "images": all_images,
+            "image_counts": image_counts,
+            "response_texts": response_texts,
+            "orderings": orderings,
+            "tokenizer": tokenizer,
+        })
 
-            # Combine OCR features
-            if isinstance(img_ocr_features, tuple):
-                ocr_features = (
-                    img_ocr_features[0] + template_ocr_features[0],
-                    img_ocr_features[1] + template_ocr_features[1]
-                )
-            else:
-                ocr_features = img_ocr_features
-
-            # Labels: mask vision tokens, predict answer only
-            labels = full_input_ids.clone()
-            vision_token_count = len(img_input_ids.squeeze(0)) + len(template_input_ids.squeeze(0))
-            labels[:vision_token_count] = -100
-
-            batch_input_ids.append(full_input_ids)
-            batch_labels.append(labels)
-            batch_ocr_features.append(ocr_features)
-
-        # Pad and combine this sub-batch
-        formatted = _pad_and_combine(batch_input_ids, batch_labels, batch_ocr_features, tokenizer)
-        sub_batches.append(formatted)
-
-    return sub_batches  # Returns list of 4 batches (shift 0, 1, 2, 3)
-
-
-def _pad_and_combine(batch_input_ids, batch_labels, batch_ocr_features, tokenizer):
-    """Helper: Pad sequences and combine features"""
-    max_len = max(ids.size(0) for ids in batch_input_ids)
-    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-
-    padded_input_ids = []
-    padded_labels = []
-    attention_masks = []
-
-    for input_ids, labels in zip(batch_input_ids, batch_labels):
-        seq_len = input_ids.size(0)
-        padding_len = max_len - seq_len
-
-        padded_input_ids.append(
-            torch.cat([input_ids, torch.full((padding_len,), pad_token_id, dtype=input_ids.dtype)])
-        )
-        padded_labels.append(
-            torch.cat([labels, torch.full((padding_len,), -100, dtype=labels.dtype)])
-        )
-        attention_masks.append(
-            torch.cat([torch.ones(seq_len, dtype=torch.long), torch.zeros(padding_len, dtype=torch.long)])
-        )
-
-    # Combine OCR features
-    final_feats_combined = []
-    deepstack_feats_combined = []
-
-    for ocr_feat in batch_ocr_features:
-        if isinstance(ocr_feat, tuple):
-            final, ds = ocr_feat
-            final_feats_combined.extend(final)
-            deepstack_feats_combined.extend(ds)
-        else:
-            final_feats_combined.extend(ocr_feat)
-
-    combined_ocr_features = (final_feats_combined, deepstack_feats_combined) if deepstack_feats_combined else final_feats_combined
-
-    return {
-        "input_ids": torch.stack(padded_input_ids),
-        "attention_mask": torch.stack(attention_masks),
-        "labels": torch.stack(padded_labels),
-        "ocr_image_features": combined_ocr_features,
-    }
+    return sub_batches  # 4 sub-batches

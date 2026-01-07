@@ -7,6 +7,11 @@
 #   - 50%: <Real Image> + <Rendered Question> -> Answer
 #   - 50%: <Rendered Question> + <Real Image> -> Answer
 #
+# Checkpoint Evaluation:
+#   - Enabled by default: runs VQA inference on 10 fixed samples per checkpoint
+#   - Results saved in: {checkpoint_dir}/eval_results/
+#   - Provides training transparency without full benchmark overhead
+#
 # Usage Examples:
 #   # Continue from alignment checkpoint with LoRA
 #   RESUME_CHECKPOINT=OCRVL/checkpoints/.../step_786 bash OCRVL/scripts/train_instruction.sh
@@ -34,26 +39,32 @@ LORA_R="${LORA_R:-8}"           # LoRA rank
 LORA_ALPHA="${LORA_ALPHA:-16}"  # LoRA alpha (typically 2x rank)
 LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
 
-# LLaVA-Instruct dataset paths
-LLAVA_JSON_PATH="${LLAVA_JSON_PATH:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_instruct_150k.json}"
-LLAVA_IMAGE_DIR="${LLAVA_IMAGE_DIR:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images/train2014}"
+# LLaVA-Instruct dataset paths (default to 665K mix with proper images/ directory)
+LLAVA_JSON_PATH="${LLAVA_JSON_PATH:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json}"
+LLAVA_IMAGE_DIR="${LLAVA_IMAGE_DIR:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images}"
+LLAVA_IMAGE_INDEX="${LLAVA_IMAGE_INDEX:-}"  # Optional: path to prebuilt image index JSON
 
 # Dataset configuration
-SINGLE_TURN_RATIO="${SINGLE_TURN_RATIO:-0.5}"  # 50% single-turn, 50% multi-turn
-MAX_TURNS="${MAX_TURNS:-}"  # Maximum conversation turns (empty = all turns)
-NUM_EPOCHS="${NUM_EPOCHS:-1}"
+NUM_EPOCHS="${NUM_EPOCHS:-3}"       # Default 3 epochs for instruction tuning
 RENDER="${RENDER:-1}"  # 1 = render questions as images (default), 0 = text prompts
 
-# Training hyperparameters
-BATCH_SIZE="${BATCH_SIZE:-4}"       # Per-GPU batch size (lower for instruction tuning)
-GRAD_ACCUM="${GRAD_ACCUM:-32}"      # Gradient accumulation steps
-LR="${LR:-2e-4}"                    # Learning rate (2e-4 for LoRA)
+# Training hyperparameters (optimized for LoRA instruction tuning)
+BATCH_SIZE="${BATCH_SIZE:-12}"      # Per-GPU batch size
+GRAD_ACCUM="${GRAD_ACCUM:-4}"       # Gradient accumulation steps (effective batch: 384 on 8 GPUs)
+LR="${LR:-2e-4}"                    # Learning rate (2e-4 for LoRA instruction tuning)
+LR_MIN="${LR_MIN:-2e-5}"            # Minimum LR for cosine annealing (10% of peak, prevents decay to zero)
+USE_LR_SCHEDULER="${USE_LR_SCHEDULER:-false}"  # Constant LR is standard for LoRA (set to 'true' for cosine decay)
+WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
+USE_GRADIENT_CHECKPOINTING="${USE_GRADIENT_CHECKPOINTING:-false}"  # Enable to save ~30-40% memory (~20% slower)
 
 # System configuration
-NUM_GPUS="${NUM_GPUS:-8}"           # Number of GPUs to use
+NUM_GPUS="${NUM_GPUS:-8}"           # Number of GPUs to use (scaled from 4 to 8 for faster training)
 GPU_IDS="${GPU_IDS:-}"              # GPU device IDs (auto-generated if not set)
 MASTER_PORT="${MASTER_PORT:-29501}"
+
+# Output directory (optional override)
+OUTPUT_DIR="${OUTPUT_DIR:-}"        # If set, overrides auto-generated output directory
 
 # Logging
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
@@ -71,11 +82,20 @@ fi
 
 EFFECTIVE_BATCH=$((NUM_GPUS * BATCH_SIZE * GRAD_ACCUM))
 
-# Auto-adjust LR for LoRA (default is LoRA enabled with 2e-4)
+# Auto-adjust LR for LoRA (only triggers if LR set to 4e-4)
 if [ "$USE_LORA" = "true" ] && [ "$LR" = "4e-4" ]; then
     echo "ℹ️  Using LoRA: Automatically adjusting LR to 2e-4 for stability"
     LR="2e-4"
 fi
+
+# Auto-generate OUTPUT_DIR if not set (so we know where to write torchrun.log)
+if [ -z "$OUTPUT_DIR" ]; then
+    timestamp=$(date '+%Y%m%d_%H%M%S')
+    OUTPUT_DIR="OCRVL/checkpoints/llava_${timestamp}"
+fi
+
+# Create output directory upfront
+mkdir -p "$OUTPUT_DIR"
 
 # ============================================================================
 # Validation
@@ -112,7 +132,7 @@ if [ ! -f "$LLAVA_JSON_PATH" ]; then
 fi
 
 if [ ! -d "$LLAVA_IMAGE_DIR" ]; then
-    echo "❌ Error: COCO image directory not found at $LLAVA_IMAGE_DIR"
+    echo "❌ Error: LLaVA image directory not found at $LLAVA_IMAGE_DIR"
     exit 1
 fi
 
@@ -150,11 +170,9 @@ fi
 echo "  Status: $([ -n "$RESUME_CHECKPOINT" ] && echo "Continue from checkpoint" || echo "Fresh training")"
 echo ""
 echo "Dataset:"
-echo "  LLaVA-Instruct-150K (full dataset, ~150K conversations)"
+echo "  LLaVA v1.5 Mix-665K (full dataset, ~665K conversations)"
 echo "  JSON: $LLAVA_JSON_PATH"
 echo "  Images: $LLAVA_IMAGE_DIR"
-echo "  Single-turn ratio: $(echo "$SINGLE_TURN_RATIO * 100" | bc)%"
-[ -n "$MAX_TURNS" ] && echo "  Max turns: $MAX_TURNS" || echo "  Max turns: unlimited"
 echo "  Epochs: $NUM_EPOCHS"
 echo "  Render mode: $([ "$RENDER" = "1" ] && echo "RENDER=1 (questions as images)" || echo "RENDER=0 (text prompts)")"
 echo ""
@@ -173,7 +191,11 @@ echo "  Gradient accumulation: $GRAD_ACCUM"
 echo "  Number of GPUs: $NUM_GPUS"
 echo "  GPU devices: $GPU_IDS"
 echo "  Effective batch size: $EFFECTIVE_BATCH"
-echo "  Learning rate: $LR"
+if [ "$USE_LR_SCHEDULER" = "true" ]; then
+    echo "  Learning rate: $LR → $LR_MIN (cosine decay)"
+else
+    echo "  Learning rate: $LR (constant)"
+fi
 echo "  Weight decay: $WEIGHT_DECAY"
 echo ""
 if [ -n "$RESUME_CHECKPOINT" ]; then
@@ -189,6 +211,10 @@ fi
 echo "Expected Performance:"
 echo "  ~30-50 samples/s (depends on hardware and batch size)"
 echo "  ~2-3 hours per epoch (for full LLaVA-Instruct-150K)"
+echo ""
+echo "Checkpoint Evaluation:"
+echo "  Enabled by default - runs VQA inference on 10 fixed samples per checkpoint"
+echo "  Results saved in: {checkpoint_dir}/eval_results/"
 echo "========================================================================"
 echo ""
 
@@ -201,25 +227,33 @@ TRAIN_ARGS=(
     --dataset-type llava
     --llava_json_path "$LLAVA_JSON_PATH"
     --llava_image_dir "$LLAVA_IMAGE_DIR"
-    --llava_single_turn_ratio "$SINGLE_TURN_RATIO"
     --num_epochs "$NUM_EPOCHS"
     --batch_size "$BATCH_SIZE"
     --gradient_accumulation_steps "$GRAD_ACCUM"
     --lr "$LR"
     --weight_decay "$WEIGHT_DECAY"
-    --num_workers 0
+    --num_workers 4
     --log_interval "$LOG_INTERVAL"
     --save_interval "$SAVE_INTERVAL"
 )
 
-# Add max_turns if specified
-if [ -n "$MAX_TURNS" ]; then
-    TRAIN_ARGS+=(--llava_max_turns "$MAX_TURNS")
+# Add LR scheduler if enabled (disabled by default for LoRA)
+if [ "$USE_LR_SCHEDULER" = "true" ]; then
+    TRAIN_ARGS+=(
+        --use_lr_scheduler
+        --lr_scheduler_min_lr "$LR_MIN"
+        --warmup_ratio "$WARMUP_RATIO"
+    )
 fi
 
 # Add render mode (default is RENDER=1, which uses default --llava_render_questions)
 if [ "$RENDER" = "0" ]; then
     TRAIN_ARGS+=(--no-llava_render_questions)
+fi
+
+# Add image index if provided
+if [ -n "$LLAVA_IMAGE_INDEX" ]; then
+    TRAIN_ARGS+=(--llava_image_index "$LLAVA_IMAGE_INDEX")
 fi
 
 # Add checkpoint resume if specified
@@ -241,26 +275,47 @@ if [ "$USE_LORA" = "true" ]; then
     )
 fi
 
+# Add gradient checkpointing if enabled
+if [ "$USE_GRADIENT_CHECKPOINTING" = "true" ]; then
+    TRAIN_ARGS+=(--use_gradient_checkpointing)
+fi
+
 # Add SwanLab if enabled
 if [ "$USE_SWANLAB" = "true" ]; then
     TRAIN_ARGS+=(--use_swanlab)
 fi
 
+# Add output directory if specified
+if [ -n "$OUTPUT_DIR" ]; then
+    TRAIN_ARGS+=(--output_dir "$OUTPUT_DIR")
+fi
+
+# Enable checkpoint evaluation by default for training transparency
+TRAIN_ARGS+=(--enable_checkpoint_eval)
+
 # ============================================================================
 # Start Training
 # ============================================================================
 
+echo "Starting training... (torchrun output will be captured)"
+echo "Torchrun log will be saved to: $OUTPUT_DIR/torchrun.log"
+echo ""
+
+# Run training with stderr redirected to capture all exceptions
 CUDA_VISIBLE_DEVICES=$GPU_IDS torchrun \
     --nproc_per_node=$NUM_GPUS \
     --master_port=$MASTER_PORT \
     OCRVL/train.py \
-    "${TRAIN_ARGS[@]}"
+    "${TRAIN_ARGS[@]}" 2>&1 | tee "$OUTPUT_DIR/torchrun.log"
+
+# Store exit code before any other commands
+TRAINING_EXIT_CODE=$?
 
 # ============================================================================
 # Post-Training
 # ============================================================================
 
-if [ $? -eq 0 ]; then
+if [ $TRAINING_EXIT_CODE -eq 0 ]; then
     echo ""
     echo "========================================================================"
     echo "✓ Instruction tuning completed successfully!"
@@ -270,10 +325,10 @@ if [ $? -eq 0 ]; then
     LATEST_CHECKPOINT=$(ls -td OCRVL/checkpoints/alignment_* 2>/dev/null | head -1)
 
     if [ -n "$LATEST_CHECKPOINT" ]; then
-        FINAL_STEP=$(ls -d "$LATEST_CHECKPOINT"/step_* 2>/dev/null | sort -V | tail -1)
+        FINAL_STEP="$LATEST_CHECKPOINT/step_latest"
         echo ""
         echo "Latest checkpoint: $LATEST_CHECKPOINT"
-        if [ -n "$FINAL_STEP" ]; then
+        if [ -d "$FINAL_STEP" ]; then
             echo "Final step: $FINAL_STEP"
             echo ""
             echo "To continue training from this checkpoint:"

@@ -297,8 +297,9 @@ def evaluate_realworldqa_vllm(
                     # Render question as image
                     question_instruction_img = render_text_to_image(text)
                     imgs = [real_img, question_instruction_img]
-                    # Use proper Qwen3-VL assistant start token (matches training format)
-                    prompt_text = '<|im_start|>assistant\n'
+                    # Use proper Qwen3-VL chat format (matches training format)
+                    # Training: <|im_start|>user\n[images]<|im_end|>\n<|im_start|>assistant\n
+                    prompt_text = '<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n'
                 else:
                     # Use text directly as prompt
                     imgs = [real_img]  # Only real image

@@ -197,6 +197,31 @@ class OCRQwen3VLModel(Qwen3VLModel):
                 self.ocr_connector = self._init_ocr_connector(in_dim, device=device, dtype=dtype)  # type: ignore[attr-defined]
         return self.ocr_connector  # type: ignore[attr-defined]
 
+    def _init_thinking_projection(self, *, device: torch.device, dtype: torch.dtype) -> nn.Module:
+        """Build thinking projection MLP: hidden_dim → latent_dim (4096 → 1280)
+
+        This projection maps transformer hidden states to OCR latent space for
+        thinking-with-latent-tokens training. Architecture follows connector pattern.
+
+        Parameters: ~10.5M (Linear 4096×2048=8.4M + Linear 2048×1280=2.6M + biases)
+        """
+        hidden_dim = self.config.text_config.hidden_size  # 4096 for Qwen3-VL
+        latent_dim = 1280  # DPSK OCR latent dimension
+
+        projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),  # 4096 → 2048
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, latent_dim),  # 2048 → 1280
+        )
+
+        return projection.to(device=device, dtype=dtype)
+
+    def _maybe_get_thinking_projection(self, *, device: torch.device, dtype: torch.dtype) -> nn.Module:
+        """Lazy initialization of thinking projection"""
+        if not hasattr(self, "thinking_projection") or self.thinking_projection is None:  # type: ignore[attr-defined]
+            self.thinking_projection = self._init_thinking_projection(device=device, dtype=dtype)  # type: ignore[attr-defined]
+        return self.thinking_projection  # type: ignore[attr-defined]
+
     def _maybe_get_deepstack_connector(self, in_dim: int, *, device: torch.device, dtype: torch.dtype) -> nn.Module:
         """Deepstack levels connector - also uses LLaVA-1.5/1.6 mlp2x_gelu."""
         if not hasattr(self, "_ocr_deepstack_connectors") or self._ocr_deepstack_connectors is None:  # type: ignore[attr-defined]
@@ -245,11 +270,20 @@ class OCRQwen3VLModel(Qwen3VLModel):
 
         # This OCR-Qwen wrapper consumes OCR pre-encoded visual tokens.
         # Native pixel_values -> ViT -> LM path is only used as a *reference* for alignment.
-        if ocr_image_features is None:
+
+        # During generation, cache_position indicates if this is first pass (=0) or subsequent (>0)
+        # Only require ocr_image_features on first pass
+        is_first_pass = (cache_position is None or
+                        (hasattr(cache_position, '__len__') and len(cache_position) > 0 and cache_position[0] == 0) or
+                        (not hasattr(cache_position, '__len__') and cache_position == 0))
+
+        if ocr_image_features is None and is_first_pass:
             raise ValueError(
                 "ocr_image_features is required. Provide OCR features (and <image> placeholders in input_ids). "
                 "For training-time alignment, also provide pixel_values/pixel_values_ref with ocr_alignment=True."
             )
+
+        # On subsequent passes, ocr_image_features can be None (vision already in KV cache)
 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -440,6 +474,7 @@ class OCRQwen3VLModel(Qwen3VLModel):
             cache_position=cache_position,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
+            output_hidden_states=True,  # Enable hidden states for thinking projection
             **kwargs,
         )
 
@@ -520,8 +555,14 @@ class OCRQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
         ocr_alignment_weight: Optional[float] = None,
         vision_scale: Optional[float] = None,
         text_scale: Optional[float] = None,
+        latent_supervision: Optional[List[List[torch.Tensor]]] = None,
+        latent_positions: Optional[torch.BoolTensor] = None,
+        thinking_loss_weight: Optional[float] = None,
         **kwargs: Any,
     ) -> Union[tuple, Qwen3VLCausalLMOutputWithPast]:
+        # Filter out output_hidden_states from kwargs to prevent conflicts with LoRA
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k != 'output_hidden_states'}
+
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -539,7 +580,7 @@ class OCRQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ocr_alignment_weight=ocr_alignment_weight,
             vision_scale=vision_scale,
             text_scale=text_scale,
-            **kwargs,
+            **filtered_kwargs,
         )
 
         hidden_states = outputs[0]
@@ -549,6 +590,53 @@ class OCRQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
+
+        # Thinking loss: align projected hidden states with OCR-encoded supervision
+        thinking_loss = None
+        if latent_supervision is not None and latent_positions is not None:
+            # Get thinking projection MLP
+            thinking_proj = self.model._maybe_get_thinking_projection(
+                device=hidden_states.device,
+                dtype=hidden_states.dtype
+            )
+
+            batch_size = hidden_states.shape[0]
+            thinking_losses = []
+
+            for b in range(batch_size):
+                latent_mask = latent_positions[b]  # [seq_len]
+                if not latent_mask.any():
+                    continue
+
+                # Extract hidden states at latent token positions
+                sample_hidden = hidden_states[b][latent_mask]  # [num_latents, hidden_dim]
+
+                # Project to latent space
+                predicted_latents = thinking_proj(sample_hidden)  # [num_latents, 1280]
+
+                # Get supervision (each chunk is [111, 1280], mean-pool to [1280])
+                supervision_list = latent_supervision[b]
+                supervision_latents = []
+                for sup_tensor in supervision_list:
+                    # Mean-pool spatial tokens to get 1280-dim representation
+                    supervision_latents.append(sup_tensor.mean(dim=0))  # [1280]
+
+                supervision_tensor = torch.stack(supervision_latents, dim=0)  # [num_latents, 1280]
+                supervision_tensor = supervision_tensor.to(predicted_latents.device, predicted_latents.dtype)
+
+                # MSE loss
+                min_count = min(predicted_latents.shape[0], supervision_tensor.shape[0])
+                sample_loss = torch.mean((predicted_latents[:min_count] - supervision_tensor[:min_count]) ** 2)
+                thinking_losses.append(sample_loss)
+
+            if thinking_losses:
+                thinking_loss = torch.stack(thinking_losses).mean()
+                weight = float(thinking_loss_weight) if thinking_loss_weight is not None else 1.0
+                thinking_loss = thinking_loss * weight
+
+        # Combine all losses
+        if thinking_loss is not None:
+            loss = thinking_loss if loss is None else (loss + thinking_loss)
 
         alignment_loss = getattr(outputs, "ocr_alignment_loss", None)
         if alignment_loss is not None:
@@ -583,6 +671,7 @@ class OCRQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("`inputs_embeds` is not supported")
 
+        # Build model_inputs for standard parameters
         model_inputs = {
             "input_ids": inputs,
             "position_ids": position_ids,
@@ -591,11 +680,26 @@ class OCRQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
             "pixel_values_videos": pixel_values_videos,
             "image_grid_thw": image_grid_thw,
             "video_grid_thw": video_grid_thw,
-            "ocr_image_features": ocr_image_features,
-            "vision_scale": vision_scale,
-            "text_scale": text_scale,
         }
-        return super().generate(**model_inputs, **kwargs)
+
+        # Store OCR-specific parameters as temporary model attributes
+        # (workaround: HuggingFace generate() doesn't pass custom kwargs to prepare_inputs_for_generation)
+        self._temp_ocr_image_features = ocr_image_features
+        self._temp_vision_scale = vision_scale
+        self._temp_text_scale = text_scale
+
+        try:
+            result = super().generate(**model_inputs, **kwargs)
+        finally:
+            # Clean up temporary attributes
+            if hasattr(self, '_temp_ocr_image_features'):
+                delattr(self, '_temp_ocr_image_features')
+            if hasattr(self, '_temp_vision_scale'):
+                delattr(self, '_temp_vision_scale')
+            if hasattr(self, '_temp_text_scale'):
+                delattr(self, '_temp_text_scale')
+
+        return result
 
     def prepare_inputs_for_generation(
         self,
@@ -616,6 +720,7 @@ class OCRQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
         text_scale=None,
         **kwargs: Any,
     ):
+        # Don't pass OCR-specific parameters to parent (it doesn't understand them)
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
@@ -628,25 +733,38 @@ class OCRQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
             use_cache=use_cache,
-            ocr_image_features=ocr_image_features,
-            deepstack_features=deepstack_features,
-            vision_scale=vision_scale,
-            text_scale=text_scale,
             **kwargs,
         )
 
         model_inputs["position_ids"] = None
 
-        if cache_position is not None and cache_position[0] != 0:
+        # Ensure OCR features are preserved (parent class may not include them)
+        if cache_position is None or cache_position[0] == 0:
+            # First forward pass: use provided OCR features or temporary attributes from generate()
+            if ocr_image_features is not None:
+                model_inputs["ocr_image_features"] = ocr_image_features
+            elif hasattr(self, '_temp_ocr_image_features') and self._temp_ocr_image_features is not None:
+                model_inputs["ocr_image_features"] = self._temp_ocr_image_features
+
+            if deepstack_features is not None:
+                model_inputs["deepstack_features"] = deepstack_features
+        else:
+            # Subsequent passes: clear vision inputs (already processed)
             model_inputs["pixel_values"] = None
             model_inputs["pixel_values_videos"] = None
             model_inputs["ocr_image_features"] = None
             model_inputs["deepstack_features"] = None
 
+        # Use temporary attributes from generate() if parameters not provided
         if vision_scale is not None:
             model_inputs["vision_scale"] = vision_scale
+        elif hasattr(self, '_temp_vision_scale') and self._temp_vision_scale is not None:
+            model_inputs["vision_scale"] = self._temp_vision_scale
+
         if text_scale is not None:
             model_inputs["text_scale"] = text_scale
+        elif hasattr(self, '_temp_text_scale') and self._temp_text_scale is not None:
+            model_inputs["text_scale"] = self._temp_text_scale
 
         return model_inputs
 
