@@ -1,0 +1,64 @@
+### model
+# Use local mirrors to avoid network access.
+model_name_or_path: /share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Instruct
+image_max_pixels: 262144
+video_max_pixels: 16384
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+do_eval: true
+finetuning_type: lora
+lora_rank: 8
+# Target LLM layers only (exclude vision to avoid PEFT errors)
+lora_target: q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj
+
+# Train OCRVL connector modules alongside LoRA adapters.
+# NOTE: Do not include `thinking_projection` unless you are running a latent-supervision stage,
+# otherwise it will be unused and can hang DDP when `ddp_find_unused_parameters=false`.
+additional_target: model.ocr_connector,model.ocr_deepstack_connector
+
+### dataset
+# For real training, prefer `OCRVL/examples/llamafactory/qwen3vl_dpskocr_lora_llava665k.yaml`
+# after running `bash OCRVL/scripts/prepare_llamafactory_datasets.sh`.
+dataset: mllm_demo
+eval_dataset: mllm_demo
+template: ocrvl_qwen3_vl_nothink
+cutoff_len: 2048
+max_samples: 1000
+# Streaming mode: Skip slow upfront tokenization that loads images
+# Images are tokenized/loaded on-the-fly during training instead (much faster startup)
+streaming: true
+# Enable sequence packing to reduce padding waste
+packing: true
+# Reduce workers for streaming (no need for parallel preprocessing)
+preprocessing_num_workers: 1
+dataloader_num_workers: 2
+
+### output
+# Base output directory (timestamp will be added automatically by training script)
+# Or override via command line: output_dir=path/to/checkpoint
+output_dir: OCRVL/checkpoints/llamafactory/qwen3vl-2b/lora/sft
+logging_steps: 10
+save_steps: 500
+eval_steps: 500
+evaluation_strategy: steps
+per_device_eval_batch_size: 4
+plot_loss: true
+overwrite_output_dir: false  # Don't overwrite existing checkpoints
+save_only_model: false
+report_to: none
+
+### train
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 8
+dataloader_drop_last: true
+learning_rate: 1.0e-4
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_find_unused_parameters: false
+ddp_timeout: 180000000
+resume_from_checkpoint: null

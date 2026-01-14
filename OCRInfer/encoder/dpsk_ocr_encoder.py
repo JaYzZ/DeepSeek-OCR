@@ -23,11 +23,15 @@ from ..decoder import transformers_patch  # noqa: F401
 
 import torch
 import torch.nn as nn
+import functools
+import os
+import glob
 from typing import List, Optional, Tuple, Union
 from PIL import Image, ImageOps
 import logging
 from pathlib import Path
 from dataclasses import dataclass
+from safetensors import safe_open
 
 from OCRInfer.utils.model_paths import resolve_model_path
 from sys_path import _add_sys_path
@@ -43,7 +47,7 @@ class EncoderOutput:
     intermediate_features: Optional[List[torch.Tensor]] = None  # List of [N, hidden_dim] at each level
 
 
-class DPSKOCREncoder:
+class DPSKOCREncoder(nn.Module):
     """
     DeepSeek-OCR Vision Encoder with Optional Multi-Level Feature Extraction
 
@@ -91,11 +95,15 @@ class DPSKOCREncoder:
                                If False, keep line separators (111 tokens = 100 grid + 10 newlines + 1 view_sep).
                                Default: True for cleaner Qwen VL integration.
         """
+        super().__init__()
         self.device = device
         self.dtype = dtype
         self.use_compile = use_compile
         self.model_path = resolve_model_path(model_path)
         self.remove_separators = remove_separators
+        # Ensure these exist even if initialization fails partway through.
+        self._hooks = []
+        self._intermediate_features = {}
 
         # Handle intermediate layer indices
         if intermediate_layer_indices is not None:
@@ -127,38 +135,174 @@ class DPSKOCREncoder:
         logger.info("  ✓ Vision components loaded (efficient, no full model)")
 
     def _load_vision_models(self):
-        """Load vision encoder efficiently by extracting from full model"""
+        """Load vision encoder directly from safetensors (no trust_remote_code dependency).
+
+        This method loads the vision components directly from the checkpoint safetensors
+        without relying on AutoModel.from_pretrained() which requires external Python files.
+        This gives OCRInfer full control over the model loading process.
+        """
         from OCRInfer.process.image_process import DeepseekOCRProcessor
-        from transformers import AutoModel
 
-        logger.info("  Loading full model temporarily to extract vision components...")
+        logger.info("  Loading vision components directly from safetensors (no trust_remote_code)...")
 
-        # Load full model (this loads all weights but we'll extract only vision parts)
-        full_model = AutoModel.from_pretrained(
-            self.model_path,
-            dtype=self.dtype,
-            device_map=self.device,
-            trust_remote_code=True
-        )
+        # Find safetensors file
+        safetensors_files = glob.glob(os.path.join(self.model_path, "*.safetensors"))
+        if not safetensors_files:
+            raise FileNotFoundError(f"No safetensors found in {self.model_path}")
 
-        # Extract vision components - these are the only parts we need
-        self.clip_model = full_model.model.vision_model
-        self.sam_model = full_model.model.sam_model
-        self.projector = full_model.model.projector
-        self.image_newline = full_model.model.image_newline
-        self.view_separator = full_model.model.view_seperator  # Note: typo in original model
+        safetensors_path = safetensors_files[0]
+        logger.info(f"  Found: {os.path.basename(safetensors_path)}")
 
-        # Delete full model to free memory immediately
-        # The language model (7B params) will be garbage collected
-        del full_model
-        torch.cuda.empty_cache()
+        # Load state_dict from safetensors
+        state_dict = {}
+        with safe_open(safetensors_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if key.startswith("model."):
+                    # Remove "model." prefix to match expected format
+                    new_key = key[6:]  # Remove "model." prefix
+                    state_dict[new_key] = f.get_tensor(key)
 
-        logger.info("  ✓ Extracted vision components, deleted LLM")
+        logger.info(f"  Loaded {len(state_dict)} tensors from safetensors")
+
+        # Initialize the DeepSeekOCR model architecture directly
+        # This creates the model structure without loading weights
+        from OCRInfer.model.deepseek_ocr_wrapper import DeepSeekOCRWrapper
+        wrapper = DeepSeekOCRWrapper(dtype=self.dtype)
+
+        # Load weights into wrapper.model (not wrapper itself)
+        # state_dict keys like "vision_model.*" map to "wrapper.model.vision_model.*"
+        missing_keys, unexpected_keys = wrapper.model.load_state_dict(state_dict, strict=False)
+        if missing_keys:
+            logger.info(f"  Missing keys (language model, expected): {len(missing_keys)}")
+        if unexpected_keys:
+            logger.warning(f"  Unexpected keys (ignored): {len(unexpected_keys)}")
+
+        # Extract vision components
+        self.clip_model = wrapper.model.vision_model
+        self.sam_model = wrapper.model.sam_model
+        self.projector = wrapper.model.projector
+        self.image_newline = wrapper.model.image_newline
+        self.view_separator = wrapper.model.view_seperator
+
+        logger.info("  ✓ Extracted vision components directly from safetensors")
+
+        # Ensure vision modules are on the expected dtype/device.
+        try:
+            self.clip_model = self.clip_model.to(device=self.device, dtype=self.dtype)
+            self.sam_model = self.sam_model.to(device=self.device, dtype=self.dtype)
+            self.projector = self.projector.to(device=self.device, dtype=self.dtype)
+            self.image_newline = self.image_newline.to(device=self.device, dtype=self.dtype)
+            self.view_separator = self.view_separator.to(device=self.device, dtype=self.dtype)
+        except Exception as e:
+            logger.warning(f"  Could not cast vision modules to dtype={self.dtype} on device={self.device}: {e}")
+
+        # Hard-ensure all params/buffers match the requested dtype.
+        def _force_dtype(module: nn.Module, dtype: torch.dtype) -> int:
+            converted = 0
+            for p in module.parameters(recurse=True):
+                if p is not None and p.dtype != dtype:
+                    p.data = p.data.to(dtype=dtype)
+                    converted += 1
+            for _, b in module.named_buffers(recurse=True):
+                if b is not None and b.dtype != dtype and b.is_floating_point():
+                    b.data = b.data.to(dtype=dtype)
+            return converted
+
+        try:
+            conv = 0
+            conv += _force_dtype(self.clip_model, self.dtype)
+            conv += _force_dtype(self.sam_model, self.dtype)
+            conv += _force_dtype(self.projector, self.dtype)
+            if conv:
+                logger.info(f"  ✓ Forced dtype={self.dtype} for {conv} fp32 params in vision modules")
+            if hasattr(self, "image_newline") and getattr(self, "image_newline", None) is not None:
+                if self.image_newline.dtype != self.dtype:
+                    self.image_newline.data = self.image_newline.data.to(dtype=self.dtype)
+            if hasattr(self, "view_separator") and getattr(self, "view_separator", None) is not None:
+                if self.view_separator.dtype != self.dtype:
+                    self.view_separator.data = self.view_separator.data.to(dtype=self.dtype)
+        except Exception as e:
+            logger.warning(f"  Could not force dtype for all vision params: {e}")
 
         # Set eval mode
         self.clip_model.eval()
         self.sam_model.eval()
         self.projector.eval()
+
+        # CRITICAL: Wrap SAM model forward to ensure dtype consistency with FSDP
+        # FSDP eval mode can rematerialize float32 parameters, causing dtype mismatches
+        original_sam_forward = self.sam_model.forward
+        @functools.wraps(original_sam_forward)
+        def sam_forward_with_dtype_fix(*args, **kwargs):
+            """Ensure SAM encoder maintains bfloat16 dtype during forward pass."""
+            # Get the input (first arg is pixel_values)
+            if args and hasattr(args[0], 'dtype'):
+                x = args[0]
+                if x.dtype != torch.bfloat16:
+                    x = x.to(torch.bfloat16)
+                    args = (x,) + args[1:]
+
+            # Ensure ALL parameters and buffers are bfloat16 before forward
+            # Use in-place .data = ... for FSDP compatibility
+            for module in self.sam_model.modules():
+                # Convert all parameters (weight, bias, etc.)
+                for name, param in list(module.named_parameters(recurse=False)):
+                    if param is not None and param.dtype != torch.bfloat16:
+                        param.data = param.data.to(torch.bfloat16)
+                # Convert all buffers (running_mean, running_var, etc.)
+                for name, buf in list(module.named_buffers(recurse=False)):
+                    if buf is not None and buf.dtype != torch.bfloat16:
+                        buf.data = buf.data.to(torch.bfloat16)
+
+            # Call original forward
+            result = original_sam_forward(*args, **kwargs)
+
+            # Ensure output is bfloat16
+            if result.dtype != torch.bfloat16:
+                result = result.to(torch.bfloat16)
+
+            return result
+
+        self.sam_model.forward = sam_forward_with_dtype_fix
+        logger.info("  ✓ Wrapped SAM encoder forward with dtype fix for FSDP")
+
+        # CRITICAL: Wrap CLIP model forward to ensure dtype consistency with FSDP
+        # Same issue as SAM - FSDP eval mode can rematerialize float32 parameters
+        original_clip_forward = self.clip_model.forward
+        @functools.wraps(original_clip_forward)
+        def clip_forward_with_dtype_fix(*args, **kwargs):
+            """Ensure CLIP encoder maintains bfloat16 dtype during forward pass."""
+            # Get the input (first arg is pixel_values)
+            if args and hasattr(args[0], 'dtype'):
+                x = args[0]
+                # Only convert floating point tensors, not integer tensors
+                if x.dtype != torch.bfloat16 and x.is_floating_point():
+                    x = x.to(torch.bfloat16)
+                    args = (x,) + args[1:]
+
+            # Ensure ALL floating-point parameters and buffers are bfloat16 before forward
+            # Use in-place .data = ... for FSDP compatibility
+            for module in self.clip_model.modules():
+                # Convert all floating-point parameters (weight, bias, etc.)
+                for name, param in list(module.named_parameters(recurse=False)):
+                    if param is not None and param.dtype != torch.bfloat16 and param.is_floating_point():
+                        param.data = param.data.to(torch.bfloat16)
+                # Convert all floating-point buffers (running_mean, running_var, etc.)
+                for name, buf in list(module.named_buffers(recurse=False)):
+                    if buf is not None and buf.dtype != torch.bfloat16 and buf.is_floating_point():
+                        buf.data = buf.data.to(torch.bfloat16)
+
+            # Call original forward
+            result = original_clip_forward(*args, **kwargs)
+
+            # Ensure output is bfloat16 (only if it's floating point)
+            if hasattr(result, 'dtype') and result.is_floating_point() and result.dtype != torch.bfloat16:
+                result = result.to(torch.bfloat16)
+
+            return result
+
+        self.clip_model.forward = clip_forward_with_dtype_fix
+        logger.info("  ✓ Wrapped CLIP encoder forward with dtype fix for FSDP")
 
         # Memory format optimization: SAM uses convolutions, benefits from channels_last
         # Expected 5-10% speedup on convolution-heavy operations
@@ -219,7 +363,11 @@ class DPSKOCREncoder:
 
     def __del__(self):
         """Cleanup hooks on deletion"""
-        self._clear_hooks()
+        try:
+            if hasattr(self, "_hooks"):
+                self._clear_hooks()
+        except Exception:
+            pass
 
     @torch.no_grad()
     def encode_images(
@@ -268,15 +416,49 @@ class DPSKOCREncoder:
             pixel_values_list.append(pixel_values)
 
         # Stack into batch tensor - BATCHED PROCESSING
-        pixel_values = torch.stack(pixel_values_list, dim=0).to(
-            device=self.device, dtype=self.dtype
+        pixel_values = torch.stack(pixel_values_list, dim=0)
+
+        return self.encode_pixel_values(
+            pixel_values,
+            return_global=return_global,
+            return_local=return_local,
+            return_intermediate=return_intermediate,
         )
+
+    def encode_pixel_values(
+        self,
+        pixel_values: torch.Tensor,
+        return_global: bool = False,
+        return_local: bool = True,
+        return_intermediate: bool = False,
+    ) -> Union[List[torch.Tensor], List[EncoderOutput]]:
+        """
+        Encode preprocessed pixel values to visual embeddings using BATCHED processing.
+
+        Args:
+            pixel_values: Tensor shaped [B,3,H,W] produced by DeepseekOCRProcessor.image_transform.
+            return_global: Return global mean token.
+            return_local: Return local patch features.
+            return_intermediate: Return intermediate layer features (if configured).
+
+        Returns:
+            Same as encode_images.
+        """
+        if pixel_values.numel() == 0:
+            return []
+        if pixel_values.dim() != 4:
+            raise ValueError(f"pixel_values must be [B,3,H,W], got shape={tuple(pixel_values.shape)}")
+
+        # Clear intermediate features from previous call
+        self._intermediate_features = {}
+
+        pixel_values = pixel_values.to(device=self.device, dtype=self.dtype)
 
         # Convert to channels_last for SAM (if SAM is in channels_last)
         if hasattr(self.sam_model, 'memory_format') or next(self.sam_model.parameters()).is_contiguous(memory_format=torch.channels_last):
             pixel_values = pixel_values.to(memory_format=torch.channels_last)
 
-        batch_size = len(images)
+        batch_size = int(pixel_values.shape[0])
 
         # ==== BATCHED GPU ENCODING (processes all images at once) ====
         # SAM encoding - BATCHED
@@ -398,6 +580,34 @@ class DPSKOCREncoder:
 
         final_embeddings = []
         intermediate_features = []
+
+        for output in outputs:
+            if isinstance(output, EncoderOutput):
+                final_embeddings.append(output.embeddings)
+                intermediate_features.append(output.intermediate_features or [])
+            else:
+                final_embeddings.append(output)
+                intermediate_features.append([])
+
+        return final_embeddings, intermediate_features
+
+    @torch.no_grad()
+    def encode_pixel_values_with_deepstack(
+        self,
+        pixel_values: torch.Tensor,
+    ) -> Tuple[List[torch.Tensor], List[List[torch.Tensor]]]:
+        """
+        Same as encode_images_with_deepstack, but accepts preprocessed pixel values [B,3,H,W].
+        """
+        # Ensure intermediate layers are configured
+        if not self.intermediate_layer_indices:
+            self.intermediate_layer_indices = self.DEFAULT_INTERMEDIATE_LAYERS.copy()
+            self._setup_intermediate_hooks()
+
+        outputs = self.encode_pixel_values(pixel_values, return_intermediate=True)
+
+        final_embeddings: List[torch.Tensor] = []
+        intermediate_features: List[List[torch.Tensor]] = []
 
         for output in outputs:
             if isinstance(output, EncoderOutput):

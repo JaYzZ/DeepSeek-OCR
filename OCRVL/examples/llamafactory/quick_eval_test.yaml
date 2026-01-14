@@ -1,0 +1,64 @@
+### Quick Eval Test Config - Based on qwen3vl_dpskocr_lora_alignment.yaml
+### Changes: max_samples=50, eval_steps=10, save_steps=10, max_steps=30
+
+### model
+model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/OCRVL/checkpoints/OCR-Qwen3-VL-2B
+image_max_pixels: 262144
+video_max_pixels: 16384
+trust_remote_code: true
+disable_gradient_checkpointing: true
+
+### method
+stage: sft
+do_train: true
+do_eval: true
+finetuning_type: lora
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target: q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj
+additional_target: model.ocr_connector,model.ocr_deepstack_connector
+freeze_vision_tower: true
+
+### dataset
+dataset: ocrvl_alignment_prerendered
+dataset_dir: OCRVL/llamafactory/data
+template: ocrvl_qwen3_vl_nothink
+cutoff_len: 2048
+max_samples: 50  # QUICK TEST: Only use 50 samples
+streaming: false
+packing: true
+preprocessing_num_workers: 16
+dataloader_num_workers: 8
+
+### eval
+eval_dataset: ocrvl_transparent_eval
+val_size: 0
+per_device_eval_batch_size: 1
+eval_strategy: steps
+eval_steps: 10  # QUICK TEST: Eval every 10 steps
+predict_with_generate: true
+
+### output
+output_dir: OCRVL/checkpoints/llamafactory/qwen3vl-2b/lora/quick_eval_test
+logging_steps: 5
+save_steps: 10  # QUICK TEST: Save every 10 steps
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: false
+report_to: none
+
+### train
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 8
+dataloader_drop_last: true
+learning_rate: 1.0e-3
+max_steps: 30  # QUICK TEST: Only run for 30 steps
+lr_scheduler_type: cosine
+warmup_steps: 5
+bf16: true
+pure_bf16: true
+# Use DDP instead of FSDP for quick test (faster startup)
+ddp_find_unused_parameters: false
+ddp_timeout: 180000000
+resume_from_checkpoint: null

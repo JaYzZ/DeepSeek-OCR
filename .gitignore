@@ -50,3 +50,5 @@ logs/
 .claude/*
 swanlog/*
 **/.pytest_cache/*
+OCRVL/llamafactory/data/*.json*
+OCRVL/llamafactory/data/*images/*

@@ -198,6 +198,23 @@ MAX_SAMPLES=1000 \
 NUM_GPUS=8 \
   GPU_IDS=0,1,2,3,4,5,6,7 \
   BATCH_SIZE=8 \
+
+## LlamaFactory-Style Pipeline Config
+
+If you prefer LlamaFactory's config-driven workflow (`.yaml` + `key=value` overrides), `OCRVL/scripts/train_llava.sh` supports a LlamaFactory-style YAML that drives the 3-stage OCRVL pipeline.
+
+```bash
+# Run the 2-stage LLaVA-style pipeline (alignment -> instruction), Phase 3 disabled by default
+bash OCRVL/scripts/train_llava.sh OCRVL/examples/llamafactory/train_llava_pipeline.yaml
+
+# Override fields like LlamaFactory (dot-path key=value)
+bash OCRVL/scripts/train_llava.sh OCRVL/examples/llamafactory/train_llava_pipeline.yaml \
+  system.cuda_visible_devices=0,1 phase2.train.num_train_epochs=1
+```
+
+Notes:
+- GPU selection follows LlamaFactory conventions: `CUDA_VISIBLE_DEVICES` (or `system.cuda_visible_devices` in YAML) drives `NUM_GPUS/GPU_IDS`.
+- Phase 3 is controlled by `phase3.enabled=true` (or `ENABLE_PHASE3=true`).
   RESUME_CHECKPOINT=OCRVL/checkpoints/.../step_latest \
   bash OCRVL/scripts/train_thinking.sh
 ```
@@ -636,3 +653,59 @@ OCRVL/
 - **OCRInfer**: Encoder utilities and model paths
 - **Renderer**: GPU-accelerated Vello renderer (optional but recommended)
 - **Qwen3-VL**: Base vision-language model (Qwen/Qwen3-VL-2B-Instruct)
+
+## LlamaFactory Training (Recommended)
+
+OCRVL can be trained using `llamafactory-cli` while still using the OCR-aware Qwen3-VL wrapper and the DeepSeek-OCR (DPSK) vision encoder.
+
+Key idea:
+- LlamaFactory uses an OCRVL-registered Qwen3-VL template (`ocrvl_qwen3_vl_nothink`) so tokenization does not eagerly load images.
+- We patch the processor at runtime so LlamaFactory produces OCRVL-compatible `pixel_values` (DeepSeek-OCR preprocessed tensors).
+- We register the OCR-aware model class so `AutoModelForCausalLM` instantiates it for Qwen3-VL configs.
+
+### Quickstart
+
+```bash
+# 1) Prepare dataset links + dataset_info.json for LlamaFactory
+bash OCRVL/scripts/prepare_llamafactory_datasets.sh
+
+# 2) Run LoRA SFT on LLaVA Mix-665K (start with max_samples=1000 in the YAML)
+bash OCRVL/scripts/train_llava_llamafactory.sh OCRVL/examples/llamafactory/qwen3vl_dpskocr_lora_llava665k.yaml
+```
+
+### Notes
+
+- The patch is activated via `PYTHONPATH` and repo-root `sitecustomize.py` (the wrapper script sets this automatically).
+- Train/save OCRVL connector modules via LlamaFactory `additional_target`:
+  `additional_target: model.ocr_connector,model.ocr_deepstack_connector`
+- DPSK encoder selection:
+  - `DPSK_MODEL_PATH` default: `/share/project/xiyan/huggingface/deepseek-ai/DeepSeek-OCR`
+  - `DPSK_DTYPE` default: `bf16`
+- Qualitative checkpoint outputs:
+  - Enabled by default in `OCRVL/scripts/train_llava_llamafactory.sh`
+  - Saves to `${output_dir}/checkpoint-*/eval_results/transparent_eval.{json,txt}`
+  - Uses samples from `OCRVL/llamafactory/transparent_eval_samples.json` (12 fixed images + 1 rendered-text OCR sample)
+- Output directory:
+  - Example configs write to `OCRVL/checkpoints/llamafactory/...`
+  - If a config omits `output_dir`, `OCRVL/scripts/train_llava_llamafactory.sh` defaults to `OCRVL/checkpoints/llamafactory/<timestamp>`
+- LlamaFactory dataset setup:
+  - Dataset definitions live in `OCRVL/llamafactory/data/dataset_info.json`
+  - `bash OCRVL/scripts/prepare_llamafactory_datasets.sh` creates symlinks for large upstream JSON/JSONL files
+  - Available dataset names: `ocrvl_llava_mix665k`, `ocrvl_llava_cot_100k`, `ocrvl_alignment_llava_pretrain_doclaynet`
+
+### Alignment Dataset (LLaVA-Pretrain + DocLayNet)
+
+The alignment-stage data is provided as a LlamaFactory local file dataset: `ocrvl_alignment_llava_pretrain_doclaynet`.
+
+Build it (writes a ShareGPT JSONL manifest that points at existing local media under `/share/project/xiyan/huggingface/liuhaotian/LLaVA-Pretrain` + DocLayNet):
+
+```bash
+bash OCRVL/scripts/prepare_llamafactory_alignment_dataset.sh \
+  --doc_ratio 0.5
+```
+
+Example config: `OCRVL/examples/llamafactory/qwen3vl_dpskocr_lora_alignment.yaml`
+
+Notes:
+- Default build uses the full corpora (no truncation). Use `--max_samples N` only for quick debugging.
+- LLaVA-Pretrain images must be extracted to `/share/project/xiyan/huggingface/liuhaotian/LLaVA-Pretrain/images/` so JSON `image` paths resolve.

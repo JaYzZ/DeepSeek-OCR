@@ -105,13 +105,14 @@ def quick_gelu(x):
 
 
 class CLIPVisionEmbeddings(nn.Module):
-    def __init__(self, hidden_size=1024, image_size=224, patch_size=14, num_channels=3):
+    def __init__(self, hidden_size=1024, image_size=224, patch_size=14, num_channels=3, dtype=torch.float32):
         super().__init__()
         self.embed_dim = hidden_size
         self.image_size = image_size
         self.patch_size = patch_size
+        self.dtype = dtype
 
-        self.class_embedding = torch.nn.Parameter(torch.randn(self.embed_dim))
+        self.class_embedding = torch.nn.Parameter(torch.randn(self.embed_dim, dtype=dtype))
 
         self.patch_embedding = torch.nn.Conv2d(
             in_channels=num_channels,
@@ -119,11 +120,15 @@ class CLIPVisionEmbeddings(nn.Module):
             kernel_size=self.patch_size,
             stride=self.patch_size,
             bias=False,
+            dtype=dtype,
         )
 
         self.num_patches = (self.image_size // self.patch_size) ** 2
         self.num_positions = self.num_patches + 1
+        # Note: nn.Embedding doesn't accept dtype in older PyTorch versions, but it follows model dtype
         self.position_embedding = torch.nn.Embedding(self.num_positions, self.embed_dim)
+        # Convert embedding weight to target dtype
+        self.position_embedding.weight.data = self.position_embedding.weight.data.to(dtype=dtype)
         self.register_buffer(
             "position_ids", torch.arange(self.num_positions).expand((1, -1))
         )
@@ -162,11 +167,12 @@ class NoTPFeedForward(nn.Module):
             cfg,
             dim: int,
             hidden_dim: int,
+            dtype=torch.float32,
     ):
         super().__init__()
 
-        self.fc1 = torch.nn.Linear(dim, hidden_dim, bias=True)
-        self.fc2 = torch.nn.Linear(hidden_dim, dim, bias=True)
+        self.fc1 = torch.nn.Linear(dim, hidden_dim, bias=True, dtype=dtype)
+        self.fc2 = torch.nn.Linear(hidden_dim, dim, bias=True, dtype=dtype)
 
     def forward(self, x):
         output = self.fc2(quick_gelu(self.fc1(x)))
@@ -225,7 +231,7 @@ class NoTPFeedForward(nn.Module):
 
 
 class NoTPAttention(torch.nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, dtype=torch.float32):
         super().__init__()
         self.num_heads = cfg.num_attention_heads
         self.n_local_heads = cfg.num_attention_heads
@@ -233,8 +239,8 @@ class NoTPAttention(torch.nn.Module):
         self.max_seq_len = cfg.seq_length
         self.use_flash_attention = cfg.use_flash_attn
 
-        self.qkv_proj = torch.nn.Linear(cfg.hidden_size, cfg.hidden_size * 3, bias=True)
-        self.out_proj = torch.nn.Linear(cfg.hidden_size, cfg.hidden_size, bias=True)
+        self.qkv_proj = torch.nn.Linear(cfg.hidden_size, cfg.hidden_size * 3, bias=True, dtype=dtype)
+        self.out_proj = torch.nn.Linear(cfg.hidden_size, cfg.hidden_size, bias=True, dtype=dtype)
 
         # self.core_attention = CoreAttention(cfg, AttnType.self_attn)
 
@@ -284,15 +290,15 @@ class NoTPAttention(torch.nn.Module):
         return output
 
 class NoTPTransformerBlock(nn.Module):
-    def __init__(self, cfg, layer_id: int, multiple_of=256):
+    def __init__(self, cfg, layer_id: int, multiple_of=256, dtype=torch.float32):
         super().__init__()
 
         self.n_heads = cfg.num_attention_heads
         self.dim = cfg.hidden_size
         self.head_dim = cfg.hidden_size // cfg.num_attention_heads
-        self.self_attn = NoTPAttention(cfg)
+        self.self_attn = NoTPAttention(cfg, dtype=dtype)
         self.mlp = NoTPFeedForward(
-            cfg, dim=cfg.hidden_size, hidden_dim=cfg.ffn_hidden_size
+            cfg, dim=cfg.hidden_size, hidden_dim=cfg.ffn_hidden_size, dtype=dtype
         )
         self.layer_id = layer_id
         self.layer_norm1 = torch.nn.LayerNorm(
@@ -310,7 +316,7 @@ class NoTPTransformerBlock(nn.Module):
 
 
 class NoTPTransformer(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, dtype=torch.float32):
         super().__init__()
 
         self.cfg = cfg
@@ -323,6 +329,7 @@ class NoTPTransformer(nn.Module):
                 NoTPTransformerBlock(
                     cfg,
                     layer_id + 1,
+                    dtype=dtype,
                 )
             )
 
@@ -361,17 +368,18 @@ class VitModel(nn.Module):
             self,
             cfg,
             freeze_embed=False,
-            freeze_pre_norm=False
+            freeze_pre_norm=False,
+            dtype=torch.float32
     ) -> None:
         super().__init__()
 
-        self.embeddings = CLIPVisionEmbeddings(hidden_size=cfg.hidden_size, image_size=cfg.image_size, patch_size=cfg.patch_size)
+        self.embeddings = CLIPVisionEmbeddings(hidden_size=cfg.hidden_size, image_size=cfg.image_size, patch_size=cfg.patch_size, dtype=dtype)
 
         if freeze_embed:
             for name, param in self.embeddings.named_parameters():
                 param.requires_grad = False
 
-        self.transformer = NoTPTransformer(cfg=cfg)
+        self.transformer = NoTPTransformer(cfg=cfg, dtype=dtype)
 
         if cfg.get("fp32norm", False):
             logger.info("Load fp32 layernorm for ViT.")
@@ -444,11 +452,12 @@ vit_model_cfg = adict(
     recompute_list = []
 )
 
-def build_clip_l():
+def build_clip_l(dtype=torch.float32):
     return VitModel(
         cfg=vit_model_cfg,
         freeze_embed=False,
         freeze_pre_norm=False,
+        dtype=dtype,
     )
 
 

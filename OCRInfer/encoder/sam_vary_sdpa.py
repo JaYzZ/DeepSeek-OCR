@@ -59,10 +59,10 @@ class MLPBlock(nn.Module):
 # From https://github.com/facebookresearch/detectron2/blob/main/detectron2/layers/batch_norm.py # noqa
 # Itself from https://github.com/facebookresearch/ConvNeXt/blob/d1fa8f6fef0a165b27399986cc2bdacc92777e40/models/convnext.py#L119  # noqa
 class LayerNorm2d(nn.Module):
-    def __init__(self, num_channels: int, eps: float = 1e-6) -> None:
+    def __init__(self, num_channels: int, eps: float = 1e-6, dtype: torch.dtype = torch.float32) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(num_channels))
-        self.bias = nn.Parameter(torch.zeros(num_channels))
+        self.weight = nn.Parameter(torch.ones(num_channels, dtype=dtype))
+        self.bias = nn.Parameter(torch.zeros(num_channels, dtype=dtype))
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -93,6 +93,7 @@ class ImageEncoderViT(nn.Module):
         rel_pos_zero_init: bool = True,
         window_size: int = 0,
         global_attn_indexes: Tuple[int, ...] = (),
+        dtype: torch.dtype = torch.float32,
     ) -> None:
         """
         Args:
@@ -114,6 +115,7 @@ class ImageEncoderViT(nn.Module):
         """
         super().__init__()
         self.img_size = img_size
+        self.dtype = dtype
 
         self.patch_embed = PatchEmbed(
             kernel_size=(patch_size, patch_size),
@@ -126,7 +128,7 @@ class ImageEncoderViT(nn.Module):
         if use_abs_pos:
             # Initialize absolute positional embedding with pretrain image size.
             self.pos_embed = nn.Parameter(
-                torch.zeros(1, img_size // patch_size, img_size // patch_size, embed_dim)
+                torch.zeros(1, img_size // patch_size, img_size // patch_size, embed_dim, dtype=dtype)
             )
 
         self.blocks = nn.ModuleList()
@@ -152,7 +154,7 @@ class ImageEncoderViT(nn.Module):
                 kernel_size=1,
                 bias=False,
             ),
-            LayerNorm2d(out_chans),
+            LayerNorm2d(out_chans, dtype=dtype),
             nn.Conv2d(
                 out_chans,
                 out_chans,
@@ -160,7 +162,7 @@ class ImageEncoderViT(nn.Module):
                 padding=1,
                 bias=False,
             ),
-            LayerNorm2d(out_chans),
+            LayerNorm2d(out_chans, dtype=dtype),
         )
 
         self.net_2 = nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1, bias=False)
@@ -478,13 +480,14 @@ class PatchEmbed(nn.Module):
         return x
 
 
-def build_sam_vit_b(checkpoint=None):
+def build_sam_vit_b(checkpoint=None, dtype=torch.float32):
     return _build_sam(
         encoder_embed_dim=768,
         encoder_depth=12,
         encoder_num_heads=12,
         encoder_global_attn_indexes=[2, 5, 8, 11],
         checkpoint=checkpoint,
+        dtype=dtype,
     )
 
 
@@ -494,6 +497,7 @@ def _build_sam(
     encoder_num_heads,
     encoder_global_attn_indexes,
     checkpoint=None,
+    dtype=torch.float32,
 ):
     prompt_embed_dim = 256
     image_size = 1024
@@ -512,6 +516,7 @@ def _build_sam(
             global_attn_indexes=encoder_global_attn_indexes,
             window_size=14,
             out_chans=prompt_embed_dim,
+            dtype=dtype,
         )
     
     if checkpoint is not None:

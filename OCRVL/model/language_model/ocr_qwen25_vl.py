@@ -182,6 +182,7 @@ class OCRQwen25VLModel(Qwen2_5_VLModel):
         video_grid_thw: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         ocr_image_features: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+        ocr_pixel_values: Optional[torch.Tensor] = None,
         pixel_values_ref: Optional[torch.Tensor] = None,
         ocr_alignment: Optional[bool] = None,
         ocr_alignment_weight: Optional[float] = None,
@@ -196,9 +197,9 @@ class OCRQwen25VLModel(Qwen2_5_VLModel):
 
         # This OCR-Qwen wrapper consumes OCR pre-encoded visual tokens.
         # Native pixel_values -> ViT -> LM path is only used as a *reference* for alignment.
-        if ocr_image_features is None:
+        if ocr_image_features is None and ocr_pixel_values is None:
             raise ValueError(
-                "ocr_image_features is required. Provide OCR features (and <image> placeholders in input_ids). "
+                "ocr_image_features (or ocr_pixel_values) is required. Provide OCR features (and <image> placeholders in input_ids). "
                 "For training-time alignment, also provide pixel_values/pixel_values_ref with ocr_alignment=True."
             )
 
@@ -219,6 +220,14 @@ class OCRQwen25VLModel(Qwen2_5_VLModel):
         image_mask = None
         ocr_image_embeds = None
         ref_image_embeds = None
+        if ocr_image_features is None and ocr_pixel_values is not None:
+            from OCRVL.dpsk_encoder import get_dpsk_encoder
+
+            encoder = get_dpsk_encoder()
+            with torch.no_grad():
+                feats = encoder.encode_pixel_values(ocr_pixel_values)
+            ocr_image_features = feats
+
         if ocr_image_features is not None:
             feats = _normalize_ocr_features(
                 ocr_image_features, device=inputs_embeds.device, dtype=inputs_embeds.dtype
