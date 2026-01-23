@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import random
 from typing import Optional
 
 from llamafactory.data.mm_plugin import Qwen3VLPlugin, register_mm_plugin
@@ -52,6 +53,12 @@ class OCRVLQwen3VLPlugin(Qwen3VLPlugin):
         # Videos require timestamps/grid inference; keep the stock behavior.
         if len(videos) != 0 or len(audios) != 0:
             return super().process_messages(messages, images, videos, audios, processor)  # type: ignore[misc]
+
+        # Randomize image order for robustness (50% chance to shuffle)
+        # This is important for VQA tasks where order shouldn't matter
+        if isinstance(images, list) and len(images) == 2:
+            if random.random() < 0.5:
+                images[:] = [images[1], images[0]]
 
         # Align the images list with the number of placeholders we will actually expand.
         # Mutate in-place so downstream dataset processing/collation sees the corrected list.

@@ -66,6 +66,7 @@ from transformers.utils import is_torchdynamo_compiling
 from OCRInfer.encoder.dpsk_ocr_encoder import DPSKOCREncoder
 from OCRInfer.utils.model_paths import resolve_model_path
 from sys_path import _add_sys_path
+from OCRVL.model.latent_injection import inject_latent_features
 
 
 class DPSKVisionTowerAdapter(nn.Module):
@@ -484,6 +485,9 @@ class OCRQwen3VLModel(Qwen3VLModel):
         ocr_alignment_weight: Optional[float] = None,
         vision_scale: Optional[float] = None,
         text_scale: Optional[float] = None,
+        # Latent injection: inject pre-encoded OCR features at latent token positions
+        latent_supervision: Optional[List[List[torch.Tensor]]] = None,
+        latent_positions: Optional[torch.BoolTensor] = None,
         **kwargs: Any,
     ):
         cfg_vision_scale = float(getattr(self.config, "ocr_vision_scale", 1.0))
@@ -685,6 +689,20 @@ class OCRQwen3VLModel(Qwen3VLModel):
             if video_mask is not None:
                 text_mask = text_mask & (~video_mask[..., 0])
             inputs_embeds[text_mask] = inputs_embeds[text_mask] * text_scale
+
+        # Latent token injection: Replace latent token embeddings with pre-encoded OCR features
+        if latent_supervision is not None and latent_positions is not None:
+            # Ensure OCR connector is initialized
+            ocr_connector = self._maybe_get_ocr_connector(
+                1280, device=inputs_embeds.device, dtype=inputs_embeds.dtype
+            )
+            # Inject OCR features at latent token positions
+            inputs_embeds = inject_latent_features(
+                inputs_embeds=inputs_embeds,
+                latent_supervision=latent_supervision,
+                latent_positions=latent_positions,
+                ocr_connector=ocr_connector,
+            )
 
         visual_pos_masks = None
         deepstack_visual_embeds = None
@@ -1104,6 +1122,13 @@ class OCRQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
 
+        # CRITICAL: Set tie_word_embeddings=False for FSDP compatibility
+        # Tied embeddings cause FSDP broadcast errors during parameter synchronization
+        # This must be done after model loading to override the config
+        if model.config.tie_word_embeddings:
+            model.config.tie_word_embeddings = False
+            logger.info("[OCRVL] Set config.tie_word_embeddings=False for FSDP compatibility")
+
         if not hasattr(model.config, "ocr_offload_vit_to_cpu"):
             model.config.ocr_offload_vit_to_cpu = True
 
@@ -1233,6 +1258,8 @@ class OCRQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ocr_alignment_weight=ocr_alignment_weight,
             vision_scale=vision_scale,
             text_scale=text_scale,
+            latent_supervision=latent_supervision,
+            latent_positions=latent_positions,
             **filtered_kwargs,
         )
 

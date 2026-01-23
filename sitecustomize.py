@@ -171,55 +171,93 @@ def _patch_once() -> None:
         import logging
         logging.warning(f"[OCRVL] Failed to skip nn.Module.eval patch: {e}")
 
-    # 7) Add connector parameters to optimizer (replacement for additional_target)
-    # This is needed because additional_target (PEFT's modules_to_save) is incompatible with FSDP
+    # 7) Freeze LLM when OCRVL_FREEZE_LLM=1 (connector-only training)
+    # This enables training ONLY connectors without LoRA on LLM layers
+    try:
+        if os.environ.get("OCRVL_FREEZE_LLM", "0") == "1":
+            import logging
+            from transformers import Trainer as OriginalTrainer
+            import torch
+
+            original_create_optimizer = OriginalTrainer.create_optimizer
+
+            @functools.wraps(original_create_optimizer)
+            def patched_create_optimizer_freeze_llm(self):
+                """Freeze LLM parameters before optimizer creation, keeping only connectors trainable."""
+                if hasattr(self.model, "model"):
+                    frozen_count = 0
+                    trainable_count = 0
+
+                    for name, param in self.model.named_parameters():
+                        # Freeze language model (but NOT connectors)
+                        if "language_model" in name and "ocr" not in name:
+                            if param.requires_grad:
+                                param.requires_grad = False
+                                frozen_count += 1
+                        # Count trainable connector params
+                        elif "ocr_connector" in name or "ocr_deepstack_connector" in name:
+                            if param.requires_grad:
+                                trainable_count += 1
+
+                    if frozen_count > 0:
+                        logging.warning(
+                            f"[OCRVL] Froze {frozen_count} LLM parameters (connector-only training mode). "
+                            f"{trainable_count} connector parameters remain trainable."
+                        )
+
+                # Call original create_optimizer
+                return original_create_optimizer(self)
+
+            OriginalTrainer.create_optimizer = patched_create_optimizer_freeze_llm
+            logging.info("[OCRVL] LLM freeze patch applied (OCRVL_FREEZE_LLM=1)")
+    except Exception as e:
+        import logging
+        logging.warning(f"[OCRVL] Failed to patch trainer for LLM freezing: {e}")
+
+    # 8) Ensure OCR connectors are always trainable and in optimizer
+    # Connectors must be trainable in all stages (alignment, VQA, etc.)
+    # This patch ensures they're properly registered even if something goes wrong with additional_target
     try:
         from transformers import Trainer as OriginalTrainer
-        import torch
+        import logging
 
-        # Store original create_optimizer method
         original_create_optimizer = OriginalTrainer.create_optimizer
 
         @functools.wraps(original_create_optimizer)
-        def patched_create_optimizer(self):
-            """Wrapper that adds OCR connector parameters to the optimizer."""
-            # Call original create_optimizer
+        def patched_create_optimizer_ensure_connectors(self):
+            """Ensure OCR connectors are trainable and in optimizer."""
+            # Step 1: Ensure connector gradients are enabled
+            connector_params = []
+            for name, param in self.model.named_parameters():
+                if 'ocr_connector' in name or 'deepstack_connector' in name:
+                    if not param.requires_grad:
+                        param.requires_grad = True
+                        logging.warning(f"[OCRVL] Re-enabled gradient for connector: {name}")
+                    if param.requires_grad:
+                        connector_params.append((name, param))
+
+            # Step 2: Create optimizer
             optimizer = original_create_optimizer(self)
 
-            # Add connector parameters to optimizer if they exist and are trainable.
-            # Important: avoid duplicating params already present in optimizer groups.
-            if hasattr(self.model, "model"):
-                import logging
+            # Step 3: Verify connectors are in optimizer, add if missing
+            if connector_params:
+                existing_param_ids = {id(p) for group in optimizer.param_groups for p in group.get("params", [])}
+                missing_params = [(n, p) for n, p in connector_params if id(p) not in existing_param_ids]
 
-                connector_params = []
-                connector_param_names = []
-
-                for name, param in self.model.named_parameters():
-                    if "ocr_connector" in name and param.requires_grad:
-                        connector_params.append(param)
-                        connector_param_names.append(name)
-
-                if connector_params:
-                    existing_param_ids = {id(p) for group in optimizer.param_groups for p in group.get("params", [])}
-                    missing_params = [p for p in connector_params if id(p) not in existing_param_ids]
-
-                    if missing_params:
-                        logging.warning(
-                            f"[OCRVL] Adding {len(missing_params)} OCR connector params to optimizer (missing from default groups)."
-                        )
-                        optimizer.add_param_group({"params": missing_params})
-                    else:
-                        logging.warning(
-                            "[OCRVL] OCR connector params already present in optimizer groups (no-op)."
-                        )
+                if missing_params:
+                    param_names = [n for n, p in missing_params]
+                    logging.warning(f"[OCRVL] Adding {len(missing_params)} connector params to optimizer: {param_names}")
+                    optimizer.add_param_group({"params": [p for n, p in missing_params]})
+                else:
+                    logging.info(f"[OCRVL] All {len(connector_params)} connector params already in optimizer")
 
             return optimizer
 
-        # Apply patch
-        OriginalTrainer.create_optimizer = patched_create_optimizer
+        OriginalTrainer.create_optimizer = patched_create_optimizer_ensure_connectors
+        logging.info("[OCRVL] Applied connector training patch (ensures connectors trainable in all stages)")
     except Exception as e:
         import logging
-        logging.warning(f"[OCRVL] Failed to patch trainer for connector params: {e}")
+        logging.warning(f"[OCRVL] Failed to patch trainer for connector training: {e}")
 
     # 7) Patch Accelerate FSDP + PEFT adapter-only saving on non-rank0 processes.
     # Accelerate's save_fsdp_model() calls _get_model_state_dict() on every rank even when

@@ -43,8 +43,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class EncoderOutput:
     """Output from DPSKOCREncoder with optional intermediate features"""
-    embeddings: torch.Tensor  # [111, 1280] final visual embeddings
+    embeddings: torch.Tensor  # [100, 1280] final visual embeddings (grid tokens only)
     intermediate_features: Optional[List[torch.Tensor]] = None  # List of [N, hidden_dim] at each level
+    final_cls: Optional[torch.Tensor] = None  # [1024] CLIP CLS token from final layer
 
 
 class DPSKOCREncoder(nn.Module):
@@ -80,6 +81,7 @@ class DPSKOCREncoder(nn.Module):
         use_compile: bool = False,
         intermediate_layer_indices: Optional[List[int]] = None,
         remove_separators: bool = True,
+        keep_cls_intermediate: bool = False,
     ):
         """
         Initialize DeepSeek-OCR vision encoder
@@ -94,6 +96,9 @@ class DPSKOCREncoder(nn.Module):
             remove_separators: If True, output pure 10×10 grid (100 tokens).
                                If False, keep line separators (111 tokens = 100 grid + 10 newlines + 1 view_sep).
                                Default: True for cleaner Qwen VL integration.
+            keep_cls_intermediate: If True, keep CLS token in intermediate features (returns 101 tokens).
+                                   If False, remove CLS token from intermediate features (returns 100 tokens).
+                                   Default: False for backward compatibility.
         """
         super().__init__()
         self.device = device
@@ -101,6 +106,7 @@ class DPSKOCREncoder(nn.Module):
         self.use_compile = use_compile
         self.model_path = resolve_model_path(model_path)
         self.remove_separators = remove_separators
+        self.keep_cls_intermediate = keep_cls_intermediate
         # Ensure these exist even if initialization fails partway through.
         self._hooks = []
         self._intermediate_features = {}
@@ -468,6 +474,9 @@ class DPSKOCREncoder(nn.Module):
         # This triggers the hooks to capture intermediate features
         clip_features = self.clip_model(pixel_values, sam_features)  # [B, seq+1, 1024]
 
+        # Capture final CLS token for visualization/analysis (before it's discarded)
+        final_cls_tokens = clip_features[:, 0, :]  # [B, 1024] - CLS tokens from final CLIP layer
+
         # Concatenate CLIP patch features + SAM features - BATCHED
         features = torch.cat(
             (
@@ -493,8 +502,8 @@ class DPSKOCREncoder(nn.Module):
             for layer_idx in sorted_indices:
                 # Get intermediate features [B, seq, hidden_dim]
                 inter_feat = self._intermediate_features[layer_idx]
-                # Skip CLS token if present (first token)
-                if inter_feat.dim() == 3 and inter_feat.shape[1] > hw:
+                # Skip CLS token if present (first token), unless keep_cls_intermediate is True
+                if not self.keep_cls_intermediate and inter_feat.dim() == 3 and inter_feat.shape[1] > hw:
                     inter_feat = inter_feat[:, 1:, :]  # Remove CLS token
                 intermediate_list.append(inter_feat)
 
@@ -541,9 +550,11 @@ class DPSKOCREncoder(nn.Module):
             if return_intermediate and intermediate_list:
                 # Return EncoderOutput with intermediate features for this image
                 img_intermediate = [inter[jdx] for inter in intermediate_list]
+                img_final_cls = final_cls_tokens[jdx]  # [1024] CLS token for this image
                 embeddings_list.append(EncoderOutput(
                     embeddings=final_emb,
-                    intermediate_features=img_intermediate
+                    intermediate_features=img_intermediate,
+                    final_cls=img_final_cls
                 ))
             else:
                 embeddings_list.append(final_emb)

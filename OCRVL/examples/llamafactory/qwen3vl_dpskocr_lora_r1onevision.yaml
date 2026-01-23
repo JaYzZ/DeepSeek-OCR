@@ -1,0 +1,164 @@
+### model
+# Unified checkpoint with both language model and DeepSeek-OCR encoder in one directory
+# - Root: Qwen3-VL-2B-Thinking language model (qwen3_model.safetensors)
+# - dpsk_ocr_encoder/: DeepSeek-OCR vision encoder (model-00001-of-000001.safetensors)
+#
+# The Thinking model includes special tokens for reasoning:
+# - <|think_start|> (151667): Opens thinking/reasoning section
+# - <|think_end|> (151668): Closes thinking/reasoning section
+model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/OCRVL/checkpoints/OCR-Qwen3-VL-2B-Thinking
+image_max_pixels: 262144
+video_max_pixels: 16384
+trust_remote_code: true
+disable_gradient_checkpointing: true  # Required for FSDP compatibility
+
+### method
+stage: sft
+do_train: true
+do_eval: false  # Use transparent evaluation callback instead
+finetuning_type: lora
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.05
+# Target LLM attention/MLP layers for lightweight LoRA adaptation
+lora_target: q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj
+
+# Train OCR connector modules alongside LoRA adapters
+# These connectors project vision features to language model hidden states
+additional_target: model.ocr_connector,model.ocr_deepstack_connector
+
+# Freeze vision components (DPSK encoder)
+freeze_vision_tower: true
+
+### dataset
+# R1-Onevision SFT dataset: Multi-domain VQA with chain-of-thought reasoning
+#
+# Datasets include:
+# - ai2d: AI2D diagrams (1,983 samples)
+# - doc_vqa: Document VQA (1,938 samples)
+# - Geometry3K: Geometry problems (4,663 samples)
+# - IconQA: Icon questions
+# - VizWiz: VizWiz VQA
+# - scienceqa: Science QA
+# - And more (~23 datasets total)
+#
+# Latent Reasoning Approach (Qwen3VL-2B-Thinking aligned):
+# --------------------------------------------------------
+# The R1-Onevision data contains thinking/reasoning sections in assistant responses.
+# For OCRVL's latent reasoning SFT with Qwen3VL-2B-Thinking format:
+# 1. Thinking sections are rendered as images using VelloRenderer
+# 2. Rendered thinking images are encoded via DeepSeek-OCR encoder
+# 3. The latent tokens are wrapped with <|think_start|> and <|think_end|> markers
+# 4. Loss is computed only on the final answer, not the thinking tokens
+#
+# This teaches the model to:
+# - Use visual tokens for intermediate reasoning (aligned with Qwen3VL-2B-Thinking)
+# - Separate thinking from final answers
+# - Leverage OCR capabilities for structured reasoning
+#
+# Data Conversion:
+# ----------------
+# Step 1: Convert parquet to JSONL with thinking rendered as images
+#   python OCRVL/scripts/convert_r1_onevision_to_jsonl.py --all
+#
+# This will:
+# - Extract main images and save to: OCRVL/llamafactory/data/r1_onevision_images/
+# - Render thinking sections and save to: OCRVL/llamafactory/data/r1_onevision_thinking/
+# - Create JSONL files with format (official Qwen3VL-Thinking format):
+#   {
+#     "messages": [
+#       {"role": "user", "content": "<image>\n{question}"},
+#       {"role": "assistant", "content": "<|think_start|>\n<image>\n<|think_end|>\n{final_answer}"}
+#     ],
+#     "images": ["path/to/main_image.png", "path/to/thinking_image.png"]
+#   }
+#
+# Step 2: During training:
+# - First <image>: Main question image (user message)
+# - Second <image>: Rendered thinking image, wrapped with <|think_start|> and <|think_end|> tokens
+# - Final answer: Text following the <|think_end|> token (official Qwen3VL-Thinking format)
+# - Token IDs: <|think_start|> = 151667, <|think_end|> = 151668
+#
+# Alternative: Skip thinking rendering (final answer only, faster)
+#   python OCRVL/scripts/convert_r1_onevision_to_jsonl.py --all --no-thinking-images
+#
+dataset: ocrvl_r1_onevision
+dataset_dir: OCRVL/llamafactory/data
+# Use standard OCRVL template (handles multi-image correctly)
+# The <|think_start|> and <|think_end|> tokens are embedded in the assistant's content, not handled by template
+template: ocrvl_qwen3_vl
+cutoff_len: 2048
+# Leave unset/null to use full dataset
+# Set to small value (e.g., 1000) for quick testing
+max_samples: null
+# Disable streaming mode - use epoch control with patched tokenization
+streaming: false
+# Enable sequence packing to reduce padding waste
+packing: true
+preprocessing_num_workers: 4
+dataloader_num_workers: 4
+
+### eval
+# Use transparent evaluation dataset (14 samples with ground truth)
+eval_dataset: ocrvl_transparent_eval
+val_size: 0
+per_device_eval_batch_size: 1
+eval_strategy: steps
+eval_steps: 200  # Run transparent evaluation every 200 steps (R1-Onevision dataset is smaller)
+predict_with_generate: true
+
+### output
+# Base output directory (timestamp will be added automatically by training script)
+output_dir: OCRVL/checkpoints/llamafactory/qwen3vl-2b/lora/r1_onevision_sft
+logging_steps: 10
+save_steps: 200  # Save checkpoint every 200 steps (R1-Onevision dataset is smaller)
+plot_loss: true
+overwrite_output_dir: false  # Don't overwrite existing checkpoints
+save_only_model: false
+report_to: none
+
+### train
+# Batch size configuration
+per_device_train_batch_size: 4  # 4 × 8 GPUs = 32 global batch
+gradient_accumulation_steps: 8  # 8 grad accum to maintain 256 effective batch
+dataloader_drop_last: true
+
+# Learning rate: Standard SFT learning rate for VQA tasks
+learning_rate: 2.0e-4
+
+# Training duration: 3 epochs for full convergence
+num_train_epochs: 3.0
+
+# Scheduler configuration
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+
+# Mixed precision and distributed training
+bf16: true
+pure_bf16: true  # Keep trainable params in bfloat16 (required for FSDP uniform dtype)
+
+# FSDP configuration (8 GPUs recommended)
+# sitecustomize.py patches PEFT auto-wrap policy for this custom model
+fsdp:
+  - full_shard
+  - auto_wrap
+fsdp_config:
+  fsdp_auto_wrap_policy: SIZE_BASED_WRAP
+  fsdp_min_num_params: 100000
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_forward_prefetch: false
+  fsdp_use_orig_params: true
+  fsdp_cpu_ram_efficient_loading: false
+  fsdp_sync_module_states: true
+
+# DDP configuration
+ddp_find_unused_parameters: false
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+
+# Optional: Resume from a previous checkpoint
+# Leave null to start from base model + alignment checkpoint
+adapter_name_or_path: null
+
+# Or resume from a specific checkpoint:
+# adapter_name_or_path: OCRVL/checkpoints/llamafactory/qwen3vl-2b/lora/alignment/checkpoint-311

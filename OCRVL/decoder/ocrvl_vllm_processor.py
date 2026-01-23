@@ -244,6 +244,8 @@ class OCRVLProcessor:
             # Multi-modal settings
             "limit_mm_per_prompt": {"image": 100},  # Support up to 100 images per prompt
             "enable_mm_embeds": True,  # Enable pre-computed embeddings
+            # Continuous batching settings
+            "enable_prefix_caching": False,  # Vision tokens not cacheable (important for OCRVL)
         }
 
         # Add LoRA configuration if enabled

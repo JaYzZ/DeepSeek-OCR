@@ -1,8 +1,12 @@
 ### model
 # Unified checkpoint with both language model and DeepSeek-OCR encoder in one directory
-# - Root: Qwen3-VL language model (model.safetensors)
+# - Root: Qwen3-VL-2B-Thinking language model (qwen3_model.safetensors)
 # - dpsk_ocr_encoder/: DeepSeek-OCR vision encoder (model-00001-of-000001.safetensors)
-model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/OCRVL/checkpoints/OCR-Qwen3-VL-2B
+#
+# The Thinking model includes special tokens for reasoning:
+# - `` (151667): Opens thinking/reasoning section
+# - `` (151668): Closes thinking/reasoning section
+model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/OCRVL/checkpoints/OCR-Qwen3-VL-2B-Thinking
 image_max_pixels: 262144
 video_max_pixels: 16384
 trust_remote_code: true
@@ -11,7 +15,7 @@ disable_gradient_checkpointing: true  # Required for FSDP compatibility
 ### method
 stage: sft
 do_train: true
-do_eval: false  # Use transparent evaluation callback instead
+do_eval: true  # Enable evaluation for transparent eval callback
 # Unified SFT: Single-stage training combining alignment and VQA tasks
 # This approach reduces task confusion compared to 2-stage training
 finetuning_type: lora
@@ -38,14 +42,18 @@ freeze_vision_tower: true
 # The standard VQA (text) component helps the model learn instruction following
 # without the complexity of rendered questions, improving task understanding.
 #
+# Note: This Thinking model version includes thinking tokens (``/``) for future
+# reasoning tasks, but the unified SFT dataset does not use them. The extra tokens
+# are harmless and simply won't appear in the training data.
+#
 # Build the dataset with:
-#   bash OCRVL/scripts/train_llamafactory.sh OCRVL/examples/llamafactory/qwen3vl_dpskocr_lora_sft.yaml
+#   bash OCRVL/scripts/train_llamafactory.sh OCRVL/examples/llamafactory/qwen3vl_dpskocr_lora_sft_thinking.yaml
 #
 # Or control data mixing ratios:
 #   OCRVL_UNIFIED_ALIGNMENT_RATIO=1.0 \
 #   OCRVL_UNIFIED_VQA_RATIO=0.5 \
 #   OCRVL_UNIFIED_STANDARD_VQA_RATIO=1.5 \
-#   bash OCRVL/scripts/train_llamafactory.sh OCRVL/examples/llamafactory/qwen3vl_dpskocr_lora_sft.yaml
+#   bash OCRVL/scripts/train_llamafactory.sh OCRVL/examples/llamafactory/qwen3vl_dpskocr_lora_sft_thinking.yaml
 dataset: ocrvl_unified_sft
 dataset_dir: OCRVL/llamafactory/data
 template: ocrvl_qwen3_vl_nothink
@@ -73,7 +81,7 @@ predict_with_generate: true
 ### output
 # Base output directory (timestamp will be added automatically by training script)
 # Or override via command line: output_dir=path/to/checkpoint
-output_dir: OCRVL/checkpoints/llamafactory/qwen3vl-2b/lora/unified_sft
+output_dir: OCRVL/checkpoints/llamafactory/qwen3vl-2b/lora/unified_sft_thinking
 logging_steps: 10
 save_steps: 500
 plot_loss: true
@@ -87,11 +95,10 @@ per_device_train_batch_size: 4  # 4 × 8 GPUs = 32 global batch
 gradient_accumulation_steps: 8  # 8 grad accum to maintain 256 effective batch
 dataloader_drop_last: true
 
-# Learning rate: Use VQA learning rate since unified SFT continues from alignment checkpoint
+# Learning rate: Use VQA learning rate for unified SFT
 learning_rate: 2.0e-4
 
-# Training duration: 3 epochs (matches VQA stage)
-# Alignment already trained in Stage 1, so unified SFT focuses on VQA capability
+# Training duration: 3 epochs
 num_train_epochs: 3.0
 
 # Scheduler configuration
@@ -121,12 +128,7 @@ ddp_find_unused_parameters: false
 ddp_timeout: 180000000
 resume_from_checkpoint: null
 
-# Load Stage 1 checkpoint (connector weights from alignment stage)
-# Use adapter_name_or_path to load only weights (not trainer_state.json)
-# This ensures eval_steps/save_steps from this config are used (not inherited from Stage 1)
-#
-# Override via command line if needed:
-#   bash OCRVL/scripts/train_llamafactory.sh \
-#     OCRVL/examples/llamafactory/qwen3vl_dpskocr_lora_sft.yaml \
-#     adapter_name_or_path=/path/to/alignment/checkpoint
-adapter_name_or_path: OCRVL/checkpoints/llamafactory/qwen3vl-2b/lora/alignment/checkpoint-311
+# No LoRA preload - start fresh from Thinking model base checkpoint
+# To load a previous checkpoint, set adapter_name_or_path:
+#   adapter_name_or_path: OCRVL/checkpoints/llamafactory/qwen3vl-2b/lora/alignment/checkpoint-311
+adapter_name_or_path: null

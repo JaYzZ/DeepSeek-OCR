@@ -46,6 +46,7 @@ class VelloRenderer:
         padding: int = 20,
         min_font_size: float = 5.0,
         max_font_size: float = 20.0,
+        preserve_newlines: bool = False,
     ):
         """
         Initialize Vello GPU renderer.
@@ -56,6 +57,8 @@ class VelloRenderer:
             padding: Padding around text
             min_font_size: Minimum font size for binary search
             max_font_size: Maximum font size for binary search
+            preserve_newlines: If True, preserve newlines for Q&A formatting.
+                            If False, collapse newlines for compact rendering (default).
 
         Raises:
             ImportError: If vello_renderer Rust module is not installed
@@ -75,6 +78,7 @@ class VelloRenderer:
         self.padding = padding
         self.min_font_size = min_font_size
         self.max_font_size = max_font_size
+        self.preserve_newlines = preserve_newlines
 
         # Create Rust renderer (initializes GPU)
         try:
@@ -84,6 +88,7 @@ class VelloRenderer:
                 padding=padding,
                 min_font_size=min_font_size,
                 max_font_size=max_font_size,
+                preserve_newlines=preserve_newlines,
             )
         except Exception as e:
             raise RuntimeError(
@@ -147,7 +152,8 @@ class VelloRenderer:
     def __repr__(self):
         return (
             f"VelloRenderer(width={self.width}, height={self.height}, "
-            f"padding={self.padding}, font_size={self.min_font_size}-{self.max_font_size})"
+            f"padding={self.padding}, font_size={self.min_font_size}-{self.max_font_size}, "
+            f"preserve_newlines={self.preserve_newlines})"
         )
 
     @property

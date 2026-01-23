@@ -473,6 +473,89 @@ OCRVL/checkpoints/alignment_long_20251227_142721/
 - Assistant response must contain reasoning in `<REASONING>` tags
 - Final answer must be in `<CONCLUSION>` tags
 
+## Training Data Format
+
+OCRVL uses JSONL format with support for multiple task types. Each line is a JSON object with `messages`, `images`, `task`, and `category` fields.
+
+### Task Types
+
+| Task | Images | Format | Example Instructions |
+|------|--------|--------|---------------------|
+| `image_caption` | 1 | Content image only | "Describe the image:", "What's in this image?" |
+| `rendered_ocr` | 1 | Rendered text image | "Read the text:", "Transcribe the text:" |
+| `document_ocr` | 1 | Real document image | "Extract all text from this image:" |
+| `vqa` | 2 | Content + rendered question | "Answer the question:" (question rendered as 2nd image) |
+
+### Image Caption Example
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "Describe the image: <image>"},
+    {"role": "assistant", "content": "a table with a bowl of fruit salad"}
+  ],
+  "images": ["/path/to/coco/train2017/000000000009.jpg"],
+  "task": "image_caption",
+  "category": "image_caption"
+}
+```
+
+### Rendered OCR Example
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "Extract the text: <image>"},
+    {"role": "assistant", "content": "The DeepSeek-OCR model represents a significant advancement..."}
+  ],
+  "images": ["test_doc_font32.png"],
+  "task": "caption_render_ocr",
+  "category": "rendered_ocr"
+}
+```
+
+### VQA Example (2 Images)
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "Answer the question: <image><image>"},
+    {"role": "assistant", "content": "Multiple objects are visible in the scene."}
+  ],
+  "images": [
+    "/path/to/content.jpg",
+    "OCRVL/llamafactory/data/conv_histories/conv_2338623.png"
+  ],
+  "task": "vqa_counting",
+  "category": "vqa"
+}
+```
+
+**Note:** VQA uses 2 images:
+1. Content image (photo/document)
+2. Rendered conversation history (previous Q&A pairs + current question)
+
+### Vision Placeholder Format
+
+Qwen3-VL uses: `<|vision_start|><|image_pad|>*N<|vision_end|>`
+
+- **1 image:** `<|vision_start|><|image_pad|>*100<|vision_end|>`
+- **2 images:** `<|vision_start|><|image_pad|>*100<|vision_end|><|vision_start|><|image_pad|>*100<|vision_end|>`
+
+### Dataset Files
+
+| File | Purpose | Samples |
+|------|---------|---------|
+| `ocrvl_alignment_text_prompts.jsonl` | Alignment training | ~627K |
+| `ocrvl_llava_mix665k.jsonl` | VQA training | ~665K |
+| `ocrvl_transparent_eval.jsonl` | Transparent evaluation | 14 |
+
+**Transparent Evaluation Distribution:**
+- 5 image_caption (COCO images)
+- 5 vqa (various question types)
+- 2 rendered_ocr (synthetic text)
+- 2 document_ocr (DocLayNet)
+
 ## vLLM Integration
 
 OCRVL provides direct vLLM integration without HuggingFace export:

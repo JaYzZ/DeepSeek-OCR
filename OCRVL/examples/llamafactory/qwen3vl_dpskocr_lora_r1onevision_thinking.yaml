@@ -1,0 +1,123 @@
+### model
+# OCR-Qwen3-VL-2B with thinking tokens for OCR thinking training
+#
+# Special tokens for thinking/reasoning:
+# - <|thinking_start|> (151667): Opens thinking section
+# - <|thinking_end|> (151668): Closes thinking section
+# - <|latent_step|> (auto-added): Placeholder for each thinking chunk
+# - <|thinking_sep|> (auto-added): Separator between thinking steps
+#
+# Format: Question <|thinking_start|><|latent_step|><|thinking_sep|>...<|thinking_end|> Answer
+# Each <|latent_step|> token will be replaced with pre-encoded OCR features during training
+model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/OCRVL/checkpoints/OCR-Qwen3-VL-2B-Thinking
+image_max_pixels: 262144
+video_max_pixels: 16384
+trust_remote_code: true
+disable_gradient_checkpointing: true  # Required for FSDP compatibility
+
+### method
+stage: sft
+do_train: true
+do_eval: false
+finetuning_type: lora
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target: q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj
+
+# Train OCR connector modules alongside LoRA adapters
+additional_target: model.ocr_connector,model.ocr_deepstack_connector
+
+# Freeze vision components (DPSK encoder)
+freeze_vision_tower: true
+
+### dataset
+# R1-OneVision OCR Thinking Training
+#
+# Uses OCRThinkingDataset with pre-rendered thinking images:
+# - Auto-detects LlamaFactory ShareGPT format (existing data)
+# - Extracts thinking images from assistant messages
+# - Encodes thinking images via DeepSeek-OCR encoder
+# - Injects OCR features at <|latent_step|> token positions
+# - Computes MSE loss via thinking_projection MLP
+#
+# Dataset format (LlamaFactory ShareGPT):
+#   {
+#     "messages": [
+#       {"role": "user", "content": "<image>\nQuestion"},
+#       {"role": "assistant", "content": "<image>\nThinking...\nAnswer"}
+#     ],
+#     "images": ["v_image.png", "thinking_image.png"]
+#   }
+#
+# During training:
+# 1. First image (v_image): Main question image - processed by vision encoder
+# 2. Second image (thinking_image): Pre-rendered thinking - encoded as OCR features
+# 3. OCR features injected at <|latent_step|> positions
+# 4. Loss: Cross-entropy on answer + MSE on OCR reconstruction
+#
+# Data: 177,260 samples across 22 VQA datasets
+dataset: ocrvl_r1_onevision_thinking
+dataset_dir: OCRVL/llamafactory/data
+template: ocrvl_qwen3_vl
+cutoff_len: 2048
+max_samples: null
+streaming: false
+packing: false  # Disabled for thinking training (need proper sequence boundaries)
+preprocessing_num_workers: 4
+dataloader_num_workers: 4
+
+### eval
+eval_dataset: ocrvl_transparent_eval
+val_size: 0
+per_device_eval_batch_size: 1
+eval_strategy: steps
+eval_steps: 500
+predict_with_generate: true
+
+### output
+output_dir: OCRVL/checkpoints/llamafactory/qwen3vl-2b/lora/r1_onevision_thinking
+logging_steps: 10
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: false
+save_only_model: false
+report_to: none
+
+### train
+per_device_train_batch_size: 4  # 4 × 8 GPUs = 32 global batch
+gradient_accumulation_steps: 8  # Effective batch = 256
+dataloader_drop_last: true
+
+# Learning rate: Standard SFT learning rate
+learning_rate: 2.0e-4
+
+# Training duration: 3 epochs
+num_train_epochs: 3.0
+
+# Scheduler configuration
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+
+# Mixed precision and distributed training
+bf16: true
+pure_bf16: true
+
+# FSDP configuration (8 GPUs recommended)
+fsdp:
+  - full_shard
+  - auto_wrap
+fsdp_config:
+  fsdp_auto_wrap_policy: SIZE_BASED_WRAP
+  fsdp_min_num_params: 100000
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_forward_prefetch: false
+  fsdp_use_orig_params: true
+  fsdp_cpu_ram_efficient_loading: false
+  fsdp_sync_module_states: true
+
+# DDP configuration
+ddp_find_unused_parameters: false
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+adapter_name_or_path: null

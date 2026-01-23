@@ -63,6 +63,7 @@ struct RenderConfig {
     padding: u32,
     min_font_size: f32,
     max_font_size: f32,
+    preserve_newlines: bool,
 }
 
 /// Binary search for optimal font size
@@ -151,7 +152,7 @@ fn find_optimal_font_size(
 }
 
 /// Preprocess text for compact rendering (collapse multiple newlines)
-fn preprocess_text(text: &str) -> String {
+fn preprocess_text_compact(text: &str) -> String {
     // Replace multiple consecutive newlines with single newline
     let mut result = String::with_capacity(text.len());
     let mut prev_was_newline = false;
@@ -175,12 +176,48 @@ fn preprocess_text(text: &str) -> String {
     result
 }
 
+/// Preprocess text for Q&A formatting (preserve newlines)
+fn preprocess_text_preserve(text: &str) -> String {
+    // Preserve single newlines, collapse multiple consecutive newlines to double newline
+    let mut result = String::with_capacity(text.len());
+    let mut newline_count = 0;
+
+    for ch in text.chars() {
+        if ch == '\n' {
+            newline_count += 1;
+            // After 2+ newlines, emit just \n\n (preserve paragraph breaks)
+            if newline_count == 2 {
+                result.push_str("\n\n");
+            }
+            // Skip additional newlines beyond 2
+        } else if ch == '\r' {
+            // Skip carriage returns
+            continue;
+        } else {
+            // Emit any pending newlines (1 or 2)
+            if newline_count == 1 {
+                result.push('\n');
+            } else if newline_count > 2 {
+                result.push_str("\n\n");
+            }
+            newline_count = 0;
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
 /// Render single text to raw RGB bytes
 fn render_single_to_bytes(text: &str, config: &RenderConfig) -> Vec<u8> {
     init_thread_local_font_system();
 
-    // Preprocess text for compact rendering
-    let text = preprocess_text(text);
+    // Preprocess text based on preserve_newlines flag
+    let text = if config.preserve_newlines {
+        preprocess_text_preserve(text)
+    } else {
+        preprocess_text_compact(text)
+    };
     let text = text.as_str();
 
     let font_size = find_optimal_font_size(text, config);
@@ -251,13 +288,14 @@ struct VelloRenderer {
 impl VelloRenderer {
     /// Create new renderer
     #[new]
-    #[pyo3(signature = (width=640, height=640, padding=20, min_font_size=5.0, max_font_size=20.0))]
+    #[pyo3(signature = (width=640, height=640, padding=20, min_font_size=5.0, max_font_size=20.0, preserve_newlines=false))]
     fn new(
         width: u32,
         height: u32,
         padding: u32,
         min_font_size: f32,
         max_font_size: f32,
+        preserve_newlines: bool,
     ) -> PyResult<Self> {
         // Initialize thread-local font system for main thread
         init_thread_local_font_system();
@@ -279,6 +317,7 @@ impl VelloRenderer {
                 padding,
                 min_font_size,
                 max_font_size,
+                preserve_newlines,
             }),
         })
     }

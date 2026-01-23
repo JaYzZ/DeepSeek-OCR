@@ -7,6 +7,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 2. DO NOT change any other reference repo's content, edit is forbidden
 3. DO NOT change the environment installation, the conda env is /share/project/xiyan/envs/ocrflow, any pip install should be passed for user validation
 
+## System Dependencies
+
+### Rust Installation (Required for Vello Renderer)
+The Vello renderer requires Rust to be installed. This is a system-level dependency, not a Python package.
+
+```bash
+# Install Rust (one-time setup)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source $HOME/.cargo/env
+
+# Verify installation
+rustc --version
+cargo --version
+```
+
 ## Repository Overview
 
 This is a research repository for **DeepSeek-OCR**, a vision-text compression model that investigates vision encoders from an LLM-centric viewpoint. The repository contains three main components:

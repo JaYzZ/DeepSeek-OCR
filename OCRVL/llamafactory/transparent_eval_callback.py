@@ -10,15 +10,34 @@ in the designated format for qualitative monitoring.
 import json
 import logging
 import os
+import shutil
+import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.distributed as dist
 from PIL import Image
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
+from transformers.integrations import is_fsdp_managed_module
 
 logger = logging.getLogger(__name__)
+
+# Add OCRVL scripts to path for composite image generation
+_REPO_ROOT = Path(__file__).parent.parent.parent
+_SCRIPTS_DIR = _REPO_ROOT / "OCRVL" / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+# Import composite image generation function
+try:
+    from generate_composite_images import generate_composite_images
+except ImportError as e:
+    logger.warning(f"Could not import composite image generation: {e}")
+    generate_composite_images = None
 
 
 class TransparentEvalCallback(TrainerCallback):
@@ -95,8 +114,8 @@ class TransparentEvalCallback(TrainerCallback):
 
         # Only rank 0 saves results
         if is_main:
-            eval_results_dir = Path(args.output_dir) / "eval_results"
-            self._save_results(eval_results_dir, results, state.global_step)
+            # Use output_dir directly - _save_results will create eval_results/ subdir
+            self._save_results(Path(args.output_dir), results, state.global_step)
             logger.info(f"[TransparentEval] Completed {len(results)}/{len(samples)} samples")
 
     def _run_inference(self, samples: List[Dict], global_step: int, model=None) -> List[Dict]:
@@ -111,9 +130,6 @@ class TransparentEvalCallback(TrainerCallback):
         """
         # FSDP handling: Detect FSDP and set synced_gpus=True for generation
         # This is how transformers Seq2SeqTrainer handles FSDP evaluation
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from transformers.integrations import is_fsdp_managed_module
-        import torch.distributed as dist
         rank = dist.get_rank() if dist.is_initialized() else 0
 
         # Use provided model or fall back to self.model
@@ -139,16 +155,16 @@ class TransparentEvalCallback(TrainerCallback):
                 for img_path in sample['images']:
                     full_path = Path(self.repo_root) / img_path
                     if full_path.exists():
-                        from PIL import Image as PILImage
-                        images.append(PILImage.open(full_path).convert('RGB'))
+                        images.append(Image.open(full_path).convert('RGB'))
                     else:
                         if is_main:
                             logger.warning(f"[TransparentEval] Image not found: {full_path}")
                         continue
 
-                if len(images) != 2:
+                # Support 1 or 2 images (1 for caption/ocr, 2 for VQA)
+                if len(images) not in (1, 2):
                     if is_main:
-                        logger.warning(f"[TransparentEval] Expected 2 images, got {len(images)} for {sample['id']}")
+                        logger.warning(f"[TransparentEval] Expected 1 or 2 images, got {len(images)} for {sample['id']}")
                     continue
 
                 # Use processor.image_processor to get pixel_values and image_grid_thw
@@ -177,8 +193,21 @@ class TransparentEvalCallback(TrainerCallback):
                     placeholder = "<|vision_start|>" + "<|image_pad|>" * image_seqlen + "<|vision_end|>"
                     vision_placeholders.append(placeholder)
 
-                # Build conversation with vision placeholders
-                conversation = [{"role": "user", "content": vision_placeholders[0] + vision_placeholders[1]}]
+                # Build conversation with instruction text + vision placeholders
+                # For 1-image tasks (caption/ocr): instruction + <image>
+                # For 2-image tasks (VQA): instruction + <image><image>
+                instruction_text = sample.get('instruction', 'Describe the image:')
+                # Remove <image> placeholders if present and strip
+                instruction_text = instruction_text.replace('<image>', '').strip()
+
+                if len(images) == 1:
+                    # Single image task: instruction + vision placeholder
+                    user_content = instruction_text + " " + vision_placeholders[0]
+                else:
+                    # Two images (VQA): instruction + both vision placeholders
+                    user_content = instruction_text + " " + vision_placeholders[0] + vision_placeholders[1]
+
+                conversation = [{"role": "user", "content": user_content}]
 
                 # Apply chat template
                 text = self.tokenizer.apply_chat_template(
@@ -256,21 +285,25 @@ class TransparentEvalCallback(TrainerCallback):
                 ground_truth_path = sample.get('ground_truth_path', '')  # For reference only
 
                 # Store result
-                results.append({
+                result = {
                     'id': sample['id'],
                     'task': sample['task'],
                     'images': sample['images'],
+                    'instruction': sample.get('instruction', ''),
                     'ground_truth': ground_truth,
                     'ground_truth_path': ground_truth_path,
                     'generated_answer': answer if answer else "[EMPTY]",
                     'step': global_step,
-                })
+                }
+                # Add question_text for VQA tasks
+                if sample.get('question_text'):
+                    result['question_text'] = sample['question_text']
+                results.append(result)
 
             except Exception as e:
                 if is_main:
                     logger.warning(f"[TransparentEval] Failed on sample {sample.get('id', 'unknown')}: {e}")
-                    import traceback
-                    logger.warning(traceback.format_exc())
+                    logger.exception(f"Sample {sample.get('id', 'unknown')} failed")
                 continue
 
         # Restore training mode
@@ -279,9 +312,36 @@ class TransparentEvalCallback(TrainerCallback):
         return results
 
     def _save_results(self, checkpoint_dir: Path, results: List[Dict], global_step: int):
-        """Save evaluation results in both JSON and human-readable formats."""
+        """Save evaluation results in both JSON and human-readable formats.
+
+        Also creates an images/ subdirectory with symlinks to all evaluation images
+        for easy cross-referencing, and generates composite images for visual inspection.
+        """
         eval_dir = checkpoint_dir / "eval_results"
         eval_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create images/ subdirectory and symlink all evaluation images
+        images_dir = eval_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+
+        # Create symlinks for each sample's images, named by sample ID
+        for result in results:
+            sample_id = result['id']
+            images = result.get('images', [])
+
+            for img_idx, img_path in enumerate(images):
+                src = Path(self.repo_root) / img_path
+                if src.exists():
+                    # Name: {sample_id}_img{idx}{ext}
+                    ext = src.suffix
+                    link_name = images_dir / f"{sample_id}_img{img_idx}{ext}"
+
+                    try:
+                        if not link_name.exists():
+                            link_name.symlink_to(src.resolve())
+                    except (OSError, NotImplementedError):
+                        # Symlink not supported (Windows), copy instead
+                        shutil.copy2(src, link_name)
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
@@ -308,8 +368,12 @@ class TransparentEvalCallback(TrainerCallback):
                 f.write(f"Sample {i}: {result['id']}\n")
                 f.write(f"Task: {result['task']}\n")
                 f.write(f"Images:\n")
-                for img in result['images']:
-                    f.write(f"  - {img}\n")
+                for img_idx, img in enumerate(result['images']):
+                    f.write(f"  - {result['id']}_img{img_idx}{Path(img).suffix}\n")
+
+                # Display instruction/question (important for VQA)
+                if result.get('instruction'):
+                    f.write(f"Question/Instruction: {result['instruction']}\n")
 
                 # Display ground truth (no truncation)
                 if result['ground_truth']:
@@ -319,23 +383,48 @@ class TransparentEvalCallback(TrainerCallback):
                 if result['ground_truth_path']:
                     f.write(f"Ground Truth Path: {result['ground_truth_path']}\n")
 
-                # Display generated answer (truncate if very long)
+                # Display generated answer (NO truncation)
                 gen = result['generated_answer']
-                if len(gen) > 500:
-                    preview = gen[:250] + f"\n... [truncated {len(gen)-500} chars] ...\n" + gen[-250:]
-                    f.write(f"Generated ({len(gen)} chars, truncated for display):\n{preview}\n")
-                else:
-                    f.write(f"Generated: {gen}\n")
+                f.write(f"Generated ({len(gen)} chars):\n{gen}\n")
 
                 f.write("-" * 80 + "\n\n")
 
         logger.info(f"[TransparentEval] Saved results to:")
         logger.info(f"  - {json_path}")
         logger.info(f"  - {txt_path}")
+        logger.info(f"  - {images_dir}/ (symlinks to evaluation images)")
+
+        # Generate composite images for visual inspection
+        self._generate_composite_images(json_path, eval_dir)
+
+    def _generate_composite_images(self, results_json: Path, output_dir: Path):
+        """Generate composite images for all evaluation samples.
+
+        Creates visual summaries showing input images with ground truth and
+        generated text overlaid for easy qualitative assessment.
+
+        Args:
+            results_json: Path to step_N_results.json file
+            output_dir: Directory to save composite images (will create step_N_composite/ subdir)
+        """
+        if generate_composite_images is None:
+            logger.warning("[TransparentEval] Composite image generation not available (import failed)")
+            return
+
+        try:
+            logger.info(f"[TransparentEval] Generating composite images...")
+            generate_composite_images(
+                results_json=results_json,
+                output_dir=output_dir,
+                repo_root=Path(self.repo_root),
+            )
+
+        except Exception as e:
+            logger.warning(f"[TransparentEval] Failed to generate composite images: {e}")
+            logger.exception("Composite image generation failed")
 
     def _is_main_process(self) -> bool:
         """Check if this is the main process (rank 0)."""
-        import torch.distributed as dist
         if dist.is_available() and dist.is_initialized():
             return dist.get_rank() == 0
         return True
