@@ -10,7 +10,7 @@ Usage:
 Output format (LlamaFactory):
 {
   "messages": [
-    {"role": "user", "content": "Extract all text in [x1, y1, x2, y2]:\n<image>"},
+    {"role": "user", "content": "Transcribe the text in [x1, y1, x2, y2]:\n<image>"},
     {"role": "assistant", "content": "text content"}
   ],
   "images": ["/absolute/path/to/image.jpg"],
@@ -114,18 +114,18 @@ def process_hiertext_split(
 
             # Convert absolute bbox to normalized [0, 1]
             xmin, ymin, xmax, ymax = bbox
-            x1_norm = xmin / width
-            y1_norm = ymin / height
-            x2_norm = xmax / width
-            y2_norm = ymax / height
+            x1_norm = round(xmin / width, 4)
+            y1_norm = round(ymin / height, 4)
+            x2_norm = round(xmax / width, 4)
+            y2_norm = round(ymax / height, 4)
 
             bbox_normalized = [x1_norm, y1_norm, x2_norm, y2_norm]
-            bbox_str = f"[{bbox_normalized[0]:.4f}, {bbox_normalized[1]:.4f}, {bbox_normalized[2]:.4f}, {bbox_normalized[3]:.4f}]"
+            bbox_str = f"[{bbox_normalized[0]}, {bbox_normalized[1]}, {bbox_normalized[2]}, {bbox_normalized[3]}]"
 
             # Yield in LlamaFactory format
             yield {
                 "messages": [
-                    {"role": "user", "content": f"Extract all text in {bbox_str}:\n<image>"},
+                    {"role": "user", "content": f"Transcribe the text in {bbox_str}:\n<image>"},
                     {"role": "assistant", "content": paragraph_text}
                 ],
                 "images": [str(image_path.resolve())],

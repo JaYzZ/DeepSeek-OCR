@@ -28,9 +28,9 @@ freeze_vision_tower: true
 # LLaVA-Instruct-665K: VQA conversations for instruction tuning
 # - LLaVA-v1.5 mix665k: ~665K instruction-following samples
 dataset: ocrvl_llava_mix665k
-dataset_dir: OCRVL/llamafactory/data
+dataset_dir: OCRVL/data
 # Use data directory as media_dir to access conv_histories and other images
-media_dir: OCRVL/llamafactory/data
+media_dir: OCRVL/data
 template: ocrvl_qwen3_vl_nothink
 cutoff_len: 2048
 # Leave unset/null to use full dataset (~665K samples)

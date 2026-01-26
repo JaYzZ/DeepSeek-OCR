@@ -33,7 +33,7 @@ freeze_vision_tower: true
 # - LLaVA-Pretrain: Natural images with captions (blip_laion_cc_sbu_558k)
 # - DocLayNet: OCR-heavy document layouts (train split)
 dataset: ocrvl_alignment_text_prompts
-dataset_dir: OCRVL/llamafactory/data
+dataset_dir: OCRVL/data
 template: ocrvl_qwen3_vl_nothink
 cutoff_len: 2048
 # Leave unset/null to use full generated dataset.

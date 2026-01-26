@@ -44,20 +44,13 @@ IMAGE_CAPTION_INSTRUCTIONS = [
     "Tell me about this image:",
 ]
 
-TEXT_OCR_INSTRUCTIONS = [
-    "What does the text say?",
-    "Read the text:",
-    "Transcribe the text:",
-    "What text is shown?",
-    "Extract the text:",
-]
-
-DOC_OCR_INSTRUCTIONS = [
-    "Please transcribe all text in the image.",
-    "What text is visible in the document?",
-    "Read and transcribe the document content.",
-    "Extract all text from this image.",
-    "What does the document say?",
+# Unified OCR instruction prompts for full image OCR
+OCR_INSTRUCTIONS = [
+    "Free OCR",
+    "Read all text in the image",
+    "Transcribe the text",
+    "Read and transcribe the document content",
+    "Extract all text from the image",
 ]
 
 # VQA question templates (will be rendered as images)
@@ -282,7 +275,7 @@ def _llava_pretrain_iter(
             _render_text_to_file(caption, caption_img_path)
             existing_caption_hashes.add(caption_hash)  # Track newly rendered
 
-        ocr_instruction = rng.choice(TEXT_OCR_INSTRUCTIONS)
+        ocr_instruction = rng.choice(OCR_INSTRUCTIONS)
         ocr_prompt = f"{ocr_instruction} <image>"
 
         yield {
@@ -344,7 +337,7 @@ def _doclaynet_iter(
         if not Path(img_path).exists():
             continue
 
-        instruction = rng.choice(DOC_OCR_INSTRUCTIONS)
+        instruction = rng.choice(OCR_INSTRUCTIONS)
         prompt = f"{instruction} <image>"
 
         yield {

@@ -93,7 +93,7 @@ class TransparentEvalCallback(TrainerCallback):
                 print(f"[DEBUG] model in kwargs: {type(kwargs['model'])}", flush=True)
 
         # Load samples (all ranks need this for FSDP)
-        metadata_path = Path(self.repo_root) / "OCRVL/llamafactory/data/ocrvl_transparent_eval.metadata.json"
+        metadata_path = Path(self.repo_root) / "OCRVL/data/ocrvl_transparent_eval.metadata.json"
         if not metadata_path.exists():
             if is_main:
                 logger.warning(f"[TransparentEval] Metadata not found: {metadata_path}")
@@ -105,6 +105,31 @@ class TransparentEvalCallback(TrainerCallback):
         samples = metadata['samples']
         if self.limit:
             samples = samples[:int(self.limit)]
+
+        # Load full samples from JSONL to get ground_truth (from assistant message)
+        # This is needed because unified SFT format doesn't have ground_truth field
+        full_samples = {}
+        jsonl_path = Path(self.repo_root) / "OCRVL/data/ocrvl_transparent_eval.jsonl"
+        if jsonl_path.exists():
+            with open(jsonl_path, 'r') as f:
+                for line in f:
+                    sample = json.loads(line.strip())
+                    sample_id = sample.get('id')
+                    if sample_id:
+                        # Extract ground_truth from assistant message if not present
+                        if 'ground_truth' not in sample:
+                            for msg in sample.get('messages', []):
+                                if msg.get('role') == 'assistant':
+                                    sample['ground_truth'] = msg.get('content', '')
+                                    break
+                        full_samples[sample_id] = sample
+
+        # Merge ground_truth into samples
+        for sample in samples:
+            sample_id = sample.get('id')
+            if sample_id in full_samples:
+                if 'ground_truth' not in sample or not sample['ground_truth']:
+                    sample['ground_truth'] = full_samples[sample_id].get('ground_truth', '')
 
         if is_main:
             logger.info(f"[TransparentEval] Running inference on {len(samples)} samples at step {state.global_step}")

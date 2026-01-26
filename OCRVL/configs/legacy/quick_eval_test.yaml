@@ -22,7 +22,7 @@ freeze_vision_tower: true
 
 ### dataset
 dataset: ocrvl_alignment_prerendered
-dataset_dir: OCRVL/llamafactory/data
+dataset_dir: OCRVL/data
 template: ocrvl_qwen3_vl_nothink
 cutoff_len: 2048
 max_samples: 50  # QUICK TEST: Only use 50 samples

@@ -58,7 +58,7 @@ freeze_vision_tower: true
 #
 # Data: 177,260 samples across 22 VQA datasets
 dataset: ocrvl_r1_onevision_thinking
-dataset_dir: OCRVL/llamafactory/data
+dataset_dir: OCRVL/data
 template: ocrvl_qwen3_vl
 cutoff_len: 2048
 max_samples: null

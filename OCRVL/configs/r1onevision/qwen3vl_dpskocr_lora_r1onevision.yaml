@@ -62,8 +62,8 @@ freeze_vision_tower: true
 #   python OCRVL/scripts/convert_r1_onevision_to_jsonl.py --all
 #
 # This will:
-# - Extract main images and save to: OCRVL/llamafactory/data/r1_onevision_images/
-# - Render thinking sections and save to: OCRVL/llamafactory/data/r1_onevision_thinking/
+# - Extract main images and save to: OCRVL/data/r1_onevision_images/
+# - Render thinking sections and save to: OCRVL/data/r1_onevision_thinking/
 # - Create JSONL files with format (official Qwen3VL-Thinking format):
 #   {
 #     "messages": [
@@ -83,7 +83,7 @@ freeze_vision_tower: true
 #   python OCRVL/scripts/convert_r1_onevision_to_jsonl.py --all --no-thinking-images
 #
 dataset: ocrvl_r1_onevision
-dataset_dir: OCRVL/llamafactory/data
+dataset_dir: OCRVL/data
 # Use standard OCRVL template (handles multi-image correctly)
 # The <|think_start|> and <|think_end|> tokens are embedded in the assistant's content, not handled by template
 template: ocrvl_qwen3_vl

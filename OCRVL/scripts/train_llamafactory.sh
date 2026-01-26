@@ -22,7 +22,7 @@ if [ ! -x "$PYTHON_BIN" ]; then
 fi
 
 # Default config (alignment mode)
-DEFAULT_CONFIG="$REPO_ROOT/OCRVL/examples/llamafactory/qwen3vl_dpskocr_lora_alignment.yaml"
+DEFAULT_CONFIG="$REPO_ROOT/OCRVL/configs/alignment/qwen3vl_dpskocr_lora_alignment.yaml"
 
 CONFIG_PATH="${1:-$DEFAULT_CONFIG}"
 if [ "${1:-}" != "" ]; then
@@ -57,9 +57,8 @@ for arg in "$@"; do
 done
 
 # Setup logging
-LOG_DIR="$OUTPUT_DIR/logs"
-mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/training.log"
+mkdir -p "$OUTPUT_DIR"
+LOG_FILE="$OUTPUT_DIR/training.log"
 
 echo "Logging to: $LOG_FILE"
 echo ""
@@ -69,10 +68,10 @@ CONFIG_BASENAME=$(basename "$CONFIG_PATH")
 
 if [[ "$CONFIG_BASENAME" == *"unified_sft"* ]] || [[ "$CONFIG_BASENAME" == *"sft"* ]]; then
     # Unified SFT: Build alignment, VQA (rendered), VQA (text), and unified datasets
-    ALIGNMENT_DATASET="$REPO_ROOT/OCRVL/llamafactory/data/ocrvl_alignment_text_prompts.jsonl"
-    VQA_DATASET="$REPO_ROOT/OCRVL/llamafactory/data/ocrvl_llava_mix665k.jsonl"
-    STANDARD_VQA_DATASET="$REPO_ROOT/OCRVL/llamafactory/data/ocrvl_llava_standard_vqa.jsonl"
-    UNIFIED_DATASET="$REPO_ROOT/OCRVL/llamafactory/data/ocrvl_unified_sft.jsonl"
+    ALIGNMENT_DATASET="$REPO_ROOT/OCRVL/data/ocrvl_alignment_text_prompts.jsonl"
+    VQA_DATASET="$REPO_ROOT/OCRVL/data/ocrvl_llava_mix665k.jsonl"
+    STANDARD_VQA_DATASET="$REPO_ROOT/OCRVL/data/ocrvl_llava_standard_vqa.jsonl"
+    UNIFIED_DATASET="$REPO_ROOT/OCRVL/data/ocrvl_unified_sft.jsonl"
 
     # Build alignment dataset if needed
     if [ ! -f "$ALIGNMENT_DATASET" ]; then
@@ -118,7 +117,7 @@ if [[ "$CONFIG_BASENAME" == *"unified_sft"* ]] || [[ "$CONFIG_BASENAME" == *"sft
                 --llava-json "${LLAVA_JSON:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json}" \
                 --llava-images "${LLAVA_IMAGES:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images}" \
                 --output "$VQA_DATASET" \
-                --rendered-images-dir "$REPO_ROOT/OCRVL/llamafactory/data/ocrvl_rendered_conversations"
+                --rendered-images-dir "$REPO_ROOT/OCRVL/data/ocrvl_rendered_conversations"
             if [ $? -ne 0 ]; then
                 echo "❌ Failed to build rendered VQA dataset"
                 exit 1
@@ -160,11 +159,11 @@ if [[ "$CONFIG_BASENAME" == *"unified_sft"* ]] || [[ "$CONFIG_BASENAME" == *"sft
         echo ""
         echo "Unified SFT requires alignment checkpoint to load connector weights."
         echo "Please run alignment training first:"
-        echo "  bash OCRVL/scripts/train_llamafactory.sh OCRVL/examples/llamafactory/qwen3vl_dpskocr_lora_alignment.yaml"
+        echo "  bash OCRVL/scripts/train_llamafactory.sh OCRVL/configs/alignment/qwen3vl_dpskocr_lora_alignment.yaml"
         echo ""
         echo "Or override with custom path:"
         echo "  ADAPTER_CHECKPOINT_PATH=/path/to/alignment/checkpoint \\"
-        echo "  bash OCRVL/scripts/train_llamafactory.sh OCRVL/examples/llamafactory/qwen3vl_dpskocr_lora_sft.yaml"
+        echo "  bash OCRVL/scripts/train_llamafactory.sh OCRVL/configs/sft/qwen3vl_dpskocr_lora_sft.yaml"
         echo "========================================================================"
         exit 1
     fi
@@ -173,7 +172,7 @@ if [[ "$CONFIG_BASENAME" == *"unified_sft"* ]] || [[ "$CONFIG_BASENAME" == *"sft
 
 elif [[ "$CONFIG_BASENAME" == *"alignment"* ]]; then
     # Alignment stage: Build alignment dataset
-    ALIGNMENT_DATASET="$REPO_ROOT/OCRVL/llamafactory/data/ocrvl_alignment_text_prompts.jsonl"
+    ALIGNMENT_DATASET="$REPO_ROOT/OCRVL/data/ocrvl_alignment_text_prompts.jsonl"
     if [ ! -f "$ALIGNMENT_DATASET" ]; then
         echo "========================================================================"
         echo "Building alignment dataset (text prompts + DocLayNet)..."
@@ -192,8 +191,8 @@ elif [[ "$CONFIG_BASENAME" == *"alignment"* ]]; then
 
 elif [[ "$CONFIG_BASENAME == *"llava"* ]] || [[ "$CONFIG_BASENAME == *"vqa"* ]]; then
     # VQA stage: Build VQA dataset (both modes)
-    VQA_DATASET="$REPO_ROOT/OCRVL/llamafactory/data/ocrvl_llava_mix665k.jsonl"
-    STANDARD_VQA_DATASET="$REPO_ROOT/OCRVL/llamafactory/data/ocrvl_llava_standard_vqa.jsonl"
+    VQA_DATASET="$REPO_ROOT/OCRVL/data/ocrvl_llava_mix665k.jsonl"
+    STANDARD_VQA_DATASET="$REPO_ROOT/OCRVL/data/ocrvl_llava_standard_vqa.jsonl"
 
     if [ ! -f "$VQA_DATASET" ] || [ ! -f "$STANDARD_VQA_DATASET" ]; then
         echo "========================================================================"
@@ -221,7 +220,7 @@ elif [[ "$CONFIG_BASENAME == *"llava"* ]] || [[ "$CONFIG_BASENAME == *"vqa"* ]];
                 --llava-json "${LLAVA_JSON:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json}" \
                 --llava-images "${LLAVA_IMAGES:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images}" \
                 --output "$VQA_DATASET" \
-                --rendered-images-dir "$REPO_ROOT/OCRVL/llamafactory/data/ocrvl_rendered_conversations"
+                --rendered-images-dir "$REPO_ROOT/OCRVL/data/ocrvl_rendered_conversations"
             if [ $? -ne 0 ]; then
                 echo "❌ Failed to build rendered VQA dataset"
                 exit 1

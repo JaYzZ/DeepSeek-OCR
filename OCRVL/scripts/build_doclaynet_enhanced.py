@@ -147,6 +147,19 @@ Convert this image to markdown:"""
         return markdown
 
 
+# =============================================================================
+# OCR Instruction Prompts
+# =============================================================================
+
+FULL_IMAGE_OCR_INSTRUCTIONS = [
+    "Free OCR",
+    "Read all text in the image",
+    "Transcribe the text",
+    "Read and transcribe the document content",
+    "Extract all text from the image",
+]
+
+
 def sort_segments_by_reading_order(
     segments: List[Dict],
     image_width: int = 640
@@ -251,10 +264,10 @@ def iter_bbox_ocr_samples(
             if len(bbox_xywh) >= 4:
                 x, y, w, h = bbox_xywh[:4]
                 # Convert to normalized [x1, y1, x2, y2] in [0, 1]
-                x1_norm = x / img_width
-                y1_norm = y / img_height
-                x2_norm = (x + w) / img_width
-                y2_norm = (y + h) / img_height
+                x1_norm = round(x / img_width, 4)
+                y1_norm = round(y / img_height, 4)
+                x2_norm = round((x + w) / img_width, 4)
+                y2_norm = round((y + h) / img_height, 4)
                 standard_segments.append({
                     "bbox": [x1_norm, y1_norm, x2_norm, y2_norm],
                     "text": cell.get('text', '')
@@ -323,7 +336,7 @@ def iter_bbox_ocr_samples(
 
             yield {
                 "messages": [
-                    {"role": "user", "content": f"Extract all text in {bbox_str}:\n<image>"},
+                    {"role": "user", "content": f"Transcribe the text in {bbox_str}:\n<image>"},
                     {"role": "assistant", "content": text}
                 ],
                 "images": [final_img_path],
@@ -399,10 +412,10 @@ def iter_full_ocr_samples(
             if len(bbox_xywh) >= 4:
                 x, y, w, h = bbox_xywh[:4]
                 # Convert to normalized [x1, y1, x2, y2] in [0, 1]
-                x1_norm = x / img_width
-                y1_norm = y / img_height
-                x2_norm = (x + w) / img_width
-                y2_norm = (y + h) / img_height
+                x1_norm = round(x / img_width, 4)
+                y1_norm = round(y / img_height, 4)
+                x2_norm = round((x + w) / img_width, 4)
+                y2_norm = round((y + h) / img_height, 4)
                 text = cell.get('text', '').strip()
                 if text:
                     standard_segments.append({
@@ -455,10 +468,13 @@ def iter_full_ocr_samples(
                 # Keep absolute if not relative
                 pass
 
+        # Randomly select OCR instruction
+        instruction = random.choice(FULL_IMAGE_OCR_INSTRUCTIONS)
+
         # Return LlamaFactory format
         yield {
             "messages": [
-                {"role": "user", "content": "Extract all text from this image:\n<image>"},
+                {"role": "user", "content": f"{instruction}:\n<image>"},
                 {"role": "assistant", "content": full_text}
             ],
             "images": [final_img_path],
@@ -536,10 +552,10 @@ def iter_markdown_model_samples(
                 bbox_xywh = cell.get('bbox', [])
                 if len(bbox_xywh) >= 4:
                     x, y, w, h = bbox_xywh[:4]
-                    x1_norm = x / img_width
-                    y1_norm = y / img_height
-                    x2_norm = (x + w) / img_width
-                    y2_norm = (y + h) / img_height
+                    x1_norm = round(x / img_width, 4)
+                    y1_norm = round(y / img_height, 4)
+                    x2_norm = round((x + w) / img_width, 4)
+                    y2_norm = round((y + h) / img_height, 4)
                     text = cell.get('text', '').strip()
                     if text:
                         standard_segments.append({
@@ -586,6 +602,10 @@ def iter_markdown_model_samples(
                     final_img_path = str(rel_path)
                 except ValueError:
                     pass
+
+            # Filter markdown samples: only include if >= 100 chars
+            if len(markdown_answer) < 100:
+                continue
 
             # Return LlamaFactory format
             yield {
@@ -649,10 +669,10 @@ def process_markdown_task(args: tuple) -> Optional[Dict[str, Any]]:
             bbox_xywh = cell.get('bbox', [])
             if len(bbox_xywh) >= 4:
                 x, y, w, h = bbox_xywh[:4]
-                x1_norm = x / img_width
-                y1_norm = y / img_height
-                x2_norm = (x + w) / img_width
-                y2_norm = (y + h) / img_height
+                x1_norm = round(x / img_width, 4)
+                y1_norm = round(y / img_height, 4)
+                x2_norm = round((x + w) / img_width, 4)
+                y2_norm = round((y + h) / img_height, 4)
                 text = cell.get('text', '').strip()
                 if text:
                     standard_segments.append({
@@ -698,6 +718,10 @@ def process_markdown_task(args: tuple) -> Optional[Dict[str, Any]]:
                 final_img_path = str(rel_path)
             except ValueError:
                 pass
+
+        # Filter markdown samples: only include if >= 100 chars
+        if len(markdown_answer) < 100:
+            return None
 
         # Return LlamaFactory format
         return {
@@ -907,10 +931,10 @@ def iter_all_samples(
                 bbox_xywh = cell.get('bbox', [])
                 if len(bbox_xywh) >= 4:
                     x, y, w, h = bbox_xywh[:4]
-                    x1_norm = x / img_width
-                    y1_norm = y / img_height
-                    x2_norm = (x + w) / img_width
-                    y2_norm = (y + h) / img_height
+                    x1_norm = round(x / img_width, 4)
+                    y1_norm = round(y / img_height, 4)
+                    x2_norm = round((x + w) / img_width, 4)
+                    y2_norm = round((y + h) / img_height, 4)
                     text = cell.get('text', '').strip()
                     if text:
                         standard_segments.append({
@@ -944,7 +968,7 @@ def iter_all_samples(
 
                 yield {
                     "messages": [
-                        {"role": "user", "content": f"Extract all text in {bbox_str}:\n<image>"},
+                        {"role": "user", "content": f"Transcribe the text in {bbox_str}:\n<image>"},
                         {"role": "assistant", "content": text}
                     ],
                     "images": [final_img_path],
@@ -978,9 +1002,12 @@ def iter_all_samples(
             full_text = '\n'.join(text_lines).strip()
 
             if full_text:
+                # Randomly select OCR instruction
+                instruction = random.choice(FULL_IMAGE_OCR_INSTRUCTIONS)
+
                 yield {
                     "messages": [
-                        {"role": "user", "content": "Extract all text from this image:\n<image>"},
+                        {"role": "user", "content": f"{instruction}:\n<image>"},
                         {"role": "assistant", "content": full_text}
                     ],
                     "images": [final_img_path],
@@ -999,6 +1026,10 @@ def iter_all_samples(
                 markdown = client.generate_markdown(img_path, full_text)
 
             if markdown:
+                # Filter markdown samples: only include if >= 100 chars
+                if len(markdown) < 100:
+                    continue
+
                 yield {
                     "messages": [
                         {"role": "user", "content": "Convert this image to markdown:\n<image>"},

@@ -1271,10 +1271,11 @@ class OCRQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
 
-        # Thinking loss: align projected hidden states with OCR-encoded supervision
+        # Thinking loss: REPA (Representation Alignment) with reverse projection
+        # Uses cosine similarity loss between normalized features
         thinking_loss = None
         if latent_supervision is not None and latent_positions is not None:
-            # Get thinking projection MLP
+            # Get thinking projection MLP (reverse path: hidden_dim -> 1280)
             thinking_proj = self.model._maybe_get_thinking_projection(
                 device=hidden_states.device,
                 dtype=hidden_states.dtype
@@ -1291,22 +1292,34 @@ class OCRQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 # Extract hidden states at latent token positions
                 sample_hidden = hidden_states[b][latent_mask]  # [num_latents, hidden_dim]
 
-                # Project to latent space
+                # Reverse projection: hidden states -> OCR feature space
                 predicted_latents = thinking_proj(sample_hidden)  # [num_latents, 1280]
 
-                # Get supervision (each chunk is [111, 1280], mean-pool to [1280])
+                # Get supervision (pre-extracted features, already [100, 1280] or [1280])
                 supervision_list = latent_supervision[b]
                 supervision_latents = []
                 for sup_tensor in supervision_list:
-                    # Mean-pool spatial tokens to get 1280-dim representation
-                    supervision_latents.append(sup_tensor.mean(dim=0))  # [1280]
+                    # Each sup_tensor is either [100, 1280] (spatial) or [1280] (mean-pooled)
+                    # For spatial tokens, mean-pool to [1280]
+                    if sup_tensor.dim() == 2:
+                        supervision_latents.append(sup_tensor.mean(dim=0))  # [1280]
+                    else:
+                        supervision_latents.append(sup_tensor)  # [1280]
 
                 supervision_tensor = torch.stack(supervision_latents, dim=0)  # [num_latents, 1280]
                 supervision_tensor = supervision_tensor.to(predicted_latents.device, predicted_latents.dtype)
 
-                # MSE loss
+                # REPA loss: cosine similarity loss (from SILoss projection loss)
+                # Normalize features and maximize similarity (minimize negative dot product)
                 min_count = min(predicted_latents.shape[0], supervision_tensor.shape[0])
-                sample_loss = torch.mean((predicted_latents[:min_count] - supervision_tensor[:min_count]) ** 2)
+
+                # Normalize along feature dimension
+                pred_normalized = F.normalize(predicted_latents[:min_count], dim=-1)  # [num_latents, 1280]
+                superv_normalized = F.normalize(supervision_tensor[:min_count], dim=-1)  # [num_latents, 1280]
+
+                # Negative cosine similarity (to maximize similarity via minimization)
+                # Equivalent to: -mean(cosine_similarity(pred, superv))
+                sample_loss = -torch.mean((pred_normalized * superv_normalized).sum(dim=-1))
                 thinking_losses.append(sample_loss)
 
             if thinking_losses:

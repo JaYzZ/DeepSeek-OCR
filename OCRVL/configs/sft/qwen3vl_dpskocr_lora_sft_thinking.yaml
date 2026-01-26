@@ -55,7 +55,7 @@ freeze_vision_tower: true
 #   OCRVL_UNIFIED_STANDARD_VQA_RATIO=1.5 \
 #   bash OCRVL/scripts/train_llamafactory.sh OCRVL/examples/llamafactory/qwen3vl_dpskocr_lora_sft_thinking.yaml
 dataset: ocrvl_unified_sft
-dataset_dir: OCRVL/llamafactory/data
+dataset_dir: OCRVL/data
 template: ocrvl_qwen3_vl_nothink
 cutoff_len: 2048
 # Leave unset/null to use full generated dataset (~2.5M samples)
