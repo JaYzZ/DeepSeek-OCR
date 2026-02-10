@@ -53,6 +53,40 @@ def create_composite_image(
             img = Image.open(full_path).convert('RGB')
             images.append(img)
 
+    # For bbox_ocr tasks, draw bbox on the first image
+    if result.get('task') == 'bbox_ocr' and images:
+        instruction = result.get('instruction', '')
+        # Parse bbox from instruction: "Transcribe the text in [x1, y1, x2, y2]:<image>"
+        import re
+        bbox_match = re.search(r'\[([^\]]+)\]', instruction)
+        if bbox_match:
+            try:
+                bbox_str = bbox_match.group(1)
+                bbox_coords = [float(x.strip()) for x in bbox_str.split(',')]
+                if len(bbox_coords) == 4:
+                    # Draw bbox on image (Qwen3VL format: [0, 1000] coordinates)
+                    img = images[0]
+                    draw = ImageDraw.Draw(img)
+                    x1, y1, x2, y2 = bbox_coords
+                    # Convert from [0, 1000] to absolute coordinates
+                    abs_x1 = int(x1 * img.width / 1000)
+                    abs_y1 = int(y1 * img.height / 1000)
+                    abs_x2 = int(x2 * img.width / 1000)
+                    abs_y2 = int(y2 * img.height / 1000)
+                    # Draw red rectangle with thick outline
+                    draw.rectangle([abs_x1, abs_y1, abs_x2, abs_y2],
+                                 outline='red', width=5)
+                    # Add semi-transparent overlay (optional visualization)
+                    # Create a semi-transparent overlay
+                    overlay = Image.new('RGBA', img.size, (255, 0, 0, 0))
+                    overlay_draw = ImageDraw.Draw(overlay)
+                    overlay_draw.rectangle([abs_x1, abs_y1, abs_x2, abs_y2],
+                                          fill=(255, 0, 0, 30))  # 30/255 alpha
+                    # Composite overlay onto image
+                    images[0] = Image.alpha_composite(img.convert('RGBA'), overlay).convert('RGB')
+            except (ValueError, IndexError) as e:
+                print(f"Warning: Failed to parse bbox for {result.get('id')}: {e}")
+
     if not images:
         print(f"Warning: No images found for {result.get('id')}")
         return
@@ -89,7 +123,7 @@ def create_composite_image(
 
     # Get text content
     ground_truth = result.get('ground_truth', '')
-    generated = result.get('generated_answer', '[EMPTY]')
+    generated = result.get('generated_answer_display') or result.get('generated_answer', '[EMPTY]')
     question_text = result.get('question_text', '')
 
     # Measure text (no truncation)

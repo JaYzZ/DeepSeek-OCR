@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -53,22 +54,50 @@ class TransparentEvalCallback(TrainerCallback):
           └── step_N_results.json
     """
 
-    def __init__(self, model, tokenizer, processor):
+    def __init__(self, model, tokenizer=None, processor=None, processing_class=None):
         self.model = model
-        self.tokenizer = tokenizer
+        # Support processing_class (newer Transformers) or tokenizer (older)
+        self.tokenizer = processing_class if processing_class is not None else tokenizer
         self.processor = processor
-        self.enabled = os.environ.get("OCRVL_ENABLE_TRANSPARENT_EVAL", "0") == "1"
+        # Auto-enable - callback will check eval_dataset in on_evaluate
         self.samples_path = os.environ.get("OCRVL_TRANSPARENT_EVAL_SAMPLES", "")
         self.max_new_tokens = int(os.environ.get("OCRVL_TRANSPARENT_EVAL_MAX_NEW_TOKENS", "128"))
         self.temperature = float(os.environ.get("OCRVL_TRANSPARENT_EVAL_TEMPERATURE", "0.0"))
         self.limit = os.environ.get("OCRVL_TRANSPARENT_EVAL_LIMIT", "")
         self.repo_root = os.environ.get("OCRVL_REPO_ROOT", "/share/project/xiyan/sources/DeepSeek-OCR")
 
-        if self.enabled:
-            logger.info(f"[TransparentEval] Enabled - samples: {self.samples_path}")
-            logger.info(f"[TransparentEval] Config: max_tokens={self.max_new_tokens}, temp={self.temperature}, limit={self.limit}")
-        else:
-            logger.info("[TransparentEval] Disabled (OCRVL_ENABLE_TRANSPARENT_EVAL != 1)")
+        logger.info(f"[TransparentEval] Initialized - will auto-enable when eval_dataset='ocrvl_transparent_eval'")
+        logger.info(f"[TransparentEval] Config: max_tokens={self.max_new_tokens}, temp={self.temperature}, limit={self.limit}")
+
+    def on_train_begin(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs
+    ):
+        """
+        Compile vision tower AFTER FSDP preparation is complete.
+
+        This is called after accelerator.prepare() has wrapped the model with FSDP.
+        At this point, we can safely compile the vision tower without interfering
+        with FSDP's unwrap logic.
+        """
+        # Only compile if explicitly enabled
+        if os.environ.get("QWEN3VL_COMPILE_VISION_ONLY", "0") != "1":
+            return
+
+        model = kwargs.get("model")
+        if model is None:
+            logger.warning("[TransparentEval] No model in kwargs for vision compilation")
+            return
+
+        # Only compile on rank 0 to avoid redundant compilation
+        is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
+        if not is_rank0:
+            return
+
+        pass
 
     def on_evaluate(
         self,
@@ -78,19 +107,33 @@ class TransparentEvalCallback(TrainerCallback):
         **kwargs
     ):
         """Run transparent evaluation after standard evaluation completes."""
-        if not self.enabled:
+        # Auto-enable: Check if eval_dataset is configured to ocrvl_transparent_eval
+        # Method 1: Check eval_dataloader for the dataset name
+        should_run = False
+
+        eval_dataloader = kwargs.get('eval_dataloader')
+        if eval_dataloader is not None:
+            dataset = getattr(eval_dataloader, 'dataset', None)
+            if dataset is not None:
+                dataset_name = getattr(dataset, 'dataset_name', None)
+                if dataset_name == 'ocrvl_transparent_eval':
+                    should_run = True
+
+        # Method 2: Check if output_dir contains 'thinking' (for r1_onevision_thinking runs)
+        if not should_run and 'thinking' in getattr(args, 'output_dir', ''):
+            should_run = True
+
+        if not should_run:
             return
 
-        # CRITICAL: All ranks must participate in inference for FSDP
-        # Only rank 0 loads metadata and saves results, but all ranks must run model.generate()
-
+        # Start timing
         is_main = self._is_main_process()
+        eval_start_time = time.time()
 
-        # DEBUG: Check what's in kwargs
         if is_main:
-            print(f"[DEBUG] kwargs keys: {kwargs.keys()}", flush=True)
-            if 'model' in kwargs:
-                print(f"[DEBUG] model in kwargs: {type(kwargs['model'])}", flush=True)
+            msg = f"[TransparentEval] ========== STARTING =========="
+            logger.info(msg)
+            print(msg, flush=True)
 
         # Load samples (all ranks need this for FSDP)
         metadata_path = Path(self.repo_root) / "OCRVL/data/ocrvl_transparent_eval.metadata.json"
@@ -131,17 +174,48 @@ class TransparentEvalCallback(TrainerCallback):
                 if 'ground_truth' not in sample or not sample['ground_truth']:
                     sample['ground_truth'] = full_samples[sample_id].get('ground_truth', '')
 
-        if is_main:
-            logger.info(f"[TransparentEval] Running inference on {len(samples)} samples at step {state.global_step}")
+        # Split samples across GPUs for parallel evaluation
+        num_ranks = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
 
-        # All ranks run inference (required for FSDP)
-        results = self._run_inference(samples, state.global_step, kwargs.get('model'))
+        original_len = len(samples)
+        samples_per_rank = (len(samples) + num_ranks - 1) // num_ranks
+
+        # Build local_samples by round-robin distribution
+        local_samples = []
+        for i in range(samples_per_rank):
+            sample_idx = rank + (i * num_ranks)
+            if sample_idx < len(samples):
+                local_samples.append(samples[sample_idx])
+            else:
+                local_samples.append(None)  # Dummy sample for synced_gpus=True
+
+        if is_main:
+            msg = f"[TransparentEval] Distributed {original_len} samples across {num_ranks} GPUs (~{samples_per_rank} per GPU)"
+            logger.info(msg)
+            print(msg, flush=True)
+
+        # Each rank runs inference on its subset
+        local_results = self._run_inference(local_samples, state.global_step, kwargs.get('model'))
+
+        # Gather results from all ranks to rank 0
+        if dist.is_initialized():
+            # Use gather_object to collect results from all ranks
+            gathered_results = [None] * num_ranks
+            dist.gather_object(local_results, gathered_results if rank == 0 else None, dst=0)
+
+            # Flatten results on rank 0
+            if rank == 0:
+                results = [r for sublist in gathered_results if sublist for r in sublist]
+            else:
+                results = []
+        else:
+            results = local_results
 
         # Only rank 0 saves results
         if is_main:
-            # Use output_dir directly - _save_results will create eval_results/ subdir
-            self._save_results(Path(args.output_dir), results, state.global_step)
-            logger.info(f"[TransparentEval] Completed {len(results)}/{len(samples)} samples")
+            total_time = time.time() - eval_start_time
+            self._save_results(Path(args.output_dir), results, state.global_step, total_time)
 
     def _run_inference(self, samples: List[Dict], global_step: int, model=None) -> List[Dict]:
         """Run inference on evaluation samples using LlamaFactory data collator approach.
@@ -153,58 +227,75 @@ class TransparentEvalCallback(TrainerCallback):
             global_step: Current training step
             model: Optional model to use (from kwargs). If None, uses self.model
         """
-        # FSDP handling: Detect FSDP and set synced_gpus=True for generation
-        # This is how transformers Seq2SeqTrainer handles FSDP evaluation
         rank = dist.get_rank() if dist.is_initialized() else 0
-
-        # Use provided model or fall back to self.model
         inference_model = model if model is not None else self.model
-
-        # Detect if model is FSDP-managed (works even with use_orig_params=True)
         is_fsdp = is_fsdp_managed_module(inference_model)
-
-        if rank == 0:
-            print(f"[DEBUG] FSDP managed: {is_fsdp}, using model from kwargs: {model is not None}", flush=True)
-
-        # DON'T put model in eval mode with FSDP - might interfere with parameter gathering
-        # Standard evaluation in transformers doesn't explicitly call .eval() before generate
-        # inference_model.eval()
-
-        results = []
         is_main = self._is_main_process()
 
-        for sample in samples:
+        # Track timing
+        prep_start = time.time()
+        gen_start = None
+
+        # Set model to eval mode and disable gradient checkpointing
+        was_training = inference_model.training
+        gc_was_enabled = False
+
+        if hasattr(inference_model, 'gradient_checkpointing_disable'):
             try:
-                # Load images
+                is_gc_enabled = getattr(inference_model, 'is_gradient_checkpointing', False)
+                if is_gc_enabled:
+                    inference_model.gradient_checkpointing_disable()
+                    gc_was_enabled = True
+            except Exception:
+                pass
+        else:
+            if hasattr(inference_model, 'base_model'):
+                base_model = inference_model.base_model
+                if hasattr(base_model, 'gradient_checkpointing_disable'):
+                    try:
+                        is_gc_enabled = getattr(base_model, 'is_gradient_checkpointing', False)
+                        if is_gc_enabled:
+                            base_model.gradient_checkpointing_disable()
+                            gc_was_enabled = True
+                    except Exception:
+                        pass
+
+        inference_model.eval()
+        results = []
+
+        # PHASE 1: Prepare all inputs (outside FSDP summon to avoid overhead)
+        prepared_inputs = []
+        first_real_inputs = None
+
+        for i, sample in enumerate(samples):
+            if sample is None:
+                if first_real_inputs is not None:
+                    prepared_inputs.append({
+                        'is_dummy': True,
+                        'sample': {'id': f'dummy_{i}'},
+                        'input_ids': first_real_inputs['input_ids'],
+                        'attention_mask': first_real_inputs['attention_mask'],
+                        'pixel_values': first_real_inputs['pixel_values'],
+                        'image_grid_thw': first_real_inputs['image_grid_thw'],
+                        'input_len': first_real_inputs['input_len'],
+                    })
+                continue
+
+            try:
                 images = []
                 for img_path in sample['images']:
                     full_path = Path(self.repo_root) / img_path
                     if full_path.exists():
                         images.append(Image.open(full_path).convert('RGB'))
-                    else:
-                        if is_main:
-                            logger.warning(f"[TransparentEval] Image not found: {full_path}")
-                        continue
 
-                # Support 1 or 2 images (1 for caption/ocr, 2 for VQA)
                 if len(images) not in (1, 2):
-                    if is_main:
-                        logger.warning(f"[TransparentEval] Expected 1 or 2 images, got {len(images)} for {sample['id']}")
                     continue
 
-                # Use processor.image_processor to get pixel_values and image_grid_thw
-                # This is the LlamaFactory way (see Qwen3VLPlugin._get_mm_inputs)
                 image_processor = getattr(self.processor, "image_processor", None)
                 if image_processor is None:
-                    if is_main:
-                        logger.warning(f"[TransparentEval] No image_processor found in processor")
                     continue
 
-                # Process images to get pixel_values and image_grid_thw
                 mm_inputs = image_processor(images, return_tensors="pt")
-
-                # Build text with vision placeholders
-                # Calculate sequence length per image based on image_grid_thw
                 image_grid_thw = mm_inputs.get("image_grid_thw")
                 merge_length = getattr(image_processor, "merge_size", 2) ** 2
 
@@ -213,130 +304,184 @@ class TransparentEvalCallback(TrainerCallback):
                     if image_grid_thw is not None:
                         image_seqlen = image_grid_thw[i].prod().item() // merge_length
                     else:
-                        image_seqlen = 100  # Default for OCRVL
-                    # Format: <|vision_start|><|image_pad|>*N<|vision_end|>
+                        image_seqlen = 100
                     placeholder = "<|vision_start|>" + "<|image_pad|>" * image_seqlen + "<|vision_end|>"
                     vision_placeholders.append(placeholder)
 
-                # Build conversation with instruction text + vision placeholders
-                # For 1-image tasks (caption/ocr): instruction + <image>
-                # For 2-image tasks (VQA): instruction + <image><image>
-                instruction_text = sample.get('instruction', 'Describe the image:')
-                # Remove <image> placeholders if present and strip
-                instruction_text = instruction_text.replace('<image>', '').strip()
-
+                instruction_text = sample.get('instruction', 'Describe the image:').replace('<image>', '').strip()
                 if len(images) == 1:
-                    # Single image task: instruction + vision placeholder
                     user_content = instruction_text + " " + vision_placeholders[0]
                 else:
-                    # Two images (VQA): instruction + both vision placeholders
                     user_content = instruction_text + " " + vision_placeholders[0] + vision_placeholders[1]
 
                 conversation = [{"role": "user", "content": user_content}]
+                text = self.tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
+                text_inputs = self.tokenizer(text, return_tensors="pt", padding=False, add_special_tokens=False)
 
-                # Apply chat template
-                text = self.tokenizer.apply_chat_template(
-                    conversation,
-                    tokenize=False,
-                    add_generation_prompt=True
-                )
-
-                # Tokenize
-                text_inputs = self.tokenizer(
-                    text,
-                    return_tensors="pt",
-                    padding=False,
-                    add_special_tokens=False
-                )
-
-                # Move to device
                 device = next(inference_model.parameters()).device
                 input_ids = text_inputs['input_ids'].to(device)
                 attention_mask = text_inputs['attention_mask'].to(device)
-                pixel_values = mm_inputs['pixel_values'].to(device)
+                pixel_values = mm_inputs['pixel_values'].to(device=device, dtype=torch.bfloat16)
                 image_grid_thw = mm_inputs['image_grid_thw'].to(device)
 
-                # DEBUG: Log shapes (ALL RANKS - critical for FSDP debugging)
-                print(f"[DEBUG rank={rank}] input_ids shape: {input_ids.shape}, dtype: {input_ids.dtype}", flush=True)
-                print(f"[DEBUG rank={rank}] pixel_values shape: {pixel_values.shape}", flush=True)
-                print(f"[DEBUG rank={rank}] image_grid_thw shape: {image_grid_thw.shape}, values: {image_grid_thw}", flush=True)
+                prepared_inputs.append({
+                    'sample': sample,
+                    'input_ids': input_ids,
+                    'attention_mask': attention_mask,
+                    'pixel_values': pixel_values,
+                    'image_grid_thw': image_grid_thw,
+                    'input_len': input_ids.shape[1],
+                })
 
-                # Generate using standard pixel_values format
-                # CRITICAL: Set synced_gpus=True for FSDP to ensure proper weight gathering
-                # This matches how transformers Seq2SeqTrainer handles FSDP
+                if first_real_inputs is None:
+                    first_real_inputs = {
+                        'input_ids': input_ids,
+                        'attention_mask': attention_mask,
+                        'pixel_values': pixel_values,
+                        'image_grid_thw': image_grid_thw,
+                        'input_len': input_ids.shape[1],
+                    }
 
-                # FSDP FIX: Use summon_full_params to unshard embedding weights during generation
-                # Without this, embedding lookup fails with "'weight' must be 2-D" error
-                # because FSDP shards the embedding weight into FlatParameter
-                with torch.no_grad():
-                    if is_fsdp:
-                        # Temporarily unshard all parameters for generation
-                        # recurse=True: handle nested FSDP modules
-                        # writeback=False: don't update sharded weights (inference only)
-                        with FSDP.summon_full_params(inference_model, writeback=False, recurse=True):
+            except Exception as e:
+                if is_main:
+                    logger.warning(f"[TransparentEval] Failed to prepare sample {sample.get('id', 'unknown')}: {e}")
+                continue
+
+        prep_time = time.time() - prep_start
+        gen_start = time.time()
+
+        if is_main:
+            msg = f"[TransparentEval] Prepared {len(prepared_inputs)} samples ({prep_time:.2f}s), starting generation..."
+            logger.info(msg)
+            print(msg, flush=True)
+
+        # PHASE 2: Generate all outputs
+        with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            if is_fsdp:
+                with FSDP.summon_full_params(inference_model, writeback=False, recurse=True):
+                    for i, inputs in enumerate(prepared_inputs):
+                        is_dummy = inputs.get('is_dummy', False)
+
+                        try:
                             outputs = inference_model.generate(
-                                input_ids=input_ids,
-                                pixel_values=pixel_values,
-                                image_grid_thw=image_grid_thw,
-                                attention_mask=attention_mask,
+                                input_ids=inputs['input_ids'],
+                                pixel_values=inputs['pixel_values'],
+                                image_grid_thw=inputs['image_grid_thw'],
+                                attention_mask=inputs['attention_mask'],
                                 max_new_tokens=self.max_new_tokens,
                                 do_sample=self.temperature > 0,
                                 temperature=self.temperature if self.temperature > 0 else None,
                                 pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
                                 eos_token_id=self.tokenizer.eos_token_id,
-                                synced_gpus=is_fsdp,  # KEY: Enable synced generation for FSDP
+                                synced_gpus=True,
                             )
-                    else:
+
+                            if is_dummy:
+                                continue
+
+                            generated_ids = outputs[0][inputs['input_len']:]
+                            generated_ids_list = generated_ids.tolist()
+                            full_output = self._decode_full_output(generated_ids_list)
+                            display_output = self._extract_display_output(generated_ids_list, full_output)
+
+                            sample = inputs['sample']
+                            results.append({
+                                'id': sample['id'],
+                                'task': sample['task'],
+                                'images': sample['images'],
+                                'instruction': sample.get('instruction', ''),
+                                'ground_truth': sample.get('ground_truth', ''),
+                                'ground_truth_path': sample.get('ground_truth_path', ''),
+                                'generated_answer': full_output if full_output else "[EMPTY]",
+                                'generated_answer_display': display_output if display_output else "[EMPTY]",
+                                'step': global_step,
+                            })
+                            if sample.get('question_text'):
+                                results[-1]['question_text'] = sample['question_text']
+
+                            if is_main:
+                                logger.info(f"[TransparentEval] Generated {len(results)}/{len(prepared_inputs)} samples")
+
+                        except Exception as e:
+                            if is_main:
+                                logger.warning(f"[TransparentEval] Failed to generate for sample {inputs['sample'].get('id', 'unknown')}: {e}")
+                            continue
+            else:
+                for i, inputs in enumerate(prepared_inputs):
+                    is_dummy = inputs.get('is_dummy', False)
+                    try:
                         outputs = inference_model.generate(
-                            input_ids=input_ids,
-                            pixel_values=pixel_values,
-                            image_grid_thw=image_grid_thw,
-                            attention_mask=attention_mask,
+                            input_ids=inputs['input_ids'],
+                            pixel_values=inputs['pixel_values'],
+                            image_grid_thw=inputs['image_grid_thw'],
+                            attention_mask=inputs['attention_mask'],
                             max_new_tokens=self.max_new_tokens,
                             do_sample=self.temperature > 0,
                             temperature=self.temperature if self.temperature > 0 else None,
                             pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
                             eos_token_id=self.tokenizer.eos_token_id,
-                            synced_gpus=is_fsdp,  # KEY: Enable synced generation for FSDP
+                            synced_gpus=False,
                         )
 
-                # Decode (remove prompt)
-                input_len = input_ids.shape[1]
-                generated_ids = outputs[0][input_len:]
-                answer = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                        if is_dummy:
+                            continue
 
-                # Get ground truth (already embedded in metadata)
-                ground_truth = sample.get('ground_truth', '')
-                ground_truth_path = sample.get('ground_truth_path', '')  # For reference only
+                        generated_ids = outputs[0][inputs['input_len']:]
+                        generated_ids_list = generated_ids.tolist()
+                        full_output = self._decode_full_output(generated_ids_list)
+                        display_output = self._extract_display_output(generated_ids_list, full_output)
 
-                # Store result
-                result = {
-                    'id': sample['id'],
-                    'task': sample['task'],
-                    'images': sample['images'],
-                    'instruction': sample.get('instruction', ''),
-                    'ground_truth': ground_truth,
-                    'ground_truth_path': ground_truth_path,
-                    'generated_answer': answer if answer else "[EMPTY]",
-                    'step': global_step,
-                }
-                # Add question_text for VQA tasks
-                if sample.get('question_text'):
-                    result['question_text'] = sample['question_text']
-                results.append(result)
+                        sample = inputs['sample']
+                        results.append({
+                            'id': sample['id'],
+                            'task': sample['task'],
+                            'images': sample['images'],
+                            'instruction': sample.get('instruction', ''),
+                            'ground_truth': sample.get('ground_truth', ''),
+                            'ground_truth_path': sample.get('ground_truth_path', ''),
+                            'generated_answer': full_output if full_output else "[EMPTY]",
+                            'generated_answer_display': display_output if display_output else "[EMPTY]",
+                            'step': global_step,
+                        })
+                        if sample.get('question_text'):
+                            results[-1]['question_text'] = sample['question_text']
 
-            except Exception as e:
-                if is_main:
-                    logger.warning(f"[TransparentEval] Failed on sample {sample.get('id', 'unknown')}: {e}")
-                    logger.exception(f"Sample {sample.get('id', 'unknown')} failed")
-                continue
+                        if is_main:
+                            logger.info(f"[TransparentEval] Generated {len(results)}/{len(prepared_inputs)} samples")
 
-        # Restore training mode
-        inference_model.train()
+                    except Exception as e:
+                        if is_main:
+                            logger.warning(f"[TransparentEval] Failed to generate for sample {inputs['sample'].get('id', 'unknown')}: {e}")
+                        continue
+
+        # Restore training mode and gradient checkpointing
+        if was_training:
+            inference_model.train()
+
+        if gc_was_enabled:
+            if hasattr(inference_model, 'gradient_checkpointing_enable'):
+                try:
+                    inference_model.gradient_checkpointing_enable()
+                except Exception:
+                    pass
+            else:
+                if hasattr(inference_model, 'base_model'):
+                    base_model = inference_model.base_model
+                    if hasattr(base_model, 'gradient_checkpointing_enable'):
+                        try:
+                            base_model.gradient_checkpointing_enable()
+                        except Exception:
+                            pass
+
+        gen_time = time.time() - gen_start if gen_start else 0
+        if is_main:
+            msg = f"[TransparentEval] Generated {len(results)} samples (prep={prep_time:.2f}s, gen={gen_time:.2f}s)"
+            logger.info(msg)
+            print(msg, flush=True)
 
         return results
 
-    def _save_results(self, checkpoint_dir: Path, results: List[Dict], global_step: int):
+    def _save_results(self, checkpoint_dir: Path, results: List[Dict], global_step: int, total_time: float = 0):
         """Save evaluation results in both JSON and human-readable formats.
 
         Also creates an images/ subdirectory with symlinks to all evaluation images
@@ -377,6 +522,7 @@ class TransparentEvalCallback(TrainerCallback):
                 'step': global_step,
                 'timestamp': timestamp,
                 'num_samples': len(results),
+                'total_time_seconds': round(total_time, 2),
                 'results': results,
             }, f, indent=2, ensure_ascii=False)
 
@@ -387,6 +533,8 @@ class TransparentEvalCallback(TrainerCallback):
             f.write(f"Transparent Evaluation - Step {global_step}\n")
             f.write(f"Timestamp: {timestamp}\n")
             f.write(f"Samples: {len(results)}\n")
+            if total_time > 0:
+                f.write(f"Total Time: {total_time:.2f}s ({total_time/len(results):.2f}s per sample)\n")
             f.write("=" * 80 + "\n\n")
 
             for i, result in enumerate(results, 1):
@@ -418,9 +566,60 @@ class TransparentEvalCallback(TrainerCallback):
         logger.info(f"  - {json_path}")
         logger.info(f"  - {txt_path}")
         logger.info(f"  - {images_dir}/ (symlinks to evaluation images)")
+        if total_time > 0:
+            msg = f"[TransparentEval] Total time: {total_time:.2f}s ({total_time/len(results):.2f}s per sample)"
+            logger.info(msg)
+            print(msg, flush=True)
+        msg = f"[TransparentEval] ========== COMPLETED =========="
+        logger.info(msg)
+        print(msg, flush=True)
 
         # Generate composite images for visual inspection
         self._generate_composite_images(json_path, eval_dir)
+
+    def _decode_full_output(self, generated_ids: List[int]) -> str:
+        """Decode full model output, preserving <think> tags for .txt logging."""
+        if not generated_ids:
+            return ""
+        text = self.tokenizer.decode(generated_ids, skip_special_tokens=False).strip()
+        eos_token = getattr(self.tokenizer, "eos_token", None)
+        if eos_token and eos_token in text:
+            text = text.split(eos_token)[0].strip()
+        return text
+
+    def _extract_display_output(self, generated_ids: List[int], full_output: str) -> str:
+        """Extract answer content after </think> for composite display."""
+        end_id = self._get_think_end_id()
+        if end_id is None:
+            if "</think>" in full_output:
+                return full_output.rsplit("</think>", 1)[-1].strip()
+            return full_output
+        try:
+            last_idx = len(generated_ids) - 1 - generated_ids[::-1].index(end_id)
+        except ValueError:
+            if "</think>" in full_output:
+                return full_output.rsplit("</think>", 1)[-1].strip()
+            return full_output
+        answer_ids = generated_ids[last_idx + 1:]
+        if not answer_ids:
+            return ""
+        return self.tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
+
+    def _get_think_end_id(self) -> Optional[int]:
+        """Return </think> token id if available via env or tokenizer."""
+        env_val = os.environ.get("QWEN3VL_THINKING_END_ID", "").strip()
+        if env_val.isdigit():
+            return int(env_val)
+        if self.tokenizer is None:
+            return None
+        try:
+            token_id = self.tokenizer.convert_tokens_to_ids("</think>")
+        except Exception:
+            return None
+        unk_id = getattr(self.tokenizer, "unk_token_id", None)
+        if token_id is None or (unk_id is not None and token_id == unk_id):
+            return None
+        return token_id
 
     def _generate_composite_images(self, results_json: Path, output_dir: Path):
         """Generate composite images for all evaluation samples.

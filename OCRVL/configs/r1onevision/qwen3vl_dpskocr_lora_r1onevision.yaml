@@ -4,8 +4,8 @@
 # - dpsk_ocr_encoder/: DeepSeek-OCR vision encoder (model-00001-of-000001.safetensors)
 #
 # The Thinking model includes special tokens for reasoning:
-# - <|think_start|> (151667): Opens thinking/reasoning section
-# - <|think_end|> (151668): Closes thinking/reasoning section
+# - <think> (151667): Opens thinking/reasoning section
+# - </think> (151668): Closes thinking/reasoning section
 model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/OCRVL/checkpoints/OCR-Qwen3-VL-2B-Thinking
 image_max_pixels: 262144
 video_max_pixels: 16384
@@ -48,7 +48,7 @@ freeze_vision_tower: true
 # For OCRVL's latent reasoning SFT with Qwen3VL-2B-Thinking format:
 # 1. Thinking sections are rendered as images using VelloRenderer
 # 2. Rendered thinking images are encoded via DeepSeek-OCR encoder
-# 3. The latent tokens are wrapped with <|think_start|> and <|think_end|> markers
+# 3. The latent tokens are wrapped with <think> and </think> markers
 # 4. Loss is computed only on the final answer, not the thinking tokens
 #
 # This teaches the model to:
@@ -68,16 +68,16 @@ freeze_vision_tower: true
 #   {
 #     "messages": [
 #       {"role": "user", "content": "<image>\n{question}"},
-#       {"role": "assistant", "content": "<|think_start|>\n<image>\n<|think_end|>\n{final_answer}"}
+#       {"role": "assistant", "content": "<think>\n<image>\n</think>\n{final_answer}"}
 #     ],
 #     "images": ["path/to/main_image.png", "path/to/thinking_image.png"]
 #   }
 #
 # Step 2: During training:
 # - First <image>: Main question image (user message)
-# - Second <image>: Rendered thinking image, wrapped with <|think_start|> and <|think_end|> tokens
-# - Final answer: Text following the <|think_end|> token (official Qwen3VL-Thinking format)
-# - Token IDs: <|think_start|> = 151667, <|think_end|> = 151668
+# - Second <image>: Rendered thinking image, wrapped with <think> and </think> tokens
+# - Final answer: Text following the </think> token (official Qwen3VL-Thinking format)
+# - Token IDs: <think> = 151667, </think> = 151668
 #
 # Alternative: Skip thinking rendering (final answer only, faster)
 #   python OCRVL/scripts/convert_r1_onevision_to_jsonl.py --all --no-thinking-images

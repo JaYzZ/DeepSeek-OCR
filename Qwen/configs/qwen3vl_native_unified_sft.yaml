@@ -1,0 +1,90 @@
+### model
+# Native Qwen3-VL-2B-Thinking for unified SFT training
+# Uses Qwen3VL's native vision tower (no DPSK OCR encoder)
+# Special thinking tokens (present in base model):
+# - <｜text▁begin▁of▁thinking｜> (151667): Opens thinking/reasoning section
+# - <｜text▁end▁of▁thinking｜> (151668): Closes thinking/reasoning section
+model_name_or_path: /share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking
+image_max_pixels: 262144
+video_max_pixels: 16384
+trust_remote_code: true
+disable_gradient_checkpointing: true  # Required for FSDP compatibility
+
+### method
+stage: sft
+do_train: true
+do_eval: true  # Enable evaluation for transparent eval callback
+finetuning_type: lora
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target: q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj
+
+# Freeze vision tower (Qwen3VL native vision)
+freeze_vision_tower: true
+
+### dataset
+# Unified SFT dataset: Same tasks as DPSK version but with native Qwen3VL
+# - Alignment: Image captioning + OCR (LLaVA-Pretrain 558K × 2 + DocLayNet 69K)
+# - VQA (rendered): Conversation-based with rendered questions (LLaVA-Instruct-665K)
+# - VQA (text): Standard VQA with text questions (LLaVA-Instruct-665K)
+# - Combined: ~2.5M samples
+#
+# Key change: Rendered text images use ADAPTIVE sizing based on text length
+# (not fixed 640x640 like DPSK OCR encoder requires)
+dataset: qwen3vl_native_unified_sft
+dataset_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/data
+template: qwen3vl
+cutoff_len: 2048
+max_samples: null
+streaming: false
+packing: true
+preprocessing_num_workers: 4
+dataloader_num_workers: 4
+
+### eval
+eval_dataset: ocrvl_transparent_eval
+eval_dataset_dir: /share/project/xiyan/sources/DeepSeek-OCR/OCRVL/data
+val_size: 0
+per_device_eval_batch_size: 1
+eval_strategy: steps
+eval_steps: 500
+predict_with_generate: true
+
+### output
+output_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/qwen3vl-2b/lora/native_unified_sft
+logging_steps: 10
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: false
+save_only_model: false
+report_to: none
+
+### train
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 8
+dataloader_drop_last: true
+learning_rate: 2.0e-4
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+pure_bf16: true
+
+# FSDP configuration
+fsdp:
+  - full_shard
+  - auto_wrap
+fsdp_config:
+  fsdp_auto_wrap_policy: SIZE_BASED_WRAP
+  fsdp_min_num_params: 100000
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_forward_prefetch: false
+  fsdp_use_orig_params: true
+  fsdp_cpu_ram_efficient_loading: false
+  fsdp_sync_module_states: true
+
+ddp_find_unused_parameters: false
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+adapter_name_or_path: null

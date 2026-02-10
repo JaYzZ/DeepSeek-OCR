@@ -23,22 +23,32 @@ except ImportError:  # pragma: no cover
 
 @dataclass
 class Qwen3VLEncoderOutput:
-    """Output from Qwen3-VL vision encoder."""
-    features: torch.Tensor
-    deepstack_features: List[torch.Tensor]
+    """Output from Qwen3-VL vision encoder.
+
+    Attributes:
+        features: List of per-image feature tensors, each [actual_tokens, hidden_dim]
+            No padding - each image has its actual token count based on resolution.
+        deepstack_features: List of lists, where each inner list contains per-image
+            deepstack features for that layer.
+        grid_thw: Tensor of shape [batch_size, 3] with (temporal, height, width) grid
+            dimensions for each image.
+    """
+    features: List[torch.Tensor]  # Changed from Tensor to List[Tensor]
+    deepstack_features: List[List[torch.Tensor]]  # Changed from List[Tensor]
     grid_thw: torch.Tensor
 
     def as_vllm_mm_dict(self) -> dict[str, torch.Tensor]:
         """Return a vLLM-compatible multimodal dict for decoder-only inference.
 
+        Concatenates all per-image features into a single flattened tensor for vLLM.
+
         vLLM Qwen3-VL expects image_embeds concatenated as:
-        [main_features | deepstack_0 | deepstack_1 | deepstack_2]
-        with shape [seq_len, 2048 * 4] = [seq_len, 8192]
+        [img0_features | img1_features | ...]
+        with shape [total_tokens, 2048]
         """
-        if self.deepstack_features:
-            image_embeds = torch.cat([self.features] + self.deepstack_features, dim=-1)
-        else:
-            image_embeds = self.features
+        # Concatenate all per-image features along sequence dimension
+        image_embeds = torch.cat(self.features, dim=0)  # [total_tokens, hidden_dim]
+
         return {
             "image_embeds": image_embeds,
             "image_grid_thw": self.grid_thw,
@@ -109,24 +119,58 @@ class Qwen3VLEncoder:
                 )
                 return
             except Exception as e:
-                import traceback
-                print(f"vLLM vision load failed, falling back to HF visual: {e}")
-                traceback.print_exc()
+                # Check if this is expected (DDP conflict) vs unexpected error
+                if "PyTorch DDP" in str(e) or "world_group is not initialized" in str(e):
+                    print(f"vLLM vision kernels incompatible with multi-GPU DDP, falling back to HF vision model")
+                else:
+                    import traceback
+                    print(f"vLLM vision load failed, falling back to HF visual: {e}")
+                    traceback.print_exc()
 
-        hf_kwargs = {
-            "trust_remote_code": True,
-            "dtype": self.dtype,
-            "device_map": str(self.device),  # Load directly to target device
+        # Load only vision model weights (skip language model)
+        from transformers import AutoConfig, Qwen3VLVisionModel
+
+        cfg = AutoConfig.from_pretrained(
+            self.model_name_or_path, trust_remote_code=True
+        )
+
+        # Initialize vision model from config
+        vision_config = cfg.vision_config
+        self._vision_model = Qwen3VLVisionModel(vision_config)
+
+        # Load only visual.* weights from checkpoint
+        print(f"Loading vision weights from {self.model_name_or_path}...")
+        from transformers import AutoModel
+
+        # Load state dict on CPU first to filter
+        full_model = AutoModel.from_pretrained(
+            self.model_name_or_path,
+            trust_remote_code=True,
+            dtype=torch.float32,  # Load as float32 to CPU
+            device_map="cpu",
+        )
+
+        # Extract only visual weights
+        vision_state_dict = {
+            k.replace("visual.", ""): v
+            for k, v in full_model.state_dict().items()
+            if k.startswith("visual.")
         }
-        if self.device.type == "cuda" and torch.cuda.is_available():
-            hf_kwargs["attn_implementation"] = "flash_attention_2"
-        full_model = AutoModel.from_pretrained(self.model_name_or_path, **hf_kwargs)
-        self._vision_model = full_model.visual
+
+        # Clean up full model
         del full_model
+        import gc
+        gc.collect()
+
+        # Load vision weights
+        self._vision_model.load_state_dict(vision_state_dict, strict=True)
+        self._vision_model = self._vision_model.to(dtype=self.dtype, device=self.device)
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
         self._vision_model.eval()
-        print(f"Vision encoder loaded successfully to {self.device} (HF fallback)")
+        print(f"Vision encoder loaded successfully to {self.device} (vision-only)")
         print(
             f"Vision encoder parameters: "
             f"{sum(p.numel() for p in self._vision_model.parameters()):,}"
@@ -196,28 +240,12 @@ class Qwen3VLEncoder:
 
             start_idx = end_idx
 
-        # Stack back into batched tensors for convenience
-        # features: [batch, max_tokens, hidden_dim] with padding if needed
-        max_tokens = max(tokens_per_image)
-        batched_features = torch.zeros(
-            (batch_size, max_tokens, features_list[0].shape[-1]),
-            dtype=features_list[0].dtype,
-            device=features_list[0].device
-        )
-        batched_deepstack = [
-            torch.zeros_like(batched_features)
-            for _ in range(len(deepstack_features))
-        ]
-
-        for img_idx in range(batch_size):
-            num_tokens = tokens_per_image[img_idx]
-            batched_features[img_idx, :num_tokens] = features_list[img_idx]
-            for ds_idx in range(len(deepstack_features)):
-                batched_deepstack[ds_idx][img_idx, :num_tokens] = deepstack_list[img_idx][ds_idx]
-
+        # Return unpadded per-image features as a list
+        # This preserves true any-resolution efficiency without padding overhead
+        # features_list: List of [actual_tokens, hidden_dim] tensors
         return Qwen3VLEncoderOutput(
-            features=batched_features,
-            deepstack_features=batched_deepstack,
+            features=features_list,  # List[Tensor], not batched!
+            deepstack_features=deepstack_list,  # List of lists
             grid_thw=grid_thw
         )
 

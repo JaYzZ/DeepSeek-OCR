@@ -5,7 +5,7 @@ This module provides utilities for injecting pre-encoded OCR features at specifi
 latent token positions during the forward pass. This enables minimal-change thinking
 training where:
 
-1. Data format uses special latent tokens: <|latent_start|><|latent|>*k<|latent_end|>
+1. Data format uses special latent tokens: <think><|latent_step|>*k</think>
 2. Pre-encoded OCR features are provided via latent_supervision parameter
 3. During forward pass, latent token embeddings are replaced with OCR features
 4. Existing thinking_projection MLP provides reconstruction supervision
@@ -55,23 +55,23 @@ def find_latent_positions(
 ) -> torch.BoolTensor:
     """Find positions of latent step tokens between thinking start/end markers.
 
-    Format: <|thinking_start|><|latent_step|>[<|thinking_sep|><|latent_step|>]*<|thinking_end|>
+    Format: <think><|latent_step|>[<|thinking_sep|><|latent_step|>]*</think>
 
     This is simpler than the old format - we just need to find all <|latent_step|> tokens
-    that appear between <|thinking_start|> and <|thinking_end|>.
+    that appear between <think> and </think>.
 
     Args:
         input_ids: [batch_size, seq_len] Input token IDs
         latent_token_id: Token ID for <|latent_step|>
-        start_token_id: Token ID for <|thinking_start|>
-        end_token_id: Token ID for <|thinking_end|>
+        start_token_id: Token ID for <think>
+        end_token_id: Token ID for </think>
 
     Returns:
         [batch_size, seq_len] Boolean mask where True indicates a latent step position
 
     Example with 3 steps:
-        Input:  [Q, <|thinking_start|>, <|latent_step|>, <|thinking_sep|>, <|latent_step|>, <|thinking_sep|>, <|latent_step|>, <|thinking_end|>, A]
-        Output: [F,     F,                 T,                F,               T,                F,               T,                F,               F]
+        Input:  [Q, <think>, <|latent_step|>, <|thinking_sep|>, <|latent_step|>, <|thinking_sep|>, <|latent_step|>, </think>, A]
+        Output: [F,       F,               T,                F,               T,                F,               T,        F, F]
     """
     batch_size, seq_len = input_ids.shape
     latent_mask = torch.zeros_like(input_ids, dtype=torch.bool)

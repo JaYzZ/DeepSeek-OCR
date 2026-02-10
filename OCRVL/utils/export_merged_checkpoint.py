@@ -62,7 +62,7 @@ def export_merged_model(
 
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         base_model_path,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map="cpu",  # Load on CPU to avoid GPU conflicts
         trust_remote_code=True,
     )

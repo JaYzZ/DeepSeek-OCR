@@ -1,0 +1,125 @@
+### model
+# Native Qwen3-VL-2B-Thinking with latent supervision for thinking training
+#
+# Special tokens for thinking/reasoning:
+# - <think> (151667): Opens thinking section
+# - </think> (151668): Closes thinking section
+# - <|latent_step|> (auto-added): Marker where latent supervision is applied
+# - <|thinking_sep|> (auto-added): Separator between thinking steps
+#
+# Architecture:
+# 1. Input: Question TEXT + Question IMAGE (both present in forward pass)
+#    Example: "What's in this image?" + <vision_start><image_pad>*N<vision_end>
+#
+# 2. Output: <think><|latent_step|></think> Answer text
+#
+# 3. Training:
+#    - Pre-encoding (offline): Question image + rendered thinking text → cross-attention
+#      → [100, 2048] latent reference saved as .latent.pt
+#    - Forward pass: Question text + question image → LLM hidden states at <|latent_step|>
+#    - Loss: CE loss + Thinking loss (OT/MSE/REPA on LLM hidden states vs latent reference)
+#    - NO reverse projection - direct supervision on LLM hidden states
+#
+# Key differences from DPSK/OCRVL:
+# - Uses Qwen3VL's native vision model (not DPSK OCR encoder)
+# - Question TEXT in input (not just encoded image)
+# - Direct LLM hidden state supervision (no LatentVisualHead reverse projection)
+# - Latent supervision via OT/MSE/REPA loss on [B, seq, 2048] hidden states
+model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking
+image_max_pixels: 262144
+video_max_pixels: 16384
+trust_remote_code: true
+flash_attn: fa2
+
+### method
+stage: sft
+do_train: true
+do_eval: false  # Use transparent evaluation callback instead
+finetuning_type: lora
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target: q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj
+
+# No OCR connectors needed (using Qwen3VL native vision)
+freeze_vision_tower: true
+
+### dataset
+# R1-OneVision Thinking Training with Qwen3VL Native Cross-Attention
+#
+# Dataset format (LlamaFactory ShareGPT):
+#   {
+#     "messages": [
+#       {"role": "user", "content": "<image>\nQuestion"},
+#       {"role": "assistant", "content": "Thinking...\nAnswer"}
+#     ],
+#     "images": ["question.png"],
+#     "latent_supervision": ["question.png__thinking_0.latent.pt"],
+#     "num_latent_steps": 3
+#   }
+#
+# During training:
+# 1. Question image: Processed by Qwen3VL native vision tower
+# 2. Latent supervision: Pre-extracted [100, hidden_dim] features from cross-attention
+# 3. Injection: Latents injected at `<|latent_step|>` token positions
+# 4. Loss: Cross-entropy on answer + MSE on latent reconstruction
+dataset: qwen3vl_r1_onevision_thinking
+dataset_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/data
+template: qwen3vl_latent
+cutoff_len: 8192
+max_samples: null
+streaming: false
+packing: false
+preprocessing_num_workers: 4
+dataloader_num_workers: 4
+dataloader_prefetch_factor: 2
+
+### eval
+eval_dataset: ocrvl_transparent_eval
+val_size: 0
+per_device_eval_batch_size: 1
+eval_strategy: steps
+eval_steps: 500
+predict_with_generate: false  # Use TransparentEvalCallback instead
+
+### output
+output_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/qwen3vl-2b/lora/r1_onevision_thinking
+logging_steps: 10
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: false
+save_only_model: false
+report_to: none
+log_level: info
+
+### train
+per_device_train_batch_size: 32
+gradient_accumulation_steps: 2
+dataloader_drop_last: true
+learning_rate: 2.0e-4
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+pure_bf16: true
+dataloader_pin_memory: true
+dataloader_persistent_workers: true
+
+# FSDP configuration
+fsdp:
+  - full_shard
+  - auto_wrap
+fsdp_config:
+  fsdp_auto_wrap_policy: SIZE_BASED_WRAP
+  fsdp_min_num_params: 100000
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_forward_prefetch: false
+  fsdp_use_orig_params: true  # CRITICAL: Required for summon_full_params to work with LoRA modules
+  fsdp_cpu_ram_efficient_loading: false
+  fsdp_sync_module_states: true
+  fsdp_state_dict_type: full_state_dict
+
+ddp_find_unused_parameters: false
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+adapter_name_or_path: null

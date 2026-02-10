@@ -133,6 +133,38 @@ def register_ocrvl_qwen3_vl_template() -> None:
     except ValueError:
         pass
 
+    # Register qwen3vl_latent alias for latent thinking training
+    try:
+        register_template(
+            name="qwen3vl_latent",
+            format_user=StringFormatter(slots=["<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"]),
+            format_assistant=StringFormatter(slots=["{{content}}<|im_end|>\n"]),
+            format_system=StringFormatter(slots=["<|im_start|>system\n{{content}}<|im_end|>\n"]),
+            format_function=FunctionFormatter(slots=["{{content}}<|im_end|>\n"], tool_format="qwen"),
+            format_observation=StringFormatter(
+                slots=["<|im_start|>user\n\n{{content}}\n<|im_end|>\n<|im_start|>assistant\n"]
+            ),
+            format_tools=ToolFormatter(tool_format="qwen"),
+            stop_words=["<|im_end|>"],
+            replace_eos=True,
+            mm_plugin=mm_plugin,
+            template_class=ReasoningTemplate,
+        )
+        import logging
+        logging.getLogger(__name__).info("[OCRVL] ✓ Registered template: qwen3vl_latent")
+    except ValueError as e:
+        # Only log "already registered" or "already exists" as debug, not error
+        error_str = str(e).lower()
+        if "already registered" in error_str or "already exists" in error_str:
+            import logging
+            logging.getLogger(__name__).debug(f"[OCRVL] Template qwen3vl_latent already registered (this is OK)")
+        else:
+            import logging
+            import traceback
+            logging.getLogger(__name__).error(f"[OCRVL] Failed to register qwen3vl_latent template: {e}")
+            logging.getLogger(__name__).error(traceback.format_exc())
+            raise
+
     try:
         register_template(
             name="ocrvl_qwen3_vl_nothink",

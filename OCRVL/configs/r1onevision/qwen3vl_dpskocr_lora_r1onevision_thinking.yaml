@@ -2,12 +2,12 @@
 # OCR-Qwen3-VL-2B with thinking tokens for OCR thinking training
 #
 # Special tokens for thinking/reasoning:
-# - <|thinking_start|> (151667): Opens thinking section
-# - <|thinking_end|> (151668): Closes thinking section
+# - <think> (151667): Opens thinking section
+# - </think> (151668): Closes thinking section
 # - <|latent_step|> (auto-added): Placeholder for each thinking chunk
 # - <|thinking_sep|> (auto-added): Separator between thinking steps
 #
-# Format: Question <|thinking_start|><|latent_step|><|thinking_sep|>...<|thinking_end|> Answer
+# Format: Question <think><|latent_step|><|thinking_sep|>...</think> Answer
 # Each <|latent_step|> token will be replaced with pre-encoded OCR features during training
 model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/OCRVL/checkpoints/OCR-Qwen3-VL-2B-Thinking
 image_max_pixels: 262144

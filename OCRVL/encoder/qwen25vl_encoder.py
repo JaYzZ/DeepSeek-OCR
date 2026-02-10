@@ -90,7 +90,7 @@ class Qwen25VLEncoder:
 
         hf_kwargs = {
             "trust_remote_code": True,
-            "torch_dtype": self.dtype,
+            "dtype": self.dtype,
             "device_map": "cpu",
         }
         if self.device.type == "cuda" and torch.cuda.is_available():

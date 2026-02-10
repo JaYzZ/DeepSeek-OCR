@@ -49,10 +49,37 @@ def build_qwen3_vit(
     from vllm.attention.backends.registry import AttentionBackendEnum
     from vllm.model_executor.models.qwen3_vl import Qwen3_VisionTransformer
     from vllm.distributed import initialize_model_parallel, init_distributed_environment
-    import traceback
 
-    # Initialize vLLM distributed environment (required even for single GPU)
-    if not torch.distributed.is_initialized():
+    # Check if PyTorch DDP is already running (e.g., from torchrun)
+    # If so, we need to initialize vLLM's parallel state using the existing setup
+    if torch.distributed.is_initialized():
+        # PyTorch DDP is already initialized - adapt vLLM to use it
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        local_rank = int(os.environ.get('LOCAL_RANK', rank))
+
+        # First, check if vLLM model parallel is already initialized
+        try:
+            from vllm.distributed.parallel_state import get_tensor_model_parallel_group
+            # If this succeeds, vLLM is already initialized, skip
+            get_tensor_model_parallel_group()
+        except (AssertionError, AttributeError):
+            # vLLM not initialized yet - need to initialize it
+            # Initialize vLLM's distributed environment using existing PyTorch setup
+            init_distributed_environment(
+                world_size=world_size,
+                rank=rank,
+                distributed_init_method="env://",  # Use env vars from torchrun
+                local_rank=local_rank,
+                backend="nccl" if torch.cuda.is_available() else "gloo",
+            )
+            # Now initialize vLLM model parallel
+            initialize_model_parallel(
+                tensor_model_parallel_size=1,  # No tensor parallel for vision encoder
+                pipeline_model_parallel_size=1,  # No pipeline parallel
+            )
+    else:
+        # No distributed setup yet, initialize vLLM's distributed from scratch
         init_distributed_environment(
             world_size=1,
             rank=0,
@@ -61,13 +88,8 @@ def build_qwen3_vit(
             backend="nccl" if torch.cuda.is_available() else "gloo",
         )
 
-    # Initialize vLLM model parallel groups
-    try:
+        # Initialize vLLM model parallel groups
         initialize_model_parallel()
-    except Exception as e:
-        print(f"Failed to initialize vLLM distributed: {e}")
-        traceback.print_exc()
-        raise
 
     hf_config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
     vision_config = hf_config.vision_config
@@ -100,16 +122,13 @@ def build_qwen3_vit(
         model_name_or_path,
         trust_remote_code=True,
         device_map="cpu",
-        torch_dtype=dtype,
+        dtype=dtype,
     )
     vit.load_weights(_iter_visual_weights(hf_model))
     del hf_model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    if compile and hasattr(torch, "compile"):
-        # Wrap whole model; vLLM uses custom ops for ViT attention.
-        vit = torch.compile(vit, mode="max-autotune")
     return vit
 
 
@@ -167,7 +186,7 @@ def build_qwen25_vit(
         model_name_or_path,
         trust_remote_code=True,
         device_map="cpu",
-        torch_dtype=dtype,
+        dtype=dtype,
     )
     vit.load_weights(_iter_visual_weights(hf_model))
     del hf_model

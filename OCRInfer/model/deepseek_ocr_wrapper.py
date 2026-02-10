@@ -31,7 +31,7 @@ class DeepSeekOCRWrapper(nn.Module):
             num_hidden_layers=12,
             num_attention_heads=10,
             num_key_value_heads=10,
-            torch_dtype=dtype,
+            dtype=dtype,
         )
 
         # Create the model with correct architecture

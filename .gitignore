@@ -54,4 +54,5 @@ swanlog/*
 **/data/**/**.png
 **/data/**/**.jpg
 **/data/*images/*
+**/data/cache/*
 Qwen/results/*

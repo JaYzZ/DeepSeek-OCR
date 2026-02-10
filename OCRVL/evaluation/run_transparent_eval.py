@@ -127,7 +127,7 @@ def main():
             model = AutoModelForVision2Seq.from_pretrained(
                 base_model,
                 trust_remote_code=True,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 device_map="auto",
             )
             # Load LoRA adapters
@@ -142,7 +142,7 @@ def main():
             model = AutoModelForVision2Seq.from_pretrained(
                 checkpoint_path,
                 trust_remote_code=True,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 device_map="auto",
             )
 

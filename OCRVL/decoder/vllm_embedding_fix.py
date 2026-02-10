@@ -78,7 +78,7 @@ def apply_vllm_embedding_fix():
         qwen3_vl.Qwen3VLForConditionalGeneration._process_image_input = patched_process_image
 
         _PATCH_APPLIED = True
-        logger.info("✓ Applied vLLM embedding fix (runtime patch)")
+        logger.debug("✓ Applied vLLM embedding fix (runtime patch)")
 
     except Exception as e:
         logger.warning(f"Failed to apply vLLM embedding fix: {e}")

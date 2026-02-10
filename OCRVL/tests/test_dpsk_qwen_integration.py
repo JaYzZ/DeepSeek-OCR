@@ -77,7 +77,7 @@ def test_dpsk_qwen_integration():
     print("\n4. Loading OCR-Qwen3-VL model...")
     model = OCRQwen3VLForConditionalGeneration.from_pretrained(
         qwen_model_path,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map=device,
         trust_remote_code=True
     )

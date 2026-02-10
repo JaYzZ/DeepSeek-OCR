@@ -77,7 +77,7 @@ def export_ocrvl_to_hf(
 
     model = OCRQwen3VLForConditionalGeneration.from_pretrained(
         str(base_model_path),
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         trust_remote_code=True
     )
 

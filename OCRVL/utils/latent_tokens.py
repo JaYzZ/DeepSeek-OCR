@@ -6,20 +6,20 @@ and managing their IDs. These tokens are used to mark positions where pre-encode
 features (from rendered thinking/CoT text) should be injected during forward pass.
 
 Format (inspired by DPSK OCR's visual token layout):
-    Question <|thinking_start|><|latent_step|><|sep|><|latent_step|><|sep|>...<|thinking_end|> Answer
+    Question <think><|latent_step|><|sep|><|latent_step|><|sep|>...</think> Answer
 
 This mirrors DPSK OCR's format:
     - 100 visual tokens (10×10 grid) + 10 newlines (row separators) + 1 view separator
     - k latent steps + (k-1) step separators + thinking boundary tokens
 
 Special Tokens:
-    <|thinking_start|>: Marks the beginning of the thinking section
+    <think>: Marks the beginning of the thinking section
     <|latent_step|>: Placeholder for a single thinking step (repeated k times, ADAPTIVE)
     <|thinking_sep|>: Separator between thinking steps (like newlines in OCR)
-    <|thinking_end|>: Marks the end of the thinking section
+    </think>: Marks the end of the thinking section
 
 Training Data Format:
-    Question + <|thinking_start|> + k×<|latent_step|> + (k-1)×<|thinking_sep|> + <|thinking_end|> + Answer
+    Question + <think> + k×<|latent_step|> + (k-1)×<|thinking_sep|> + </think> + Answer
 
     The number k is ADAPTIVE - determined by how many OCR chunks the thinking
     text produces. Short thinking = 1 step, long thinking = multiple steps.
@@ -50,10 +50,10 @@ logger = logging.getLogger(__name__)
 
 
 # Special token names
-THINKING_START_TOKEN = "<|thinking_start|>"
+THINKING_START_TOKEN = "<think>"
 LATENT_STEP_TOKEN = "<|latent_step|>"
 THINKING_SEP_TOKEN = "<|thinking_sep|>"
-THINKING_END_TOKEN = "<|thinking_end|>"
+THINKING_END_TOKEN = "</think>"
 
 # All thinking tokens (in order)
 ALL_THINKING_TOKENS = [
@@ -103,7 +103,7 @@ def get_thinking_token_ids(tokenizer: PreTrainedTokenizerBase) -> Dict[str, int]
         return token_ids
 
     # Fall back to default IDs for Qwen3-VL-2B-Thinking
-    # Use <|thinking_start|> = 151667, <|thinking_end|> = 151668
+    # Use <think> = 151667, </think> = 151668
     # For <|latent_step|> and <|thinking_sep|>, add new tokens
     logger.info("Named thinking tokens not found, using default IDs for Qwen3-VL-2B-Thinking")
 
@@ -154,8 +154,8 @@ def add_thinking_tokens(
         >>> tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-VL-2B")
         >>> tokenizer, token_ids = add_thinking_tokens(tokenizer, save_path="./tokenizer_updated")
         >>> print(token_ids)
-        {'<|thinking_start|>': 151646, '<|latent_step|>': 151647,
-         '<|thinking_sep|>': 151648, '<|thinking_end|>': 151649}
+        {'<think>': 151646, '<|latent_step|>': 151647,
+         '<|thinking_sep|>': 151648, '</think>': 151649}
     """
     # Check which tokens need to be added
     tokens_to_add = []
@@ -231,10 +231,10 @@ def build_sequence_with_thinking(
     """Build a training sequence with thinking tokens (using separators).
 
     Format (inspired by DPSK OCR's visual token layout):
-        Question <|thinking_start|><|latent_step|>[<|thinking_sep|><|latent_step|>]*<|thinking_end|> Answer
+        Question <think><|latent_step|>[<|thinking_sep|><|latent_step|>]*</think> Answer
 
     Example with 3 thinking steps:
-        "What is 2+2?" <|thinking_start|><|latent_step|><|thinking_sep|><|latent_step|><|thinking_sep|><|latent_step|><|thinking_end|> "4"
+        "What is 2+2?" <think><|latent_step|><|thinking_sep|><|latent_step|><|thinking_sep|><|latent_step|><|thinking_end|> "4"
 
     This mirrors DPSK OCR's format:
     - Visual: 100 tokens + 10 newlines (row separators) + 1 view separator

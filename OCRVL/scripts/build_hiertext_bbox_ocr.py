@@ -112,12 +112,12 @@ def process_hiertext_split(
             if bbox_area < (original_area / 20) or bbox_area > (original_area / 4) or bbox_area < 400 or len(paragraph_text) < 8:
                 continue
 
-            # Convert absolute bbox to normalized [0, 1]
+            # Convert absolute bbox to normalized [0, 1000] for Qwen3VL
             xmin, ymin, xmax, ymax = bbox
-            x1_norm = round(xmin / width, 4)
-            y1_norm = round(ymin / height, 4)
-            x2_norm = round(xmax / width, 4)
-            y2_norm = round(ymax / height, 4)
+            x1_norm = round(xmin / width * 1000)
+            y1_norm = round(ymin / height * 1000)
+            x2_norm = round(xmax / width * 1000)
+            y2_norm = round(ymax / height * 1000)
 
             bbox_normalized = [x1_norm, y1_norm, x2_norm, y2_norm]
             bbox_str = f"[{bbox_normalized[0]}, {bbox_normalized[1]}, {bbox_normalized[2]}, {bbox_normalized[3]}]"

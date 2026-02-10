@@ -26,7 +26,7 @@ def patch_transformers_imports():
 
         # Check if LlamaFlashAttention2 exists
         if not hasattr(llama_module, 'LlamaFlashAttention2'):
-            logger.info("Patching transformers: Adding LlamaFlashAttention2")
+            logger.debug("Patching transformers: Adding LlamaFlashAttention2")
 
             # Use Llama attention as the base
             if hasattr(llama_module, 'LlamaAttention'):
@@ -37,14 +37,14 @@ def patch_transformers_imports():
                     pass
                 llama_module.LlamaFlashAttention2 = LlamaFlashAttention2
 
-            logger.info("  ✓ LlamaFlashAttention2 patched")
+            logger.debug("  ✓ LlamaFlashAttention2 patched")
 
         # Check for other potentially missing classes
         if not hasattr(llama_module, 'LlamaSdpaAttention'):
-            logger.info("Patching transformers: Adding LlamaSdpaAttention")
+            logger.debug("Patching transformers: Adding LlamaSdpaAttention")
             if hasattr(llama_module, 'LlamaAttention'):
                 llama_module.LlamaSdpaAttention = llama_module.LlamaAttention
-            logger.info("  ✓ LlamaSdpaAttention patched")
+            logger.debug("  ✓ LlamaSdpaAttention patched")
 
         return True
 

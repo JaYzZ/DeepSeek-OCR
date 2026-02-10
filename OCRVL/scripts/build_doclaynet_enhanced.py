@@ -263,11 +263,11 @@ def iter_bbox_ocr_samples(
             bbox_xywh = cell.get('bbox', [])
             if len(bbox_xywh) >= 4:
                 x, y, w, h = bbox_xywh[:4]
-                # Convert to normalized [x1, y1, x2, y2] in [0, 1]
-                x1_norm = round(x / img_width, 4)
-                y1_norm = round(y / img_height, 4)
-                x2_norm = round((x + w) / img_width, 4)
-                y2_norm = round((y + h) / img_height, 4)
+                # Convert to normalized [x1, y1, x2, y2] in [0, 1000] for Qwen3VL
+                x1_norm = round(x / img_width * 1000)
+                y1_norm = round(y / img_height * 1000)
+                x2_norm = round((x + w) / img_width * 1000)
+                y2_norm = round((y + h) / img_height * 1000)
                 standard_segments.append({
                     "bbox": [x1_norm, y1_norm, x2_norm, y2_norm],
                     "text": cell.get('text', '')
@@ -411,11 +411,11 @@ def iter_full_ocr_samples(
             bbox_xywh = cell.get('bbox', [])
             if len(bbox_xywh) >= 4:
                 x, y, w, h = bbox_xywh[:4]
-                # Convert to normalized [x1, y1, x2, y2] in [0, 1]
-                x1_norm = round(x / img_width, 4)
-                y1_norm = round(y / img_height, 4)
-                x2_norm = round((x + w) / img_width, 4)
-                y2_norm = round((y + h) / img_height, 4)
+                # Convert to normalized [x1, y1, x2, y2] in [0, 1000] for Qwen3VL
+                x1_norm = round(x / img_width * 1000)
+                y1_norm = round(y / img_height * 1000)
+                x2_norm = round((x + w) / img_width * 1000)
+                y2_norm = round((y + h) / img_height * 1000)
                 text = cell.get('text', '').strip()
                 if text:
                     standard_segments.append({
@@ -552,10 +552,11 @@ def iter_markdown_model_samples(
                 bbox_xywh = cell.get('bbox', [])
                 if len(bbox_xywh) >= 4:
                     x, y, w, h = bbox_xywh[:4]
-                    x1_norm = round(x / img_width, 4)
-                    y1_norm = round(y / img_height, 4)
-                    x2_norm = round((x + w) / img_width, 4)
-                    y2_norm = round((y + h) / img_height, 4)
+                    # Convert to [0, 1000] for Qwen3VL
+                    x1_norm = round(x / img_width * 1000)
+                    y1_norm = round(y / img_height * 1000)
+                    x2_norm = round((x + w) / img_width * 1000)
+                    y2_norm = round((y + h) / img_height * 1000)
                     text = cell.get('text', '').strip()
                     if text:
                         standard_segments.append({
@@ -669,10 +670,10 @@ def process_markdown_task(args: tuple) -> Optional[Dict[str, Any]]:
             bbox_xywh = cell.get('bbox', [])
             if len(bbox_xywh) >= 4:
                 x, y, w, h = bbox_xywh[:4]
-                x1_norm = round(x / img_width, 4)
-                y1_norm = round(y / img_height, 4)
-                x2_norm = round((x + w) / img_width, 4)
-                y2_norm = round((y + h) / img_height, 4)
+                x1_norm = round(x / img_width * 1000)
+                y1_norm = round(y / img_height * 1000)
+                x2_norm = round((x + w) / img_width * 1000)
+                y2_norm = round((y + h) / img_height * 1000)
                 text = cell.get('text', '').strip()
                 if text:
                     standard_segments.append({
@@ -931,10 +932,10 @@ def iter_all_samples(
                 bbox_xywh = cell.get('bbox', [])
                 if len(bbox_xywh) >= 4:
                     x, y, w, h = bbox_xywh[:4]
-                    x1_norm = round(x / img_width, 4)
-                    y1_norm = round(y / img_height, 4)
-                    x2_norm = round((x + w) / img_width, 4)
-                    y2_norm = round((y + h) / img_height, 4)
+                    x1_norm = round(x / img_width * 1000)
+                    y1_norm = round(y / img_height * 1000)
+                    x2_norm = round((x + w) / img_width * 1000)
+                    y2_norm = round((y + h) / img_height * 1000)
                     text = cell.get('text', '').strip()
                     if text:
                         standard_segments.append({
@@ -964,7 +965,7 @@ def iter_all_samples(
             for seg in presampled_segments:
                 bbox = seg['bbox']
                 text = seg['text']
-                bbox_str = f"[{bbox[0]:.4f}, {bbox[1]:.4f}, {bbox[2]:.4f}, {bbox[3]:.4f}]"
+                bbox_str = f"[{bbox[0]}, {bbox[1]}, {bbox[2]}, {bbox[3]}]"
 
                 yield {
                     "messages": [
