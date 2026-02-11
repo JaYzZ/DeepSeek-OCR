@@ -56,3 +56,5 @@ swanlog/*
 **/data/*images/*
 **/data/cache/*
 Qwen/results/*
+Qwen/evaluation/data/*
+*.tsv

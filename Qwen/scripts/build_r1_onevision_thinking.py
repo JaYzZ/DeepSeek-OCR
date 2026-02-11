@@ -156,7 +156,7 @@ def chunk_thinking_text(
 
 def extract_thinking_and_answer(
     content: str,
-    max_chars: Optional[int] = 3200,
+    max_chars: Optional[int] = 4800,
     return_chunks: bool = True,
 ) -> Tuple[str, str] | Tuple[List[str], str]:
     """
@@ -166,7 +166,7 @@ def extract_thinking_and_answer(
 
     Args:
         content: Assistant message containing thinking tags
-        max_chars: Maximum characters per chunk (default: 3200)
+        max_chars: Maximum characters per chunk (default: 4800)
         return_chunks: If True (default), return list of chunks.
                       If False, return only first chunk for backward compatibility.
 
@@ -318,7 +318,7 @@ def process_parquet_file(
     dataset_name: str,
     renderer: AdaptiveVelloRenderer,
     encoder: Qwen3VLEncoder,
-    max_chars_per_chunk: int = 3200,
+    max_chars_per_chunk: int = 4800,
     max_samples: Optional[int] = None,
     file_mode: str = 'w',
 ) -> dict:
@@ -766,13 +766,13 @@ def main_encode_only(args, encoder):
                     # Collect thinking image paths (question text + thinking chunks)
                     thinking_image_paths = []
 
-                    # SKIPPED:                 # 1. Add question text image first
-                    # SKIPPED:                 question_text_filename = get_hash_filename(dataset_name, sample_id, "question_text")
-                    # SKIPPED:                 question_text_path = images_dir / f"{question_text_filename}.png"
-                    # SKIPPED:                 if local_rank == 0:
-                    # SKIPPED:                     logger.info(f"    Checking {question_text_path.name}: exists={question_text_path.exists()}")
-                    # SKIPPED:                 if question_text_path.exists():
-                    # SKIPPED:                     thinking_image_paths.append(str(question_text_path))
+                    # 1. Add question text image first
+                    question_text_filename = get_hash_filename(dataset_name, sample_id, "question_text")
+                    question_text_path = images_dir / f"{question_text_filename}.png"
+                    if local_rank == 0:
+                        logger.info(f"    Checking {question_text_path.name}: exists={question_text_path.exists()}")
+                    if question_text_path.exists():
+                        thinking_image_paths.append(str(question_text_path))
 
                     # 2. Add thinking chunk images
                     # thinking is already a list of chunks from extract_thinking_and_answer(return_chunks=True)
@@ -1021,8 +1021,8 @@ def main():
     parser.add_argument('--images-dir',
                         default='Qwen/data/r1_onevision_images',
                         help='Directory for rendered images and latent files')
-    parser.add_argument('--max-chars-per-chunk', type=int, default=3200,
-                        help='Maximum characters per thinking chunk (default: 3200)')
+    parser.add_argument('--max-chars-per-chunk', type=int, default=4800,
+                        help='Maximum characters per thinking chunk (default: 4800)')
     parser.add_argument('--device', default='cuda:0',
                         help='Device for cross-attention encoder')
     parser.add_argument('--cache-chunks', action='store_true',
@@ -1511,7 +1511,7 @@ def process_parquet_file_ddp(
     dataset_name: str,
     renderer: AdaptiveVelloRenderer,
     encoder: torch.nn.parallel.DistributedDataParallel,
-    max_chars_per_chunk: int = 3200,
+    max_chars_per_chunk: int = 4800,
     max_samples: Optional[int] = None,
     batch_size: int = 8,
     local_rank: int = 0,

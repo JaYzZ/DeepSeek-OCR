@@ -397,7 +397,7 @@ class AdaptiveVelloRenderer:
     def __init__(
         self,
         min_vello_font: float = 8.0,     # Vello's minimum font size
-        max_vello_font: float = 48.0,    # Vello's maximum font size
+        max_vello_font: float = 12.0,    # Vello's maximum font size (limited to reduce token count)
         min_size: int = 64,
         max_size: int = 1536,
         vit_divisor: int = 32,

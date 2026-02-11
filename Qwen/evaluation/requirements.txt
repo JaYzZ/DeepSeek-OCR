@@ -1,0 +1,25 @@
+# Core dependencies for all evaluation benchmarks
+vllm
+transformers
+qwen_vl_utils
+torch
+torchvision
+accelerate
+flash_attn
+
+# Data processing
+pandas
+numpy
+Pillow
+
+# Utilities
+tqdm
+requests
+validators
+
+# Benchmark-specific dependencies
+openpyxl          # MathVision
+latex2sympy2      # MathVision
+pycocotools       # ODinW-13
+tabulate          # ODinW-13
+sentencepiece     # RealWorldQA
