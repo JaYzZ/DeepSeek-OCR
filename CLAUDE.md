@@ -7,6 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 2. DO NOT change any other reference repo's content, edit is forbidden
 3. DO NOT change the environment installation, the conda env is /share/project/xiyan/envs/ocrflow, any pip install should be passed for user validation
 4. DO NOT do this: `torch_dtype` is deprecated! Use `dtype` instead!
+5. **DO NOT use git commands that modify files** - `git checkout`, `git reset`, `git revert` without explicit approval
+6. **Import rules**: Always use absolute imports (e.g., `from vllm_thinking.runner_patch import ...`) NOT relative imports. Place all imports at the top of the file, never use inline/wild imports inside functions.
 
 ## System Dependencies
 
@@ -241,6 +243,63 @@ Required parameters for DeepSeek-OCR:
 2. If modifying encoder: edit `OCRInfer/encoder/dpsk_ocr_encoder.py`
 3. Test with short run: `python OCRFlow/examples/train.py --max_steps 10`
 4. Full training: `./OCRFlow/scripts/start_training.sh`
+
+## Continuous Latent AR Mode
+
+### Overview
+The Qwen3-VL-2B-Thinking model uses a discrete thinking approach with `<|latent_step|>` placeholder tokens. For improved efficiency, we've implemented **continuous latent autoregressive (AR) mode** that operates directly in hidden state space without tokenization during the thinking phase.
+
+### Key Differences
+
+**Discrete Token Mode (Default)**
+- Generates tokens one-by-one through LM head
+- Each token goes through tokenization
+- Thinking steps: `<|latent_step|>` placeholders
+- Same as official Qwen3-VL-2B-Thinking model
+
+**Continuous Latent AR Mode (Default: ENABLED)**
+- Generates directly in continuous hidden state space
+- NO tokenization during thinking phase
+- Projects hidden states → logits → sample/argmax → next hidden state
+- Switches to discrete token mode only when exiting thinking
+
+### Configuration
+
+**Enable continuous latent AR mode** by setting environment variable:
+```bash
+export QWEN3VL_CONTINUOUS_LATENT=1  # Default: enabled (1=enabled, 0=disabled)
+```
+
+When enabled, the model will:
+1. Detect `<|latent_step|>` → Enter continuous latent AR mode
+2. Generate in continuous hidden state space (no intermediate tokenization)
+3. Decode each hidden state to discrete token (for monitoring/exit detection)
+4. Exit thinking mode when `<|</think>|>` detected
+5. Continue standard token generation for answer
+
+### Implementation Details
+
+**File**: `Qwen/llamafactory/integration.py`
+- Function: `_generate_with_continuous_latent_ar()`
+- Automatically enabled when `QWEN3VL_CONTINUOUS_LATENT=1`
+- Routes via `patched_generate()` based on config
+- Compatible with both discrete and continuous modes
+
+**Key Features**:
+- No tokenization overhead during thinking
+- Direct hidden state transitions (smoother AR)
+- Proper exit token detection (`<|</think>|>`)
+- Maintains compatibility with discrete mode fallback
+
+### Training Impact
+
+**With continuous latent AR enabled** (default):
+- Training works identically to discrete token mode
+- Evaluation works with continuous mode
+- vLLM inference benefits from no tokenization overhead
+- **No changes needed** - works with linear checkpoint (Qwen3-VL-2B)
+
+**Note**: This mode is only active during inference/thinking phase. Standard tokenization is still used for regular text generation.
 
 ### Making Changes to Vello Renderer
 1. Edit Rust code in `Renderer/src/lib.rs`

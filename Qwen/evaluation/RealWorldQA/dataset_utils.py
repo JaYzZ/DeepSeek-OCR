@@ -10,7 +10,10 @@ import numpy as np
 import string
 from typing import Dict, Any, List
 from PIL import Image
-from common_utils import download_file, md5, toliststr, decode_base64_to_image_file
+try:
+    from .common_utils import download_file, md5, toliststr, decode_base64_to_image_file
+except ImportError:
+    from common_utils import download_file, md5, toliststr, decode_base64_to_image_file
 
 # RealWorldQA dataset URL and MD5
 REALWORLDQA_DATASET_URL = 'https://opencompass.openxlab.space/utils/VLMEval/RealWorldQA.tsv'
@@ -41,17 +44,6 @@ def load_dataset(dataset_name='RealWorldQA'):
     
     # Load dataset
     data = pd.read_csv(data_path, sep='\t')
-
-    # Apply sample limit if specified via environment variable
-    num_samples = os.environ.get('EVAL_NUM_SAMPLES')
-    if num_samples:
-        num_samples = int(num_samples)
-        import hashlib
-        # Deterministic sampling by hash
-        data['_hash'] = data['index'].apply(lambda x: hashlib.md5(str(x).encode()).hexdigest())
-        data = data.sort_values('_hash').head(num_samples)
-        data = data.drop('_hash', axis=1)
-        print(f"✓ Limited dataset to {len(data)} samples (deterministic sampling from {len(pd.read_csv(data_path, sep='\t'))} total)")
 
     # Process dataset
     data['index'] = [str(x) for x in data['index']]
@@ -187,4 +179,3 @@ def build_realworldqa_prompt(line, dump_image_func, min_pixels, max_pixels):
     }]
     
     return messages
-

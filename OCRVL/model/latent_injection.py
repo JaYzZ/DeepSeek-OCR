@@ -5,7 +5,7 @@ This module provides utilities for injecting pre-encoded OCR features at specifi
 latent token positions during the forward pass. This enables minimal-change thinking
 training where:
 
-1. Data format uses special latent tokens: <think><|latent_step|>*k</think>
+1. Data format uses special latent tokens: <think><latent>*k</think>
 2. Pre-encoded OCR features are provided via latent_supervision parameter
 3. During forward pass, latent token embeddings are replaced with OCR features
 4. Existing thinking_projection MLP provides reconstruction supervision
@@ -55,14 +55,14 @@ def find_latent_positions(
 ) -> torch.BoolTensor:
     """Find positions of latent step tokens between thinking start/end markers.
 
-    Format: <think><|latent_step|>[<|thinking_sep|><|latent_step|>]*</think>
+    Format: <think><latent>[<think_sep><latent>]*</think>
 
-    This is simpler than the old format - we just need to find all <|latent_step|> tokens
+    This is simpler than the old format - we just need to find all <latent> tokens
     that appear between <think> and </think>.
 
     Args:
         input_ids: [batch_size, seq_len] Input token IDs
-        latent_token_id: Token ID for <|latent_step|>
+        latent_token_id: Token ID for <latent>
         start_token_id: Token ID for <think>
         end_token_id: Token ID for </think>
 
@@ -70,7 +70,7 @@ def find_latent_positions(
         [batch_size, seq_len] Boolean mask where True indicates a latent step position
 
     Example with 3 steps:
-        Input:  [Q, <think>, <|latent_step|>, <|thinking_sep|>, <|latent_step|>, <|thinking_sep|>, <|latent_step|>, </think>, A]
+        Input:  [Q, <think>, <latent>, <think_sep>, <latent>, <think_sep>, <latent>, </think>, A]
         Output: [F,       F,               T,                F,               T,                F,               T,        F, F]
     """
     batch_size, seq_len = input_ids.shape

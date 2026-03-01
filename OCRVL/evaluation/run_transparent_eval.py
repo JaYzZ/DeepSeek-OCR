@@ -80,11 +80,11 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Set environment variables for callback
-    os.environ["OCRVL_ENABLE_TRANSPARENT_EVAL"] = "1"
-    os.environ["OCRVL_TRANSPARENT_EVAL_LIMIT"] = args.limit
-    os.environ["OCRVL_TRANSPARENT_EVAL_MAX_NEW_TOKENS"] = str(args.max_new_tokens)
-    os.environ["OCRVL_TRANSPARENT_EVAL_TEMPERATURE"] = str(args.temperature)
-    os.environ["OCRVL_REPO_ROOT"] = str(_REPO_ROOT)
+    os.environ["ENABLE_TRANSPARENT_EVAL"] = "1"
+    os.environ["TRANSPARENT_EVAL_LIMIT"] = args.limit
+    os.environ["TRANSPARENT_EVAL_MAX_NEW_TOKENS"] = str(args.max_new_tokens)
+    os.environ["TRANSPARENT_EVAL_TEMPERATURE"] = str(args.temperature)
+    os.environ["REPO_ROOT"] = str(_REPO_ROOT)
 
     logger.info("="*80)
     logger.info("Standalone Transparent Evaluation")

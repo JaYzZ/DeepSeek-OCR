@@ -209,13 +209,40 @@ def create_composite_image(
         y_offset += font_size + 2
     y_offset += 10
 
-    # Draw generated answer
-    draw.text((padding, y_offset), "Model Output:", fill='#FF9800', font=label_font)
-    y_offset += 20
-    lines = wrap_text(generated, text_font, text_width)
-    for line in lines:
-        draw.text((padding, y_offset), line, fill='#333', font=text_font)
-        y_offset += font_size + 2
+    # Draw generated answer - separate thinking from answer if different
+    full_output = result.get('generated_answer', '')
+    display_output = result.get('generated_answer_display', '')
+
+    # Check if there's a difference (thinking vs answer)
+    if display_output and display_output != full_output:
+        # Extract thinking (the part that gets stripped)
+        thinking = full_output.replace(display_output, '', 1).strip()
+
+        # Draw thinking section
+        if thinking:
+            draw.text((padding, y_offset), "Thinking:", fill='#9E9E9E', font=label_font)
+            y_offset += 20
+            lines = wrap_text(thinking, text_font, text_width)
+            for line in lines:
+                draw.text((padding, y_offset), line, fill='#9E9E9E', font=text_font)
+                y_offset += font_size + 2
+            y_offset += 10
+
+        # Draw final answer
+        draw.text((padding, y_offset), "Answer:", fill='#FF9800', font=label_font)
+        y_offset += 20
+        lines = wrap_text(display_output, text_font, text_width)
+        for line in lines:
+            draw.text((padding, y_offset), line, fill='#333', font=text_font)
+            y_offset += font_size + 2
+    else:
+        # No thinking detected, show full output
+        draw.text((padding, y_offset), "Model Output:", fill='#FF9800', font=label_font)
+        y_offset += 20
+        lines = wrap_text(generated, text_font, text_width)
+        for line in lines:
+            draw.text((padding, y_offset), line, fill='#333', font=text_font)
+            y_offset += font_size + 2
 
     # Save composite
     output_path.parent.mkdir(parents=True, exist_ok=True)

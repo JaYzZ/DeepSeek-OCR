@@ -8,7 +8,10 @@ import traceback
 import pandas as pd
 from PIL import Image
 from typing import List, Dict, Tuple, Any
-from common_utils import encode_image_to_base64
+try:
+    from .common_utils import encode_image_to_base64
+except ImportError:
+    from common_utils import encode_image_to_base64
 
 def strip_thinking_tokens(prediction):
     """Strip thinking process wrapped in <thinking>...</thinking> tokens."""
@@ -288,7 +291,7 @@ def build_judge(model, api_type, api_url=None, api_key=None):
         return CustomJudgeWrapper(judge_url)
     elif api_type == 'local':
         # Use local OpenAI-compatible API
-        api_base = api_url or os.environ.get('LOCAL_API_URL', 'http://localhost:8000/v1/chat/completions')
+        api_base = api_url or os.environ.get('LOCAL_API_URL', 'http://localhost:8016/v1/chat/completions')
         api_key = api_key or os.environ.get('LOCAL_API_KEY', 'EMPTY')
         print(f"Using local API: {api_base}")
         return OpenAIWrapper(model, api_base, api_key)

@@ -18,8 +18,9 @@ from config import resolve_path, get_data_path, get_results_path, QWEN3_VL_2B_TH
 
 # vLLM imports
 from vllm import LLM, SamplingParams
-from qwen_vl_utils import process_vision_info
 from transformers import AutoProcessor
+
+# Note: Image preprocessing now handled by vLLM internally
 
 # Import LoRARequest for vLLM LoRA support
 try:
@@ -29,9 +30,16 @@ except ImportError:
     HAS_LORA_REQUEST = False
     LoRARequest = None
 
-# Local imports from refactored files
-from dataset_utils import load_dataset, dump_image
-from eval_utils import build_judge, eval_single_sample, MATH_V_acc
+# Local imports from refactored files.
+# Support both:
+# - Running as a script from this folder (expects local imports)
+# - Importing as a package module (e.g. MathVision.run_mathv)
+try:
+    from .dataset_utils import load_dataset, dump_image
+    from .eval_utils import build_judge, eval_single_sample, MATH_V_acc
+except ImportError:
+    from dataset_utils import load_dataset, dump_image
+    from eval_utils import build_judge, eval_single_sample, MATH_V_acc
 
 # Set vLLM multiprocessing method
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
@@ -94,35 +102,63 @@ def build_mathv_prompt(line, dump_image_func, dataset):
 
 def prepare_inputs_for_vllm(messages, processor):
     """
-    Prepare inputs for vLLM (following the examples in README.md).
-    
+    Prepare inputs for vLLM - let vLLM handle everything (official approach).
+
     Args:
         messages: List of messages in standard conversation format
         processor: AutoProcessor instance
-    
+
     Returns:
         dict: Input format required by vLLM
     """
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    
-    # qwen_vl_utils 0.0.14+ required
-    image_inputs, video_inputs, video_kwargs = process_vision_info(
-        messages,
-        image_patch_size=processor.image_processor.patch_size,
-        return_video_kwargs=True,
-        return_video_metadata=True
-    )
-    
+
+    # Apply chat template to get prompt with proper placeholders
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    text = text + "<|im_start|>assistant\n"
+
+    # Extract raw images from messages - let vLLM handle preprocessing
+    raw_images = []
+    raw_videos = []
+
+    for item in messages[0].get('content', []):
+        if isinstance(item, dict):
+            if item.get('type') == 'image':
+                raw_images.append(item['image'])  # Can be path or PIL image
+            elif item.get('type') == 'video':
+                raw_videos.append(item['video'])
+
+    # Get min/max pixels from processor or messages
+    min_pixels = None
+    max_pixels = None
+
+    # Check if messages have explicit pixel settings
+    for item in messages[0].get('content', []):
+        if isinstance(item, dict) and item.get('type') == 'image':
+            if 'min_pixels' in item:
+                min_pixels = item['min_pixels']
+            if 'max_pixels' in item:
+                max_pixels = item['max_pixels']
+            break
+
+    # Fallback to processor defaults
+    if min_pixels is None:
+        min_pixels = getattr(processor.image_processor, 'min_pixels', 28 * 28 * 256)
+    if max_pixels is None:
+        max_pixels = getattr(processor.image_processor, 'max_pixels', 28 * 28 * 2048)
+
     mm_data = {}
-    if image_inputs is not None:
-        mm_data['image'] = image_inputs
-    if video_inputs is not None:
-        mm_data['video'] = video_inputs
-    
+    if raw_images:
+        mm_data['image'] = raw_images
+    if raw_videos:
+        mm_data['video'] = raw_videos
+
     return {
         'prompt': text,
         'multi_modal_data': mm_data,
-        'mm_processor_kwargs': video_kwargs
+        'mm_processor_kwargs': {
+            'min_pixels': min_pixels,
+            'max_pixels': max_pixels,
+        }
     }
 
 def run_inference(args):
@@ -262,7 +298,7 @@ def run_inference(args):
         lora_request = LoRARequest(
             lora_name=args.lora_name,
             lora_int_id=1,
-            lora_local_path=args.lora_path,
+            lora_path=args.lora_path,
         )
         print(f"   Using LoRA: {args.lora_name}")
 
@@ -508,7 +544,7 @@ def main():
     eval_parser.add_argument("--api-type", type=str, default="custom", choices=["custom", "local", "dash", "mit"],
                             help="API type for evaluation (default: local)")
     eval_parser.add_argument("--api-url", type=str, default=None,
-                            help="API URL for local API (default: http://localhost:8000/v1/chat/completions)")
+                            help="API URL for local API (default: http://localhost:8016/v1/chat/completions)")
     eval_parser.add_argument("--api-key", type=str, default=None,
                             help="API key for local API (default: EMPTY)")
     eval_parser.add_argument("--nproc", type=int, default=4, help="Number of processes to use")

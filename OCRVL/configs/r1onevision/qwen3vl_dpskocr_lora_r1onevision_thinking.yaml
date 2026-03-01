@@ -4,11 +4,11 @@
 # Special tokens for thinking/reasoning:
 # - <think> (151667): Opens thinking section
 # - </think> (151668): Closes thinking section
-# - <|latent_step|> (auto-added): Placeholder for each thinking chunk
-# - <|thinking_sep|> (auto-added): Separator between thinking steps
+# - <latent> (auto-added): Placeholder for each thinking chunk
+# - <think_sep> (auto-added): Separator between thinking steps
 #
-# Format: Question <think><|latent_step|><|thinking_sep|>...</think> Answer
-# Each <|latent_step|> token will be replaced with pre-encoded OCR features during training
+# Format: Question <think><latent><think_sep>...</think> Answer
+# Each <latent> token will be replaced with pre-encoded OCR features during training
 model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/OCRVL/checkpoints/OCR-Qwen3-VL-2B-Thinking
 image_max_pixels: 262144
 video_max_pixels: 16384
@@ -38,7 +38,7 @@ freeze_vision_tower: true
 # - Auto-detects LlamaFactory ShareGPT format (existing data)
 # - Extracts thinking images from assistant messages
 # - Encodes thinking images via DeepSeek-OCR encoder
-# - Injects OCR features at <|latent_step|> token positions
+# - Injects OCR features at <latent> token positions
 # - Computes MSE loss via thinking_projection MLP
 #
 # Dataset format (LlamaFactory ShareGPT):
@@ -53,7 +53,7 @@ freeze_vision_tower: true
 # During training:
 # 1. First image (v_image): Main question image - processed by vision encoder
 # 2. Second image (thinking_image): Pre-rendered thinking - encoded as OCR features
-# 3. OCR features injected at <|latent_step|> positions
+# 3. OCR features injected at <latent> positions
 # 4. Loss: Cross-entropy on answer + MSE on OCR reconstruction
 #
 # Data: 177,260 samples across 22 VQA datasets

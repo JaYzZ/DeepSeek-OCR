@@ -53,7 +53,7 @@ def main():
     log(f"Loading model from {args.model_path}...")
     model = AutoModelForVision2Seq.from_pretrained(
         args.model_path,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map={"": device},
         trust_remote_code=True,
     )
@@ -85,7 +85,7 @@ def main():
 
     # 4. Load samples
     repo_root = "/share/project/xiyan/sources/DeepSeek-OCR"
-    metadata_path = f"{repo_root}/OCRVL/data/ocrvl_transparent_eval.metadata.json"
+    metadata_path = f"{repo_root}/Qwen/evaluation/data/qwen3vl_transparent_eval.metadata.json"
     with open(metadata_path, 'r') as f:
         metadata = json.load(f)
     samples = metadata['samples'][:args.max_samples]
@@ -123,7 +123,9 @@ def main():
                 conversation = [{"role": "user", "content": user_content}]
 
                 tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
-                text = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
+                
+                text = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=False)
+                text = text + "<|im_start|>assistant\n"
                 text_inputs = tokenizer(text, return_tensors="pt", padding=False, add_special_tokens=False)
 
                 input_ids = text_inputs['input_ids'].to(device)
@@ -217,7 +219,9 @@ def main():
                 conversation = [{"role": "user", "content": user_content}]
 
                 tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
-                text = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
+                
+                text = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=False)
+                text = text + "<|im_start|>assistant\n"
                 text_inputs = tokenizer(text, return_tensors="pt", padding=False, add_special_tokens=False)
 
                 input_ids = text_inputs['input_ids'].to(device)

@@ -4,19 +4,19 @@
 # Special tokens for thinking/reasoning:
 # - <think> (151667): Opens thinking section
 # - </think> (151668): Closes thinking section
-# - <|latent_step|> (auto-added): Marker where latent supervision is applied
-# - <|thinking_sep|> (auto-added): Separator between thinking steps
+# - <latent> (auto-added): Marker where latent supervision is applied
+# - <think_sep> (auto-added): Separator between thinking steps
 #
 # Architecture:
 # 1. Input: Question TEXT + Question IMAGE (both present in forward pass)
 #    Example: "What's in this image?" + <vision_start><image_pad>*N<vision_end>
 #
-# 2. Output: <think><|latent_step|></think> Answer text
+# 2. Output: <think><latent></think> Answer text
 #
 # 3. Training:
 #    - Pre-encoding (offline): Question image + rendered thinking text → cross-attention
 #      → [100, 2048] latent reference saved as .latent.pt
-#    - Forward pass: Question text + question image → LLM hidden states at <|latent_step|>
+#    - Forward pass: Question text + question image → LLM hidden states at <latent>
 #    - Loss: CE loss + Thinking loss (OT/MSE/REPA on LLM hidden states vs latent reference)
 #    - NO reverse projection - direct supervision on LLM hidden states
 #
@@ -26,6 +26,7 @@
 # - Direct LLM hidden state supervision (no LatentVisualHead reverse projection)
 # - Latent supervision via OT/MSE/REPA loss on [B, seq, 2048] hidden states
 model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking
+add_special_tokens: "<latent>,<think_sep>"
 image_max_pixels: 262144
 video_max_pixels: 16384
 trust_remote_code: true
@@ -61,7 +62,7 @@ freeze_vision_tower: true
 # During training:
 # 1. Question image: Processed by Qwen3VL native vision tower
 # 2. Latent supervision: Pre-extracted [100, hidden_dim] features from cross-attention
-# 3. Injection: Latents injected at `<|latent_step|>` token positions
+# 3. Injection: Latents injected at `<latent>` token positions
 # 4. Loss: Cross-entropy on answer + MSE on latent reconstruction
 dataset: qwen3vl_r1_onevision_thinking
 dataset_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/data
@@ -75,12 +76,12 @@ dataloader_num_workers: 4
 dataloader_prefetch_factor: 2
 
 ### eval
-eval_dataset: ocrvl_transparent_eval
-val_size: 0
-per_device_eval_batch_size: 1
-eval_strategy: steps
-eval_steps: 500
-predict_with_generate: false  # Use TransparentEvalCallback instead
+# eval_dataset: qwen3vl_transparent_eval
+# val_size: 0
+# per_device_eval_batch_size: 1
+# eval_strategy: steps
+# eval_steps: 500
+# predict_with_generate: false
 
 ### output
 output_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/qwen3vl-2b/lora/r1_onevision_thinking
@@ -123,3 +124,4 @@ ddp_find_unused_parameters: false
 ddp_timeout: 180000000
 resume_from_checkpoint: null
 adapter_name_or_path: null
+

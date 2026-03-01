@@ -44,8 +44,17 @@ def run_vllm_inference(
     # Total timing
     total_start = time.time()
 
+    # Track completed benchmarks (for resume support)
+    completed = []
+
     for benchmark in benchmarks:
         output_file = os.path.join(output_dir, f"{benchmark.lower()}_inference.jsonl")
+
+        # Skip if already exists (resume support)
+        if os.path.exists(output_file):
+            print(f"⏭️  Skipping {benchmark} (output exists): {output_file}")
+            completed.append(benchmark)
+            continue
 
         # Build command for individual benchmark script
         benchmark_scripts = {
@@ -85,13 +94,18 @@ def run_vllm_inference(
         if num_samples > 0:
             if benchmark == "ODinW-13":
                 cmd.extend(["--limit", str(num_samples)])
-            elif benchmark == "MathVision":
+            elif benchmark in ("MathVision", "MMMU", "RealWorldQA"):
                 cmd.extend(["--num-samples", str(num_samples)])
 
-        # Set environment for sample limiting (MMMU, RealWorldQA)
         env = os.environ.copy()
-        if num_samples > 0 and benchmark in ["MMMU", "RealWorldQA"]:
-            env["EVAL_NUM_SAMPLES"] = str(num_samples)
+
+        # Enable thinking mode for continuous latent AR (if not already set)
+        env.setdefault("VLLM_THINKING_MODE_ENABLED", "1")
+        env.setdefault("VLLM_THINKING_AUTO_PATCH", "1")
+
+        # Set LoRA checkpoint path for VAE loading (if provided)
+        if lora_path:
+            env["VLLM_LORA_CHECKPOINT_PATH"] = lora_path
 
         # Add LoRA arguments if provided
         if lora_path:
@@ -115,15 +129,23 @@ def run_vllm_inference(
                 cmd,
                 env=env,
                 check=True,
-                cwd=Path(__file__).parent
+                cwd=Path(__file__).parent,
+                capture_output=False  # Show output in real-time
             )
             elapsed = time.time() - start_time
-            print(f"✓ {benchmark} inference completed in {elapsed:.2f}s")
+            print(f"\n✓ {benchmark} inference completed in {elapsed:.2f}s")
+            completed.append(benchmark)
 
         except subprocess.CalledProcessError as e:
             elapsed = time.time() - start_time
-            print(f"✗ {benchmark} inference failed after {elapsed:.2f}s")
+            print(f"\n✗ {benchmark} inference failed after {elapsed:.2f}s")
             print(f"Error: {e}")
+            print(f"Return code: {e.returncode}")
+            # Print stderr if available
+            if e.stderr:
+                print(f"STDERR: {e.stderr[:1000]}")
+            # Continue to next benchmark instead of stopping
+            print(f"⚠️  Continuing to next benchmark...")
 
     total_elapsed = time.time() - total_start
 
@@ -131,8 +153,10 @@ def run_vllm_inference(
     print("✅ ALL INFERENCE COMPLETED")
     print("="*80)
     print(f"Total time: {total_elapsed:.2f} seconds ({total_elapsed/60:.2f} minutes)")
-    print(f"Total samples: {num_samples * len(benchmarks)}")
-    print(f"Average throughput: {(num_samples * len(benchmarks)) / total_elapsed:.2f} samples/second")
+    print(f"Completed benchmarks: {', '.join(completed)}")
+    if len(completed) < len(benchmarks):
+        skipped = [b for b in benchmarks if b not in completed]
+        print(f"Skipped/Failed benchmarks: {', '.join(skipped)}")
     print(f"\nAll results saved to: {output_dir}")
     print("="*80 + "\n")
 

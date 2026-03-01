@@ -2,7 +2,10 @@ import os
 import pandas as pd
 import numpy as np
 from typing import Dict, Any
-from common_utils import download_file, md5, toliststr, decode_base64_to_image_file
+try:
+    from .common_utils import download_file, md5, toliststr, decode_base64_to_image_file
+except ImportError:
+    from common_utils import download_file, md5, toliststr, decode_base64_to_image_file
 
 MMMU_DATASET_URL = 'https://opencompass.openxlab.space/utils/VLMEval/MMMU_DEV_VAL.tsv'
 MMMU_DATASET_MD5 = '521afc0f3bf341e6654327792781644d'
@@ -22,17 +25,6 @@ def load_dataset(dataset_name='MMMU_DEV_VAL'):
 
     # Load the dataset
     data = pd.read_csv(data_path, sep='\t')
-
-    # Apply sample limit if specified via environment variable
-    num_samples = os.environ.get('EVAL_NUM_SAMPLES')
-    if num_samples:
-        num_samples = int(num_samples)
-        import hashlib
-        # Deterministic sampling by hash
-        data['_hash'] = data['index'].apply(lambda x: hashlib.md5(str(x).encode()).hexdigest())
-        data = data.sort_values('_hash').head(num_samples)
-        data = data.drop('_hash', axis=1)
-        print(f"✓ Limited dataset to {len(data)} samples (deterministic sampling from {len(pd.read_csv(data_path, sep='\t'))} total)")
 
     # Process the dataset
     data['index'] = [str(x) for x in data['index']]

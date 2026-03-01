@@ -2,7 +2,7 @@
 """
 Transparent Evaluation Callback for LlamaFactory Training
 
-Monitors environment variable OCRVL_ENABLE_TRANSPARENT_EVAL and runs
+Monitors environment variable ENABLE_TRANSPARENT_EVAL and runs
 inference on transparent eval samples during training, saving results
 in the designated format for qualitative monitoring.
 """
@@ -54,16 +54,16 @@ class TransparentEvalCallback(TrainerCallback):
           └── step_N_results.json
     """
 
-    def __init__(self, model, tokenizer=None, processor=None, processing_class=None):
+    def __init__(self, model, tokenizer=None, processor=None, processing_class=None, synced_gpus=None):
         self.model = model
         # Support processing_class (newer Transformers) or tokenizer (older)
         self.tokenizer = processing_class if processing_class is not None else tokenizer
         self.processor = processor
         # Auto-enable - callback will check eval_dataset in on_evaluate
-        self.samples_path = os.environ.get("OCRVL_TRANSPARENT_EVAL_SAMPLES", "")
-        self.max_new_tokens = int(os.environ.get("OCRVL_TRANSPARENT_EVAL_MAX_NEW_TOKENS", "128"))
-        self.temperature = float(os.environ.get("OCRVL_TRANSPARENT_EVAL_TEMPERATURE", "0.0"))
-        self.limit = os.environ.get("OCRVL_TRANSPARENT_EVAL_LIMIT", "")
+        self.samples_path = os.environ.get("TRANSPARENT_EVAL_SAMPLES", "")
+        self.max_new_tokens = int(os.environ.get("TRANSPARENT_EVAL_MAX_NEW_TOKENS", "128"))
+        self.temperature = float(os.environ.get("TRANSPARENT_EVAL_TEMPERATURE", "0.0"))
+        self.limit = os.environ.get("TRANSPARENT_EVAL_LIMIT", "")
         self.repo_root = os.environ.get("OCRVL_REPO_ROOT", "/share/project/xiyan/sources/DeepSeek-OCR")
 
         logger.info(f"[TransparentEval] Initialized - will auto-enable when eval_dataset='ocrvl_transparent_eval'")
@@ -296,6 +296,13 @@ class TransparentEvalCallback(TrainerCallback):
                     continue
 
                 mm_inputs = image_processor(images, return_tensors="pt")
+
+                # Validate that image processing succeeded
+                if mm_inputs is None or 'pixel_values' not in mm_inputs or mm_inputs['pixel_values'] is None:
+                    if is_main:
+                        logger.warning(f"[TransparentEval] Image processor returned None for sample {sample.get('id', 'unknown')}")
+                    continue
+
                 image_grid_thw = mm_inputs.get("image_grid_thw")
                 merge_length = getattr(image_processor, "merge_size", 2) ** 2
 
@@ -345,6 +352,7 @@ class TransparentEvalCallback(TrainerCallback):
             except Exception as e:
                 if is_main:
                     logger.warning(f"[TransparentEval] Failed to prepare sample {sample.get('id', 'unknown')}: {e}")
+                    logger.debug(f"[TransparentEval] Preparation traceback:\n{traceback.format_exc()}")
                 continue
 
         prep_time = time.time() - prep_start
@@ -363,6 +371,12 @@ class TransparentEvalCallback(TrainerCallback):
                         is_dummy = inputs.get('is_dummy', False)
 
                         try:
+                            # Validate inputs before generation
+                            if inputs.get('pixel_values') is None:
+                                if is_main:
+                                    logger.warning(f"[TransparentEval] pixel_values is None for sample {inputs['sample'].get('id', 'unknown')}, skipping")
+                                continue
+
                             outputs = inference_model.generate(
                                 input_ids=inputs['input_ids'],
                                 pixel_values=inputs['pixel_values'],
@@ -405,11 +419,18 @@ class TransparentEvalCallback(TrainerCallback):
                         except Exception as e:
                             if is_main:
                                 logger.warning(f"[TransparentEval] Failed to generate for sample {inputs['sample'].get('id', 'unknown')}: {e}")
+                                logger.debug(f"[TransparentEval] Full traceback:\n{traceback.format_exc()}")
                             continue
             else:
                 for i, inputs in enumerate(prepared_inputs):
                     is_dummy = inputs.get('is_dummy', False)
                     try:
+                        # Validate inputs before generation
+                        if inputs.get('pixel_values') is None:
+                            if is_main:
+                                logger.warning(f"[TransparentEval] pixel_values is None for sample {inputs['sample'].get('id', 'unknown')}, skipping")
+                            continue
+
                         outputs = inference_model.generate(
                             input_ids=inputs['input_ids'],
                             pixel_values=inputs['pixel_values'],
@@ -452,6 +473,7 @@ class TransparentEvalCallback(TrainerCallback):
                     except Exception as e:
                         if is_main:
                             logger.warning(f"[TransparentEval] Failed to generate for sample {inputs['sample'].get('id', 'unknown')}: {e}")
+                            logger.debug(f"[TransparentEval] Full traceback:\n{traceback.format_exc()}")
                         continue
 
         # Restore training mode and gradient checkpointing

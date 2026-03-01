@@ -2,7 +2,12 @@ import os
 import pandas as pd
 import numpy as np
 from typing import Dict, Any
-from common_utils import download_file, md5, toliststr, decode_base64_to_image_file
+try:
+    # When imported as a package module (e.g. MathVision.dataset_utils).
+    from .common_utils import download_file, md5, toliststr, decode_base64_to_image_file
+except ImportError:
+    # When executed from within the MathVision folder (e.g. run_mathv.py imports dataset_utils).
+    from common_utils import download_file, md5, toliststr, decode_base64_to_image_file
 
 # MathVision dataset URLs and MD5
 MATHVISION_DATASET_URL = {

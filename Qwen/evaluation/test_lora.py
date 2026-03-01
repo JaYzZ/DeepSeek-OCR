@@ -15,7 +15,8 @@ import sys
 import torch
 from vllm import LLM, SamplingParams
 from transformers import AutoProcessor
-from qwen_vl_utils import process_vision_info
+
+# Note: Image preprocessing now handled by vLLM internally
 
 def test_inference(model_path, lora_path=None, lora_name="default"):
     """Test basic inference with or without LoRA."""
@@ -68,25 +69,38 @@ def test_inference(model_path, lora_path=None, lora_name="default"):
         ]
     }]
 
-    # Prepare inputs for vLLM
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    image_inputs, video_inputs, video_kwargs = process_vision_info(
-        messages,
-        image_patch_size=processor.image_processor.patch_size,
-        return_video_kwargs=True,
-        return_video_metadata=True
-    )
+    # Prepare inputs for vLLM - let vLLM handle everything (official approach)
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    text = text + "<|im_start|>assistant\n"
+
+    # Extract raw images from messages - let vLLM handle preprocessing
+    raw_images = []
+    raw_videos = []
+
+    for item in messages[0].get('content', []):
+        if isinstance(item, dict):
+            if item.get('type') == 'image':
+                raw_images.append(item['image'])  # Can be path, PIL image, or base64
+            elif item.get('type') == 'video':
+                raw_videos.append(item['video'])
+
+    # Get min/max pixels from processor
+    min_pixels = getattr(processor.image_processor, 'min_pixels', 28 * 28 * 256)
+    max_pixels = getattr(processor.image_processor, 'max_pixels', 28 * 28 * 2048)
 
     mm_data = {}
-    if image_inputs is not None:
-        mm_data['image'] = image_inputs
-    if video_inputs is not None:
-        mm_data['video'] = video_inputs
+    if raw_images:
+        mm_data['image'] = raw_images
+    if raw_videos:
+        mm_data['video'] = raw_videos
 
     inputs = [{
         'prompt': text,
         'multi_modal_data': mm_data,
-        'mm_processor_kwargs': video_kwargs
+        'mm_processor_kwargs': {
+            'min_pixels': min_pixels,
+            'max_pixels': max_pixels,
+        }
     }]
 
     # Sampling params
@@ -102,7 +116,7 @@ def test_inference(model_path, lora_path=None, lora_name="default"):
         lora_request = LoRARequest(
             lora_name=lora_name,
             lora_int_id=1,
-            lora_local_path=lora_path,
+            lora_path=lora_path,
         )
         print(f"Testing inference with LoRA: {lora_name}\n")
     else:

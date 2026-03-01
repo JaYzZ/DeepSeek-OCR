@@ -8,6 +8,9 @@ from tqdm import tqdm
 from typing import List, Dict, Any
 from collections import defaultdict, OrderedDict
 import torch
+import requests
+import concurrent.futures
+import random
 
 # Add parent directory to path to import shared config
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,7 +26,7 @@ try:
 except ImportError:
     HAS_LORA_REQUEST = False
     LoRARequest = None
-from qwen_vl_utils import process_vision_info
+# Note: Image preprocessing now handled by vLLM internally
 from transformers import AutoProcessor
 
 # pycocotools imports
@@ -31,44 +34,70 @@ from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
 # Local imports from refactored files
-from dataset_utils import load_odinw_config, generate_odinw_jobs
-from eval_utils import compute_metrics
+try:
+    from .dataset_utils import load_odinw_config, generate_odinw_jobs
+    from .eval_utils import compute_metrics
+except ImportError:
+    from dataset_utils import load_odinw_config, generate_odinw_jobs
+    from eval_utils import compute_metrics
 
 # Set vLLM multiprocessing method
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 
 
 def prepare_inputs_for_vllm(messages, processor):
-    """Prepare inputs for vLLM."""
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    
-    # qwen_vl_utils 0.0.14+ required
-    image_inputs, video_inputs, video_kwargs = process_vision_info(
-        messages,
-        image_patch_size=processor.image_processor.patch_size,
-        return_video_kwargs=True,
-        return_video_metadata=True
-    )
-    
+    """
+    Prepare inputs for vLLM - let vLLM handle everything (official approach).
+    """
+
+    # Apply chat template to get prompt with proper placeholders
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    text = text + "<|im_start|>assistant\n"
+
+    # Extract raw images from messages - let vLLM handle preprocessing
+    raw_images = []
+    raw_videos = []
+
+    for item in messages[0].get('content', []):
+        if isinstance(item, dict):
+            if item.get('type') == 'image':
+                raw_images.append(item['image'])  # Can be path, PIL image, or base64
+            elif item.get('type') == 'video':
+                raw_videos.append(item['video'])
+
+    # Get min/max pixels from processor
+    min_pixels = getattr(processor.image_processor, 'min_pixels', 28 * 28 * 256)
+    max_pixels = getattr(processor.image_processor, 'max_pixels', 28 * 28 * 2048)
+
     mm_data = {}
-    if image_inputs is not None:
-        mm_data['image'] = image_inputs
-    if video_inputs is not None:
-        mm_data['video'] = video_inputs
-    
+    if raw_images:
+        mm_data['image'] = raw_images
+    if raw_videos:
+        mm_data['video'] = raw_videos
+
     return {
         'prompt': text,
         'multi_modal_data': mm_data,
-        'mm_processor_kwargs': video_kwargs
+        'mm_processor_kwargs': {
+            'min_pixels': min_pixels,
+            'max_pixels': max_pixels,
+        }
     }
 
 
 def run_inference(args):
-    """Run inference on the ODinW dataset using vLLM."""
+    """Run inference on the ODinW dataset using vLLM or external API server."""
+    # Check for server inference mode
+    api_url = getattr(args, 'api_url', None) or os.environ.get('LOCAL_API_URL')
+
     print("\n" + "="*80)
-    print("🚀 ODinW Inference with vLLM (High-Speed Mode)")
+    if api_url:
+        print("🚀 ODinW Inference with External API Server")
+        print(f"   API URL: {api_url}")
+    else:
+        print("🚀 ODinW Inference with vLLM (High-Speed Mode)")
     print("="*80 + "\n")
-    
+
     # Generate task list (sampling is now handled inside generate_odinw_jobs at image level)
     question_list, datasets = generate_odinw_jobs(args.data_dir, args)
     print(f"✓ Generated {len(question_list)} inference jobs\n")
@@ -94,92 +123,160 @@ def run_inference(args):
     print(f"   presence_penalty={sampling_params.presence_penalty}")
     print()
     
-    # Load processor
-    print(f"Loading processor from {args.model_path}")
-    processor = AutoProcessor.from_pretrained(args.model_path)
-    print("✓ Processor loaded\n")
-    
-    # Initialize vLLM
-    print(f"Initializing vLLM with model: {args.model_path}")
-    print(f"   GPU count: {torch.cuda.device_count()}")
-    print(f"   Tensor parallel size: {args.tensor_parallel_size}")
-
-    # Build LLM kwargs
-    llm_kwargs = {
-        "model": args.model_path,
-        "tensor_parallel_size": args.tensor_parallel_size,
-        "gpu_memory_utilization": args.gpu_memory_utilization,
-        "trust_remote_code": True,
-        "max_model_len": args.max_model_len,
-        "limit_mm_per_prompt": {"image": args.max_images_per_prompt},
-        "seed": 42,
-    }
-
-    # Add LoRA parameters if enabled
-    if hasattr(args, 'enable_lora') and args.enable_lora and args.lora_path:
-        llm_kwargs["enable_lora"] = True
-        llm_kwargs["max_lora_rank"] = args.max_lora_rank
-        llm_kwargs["max_loras"] = 1
-        # Note: LoRA modules loaded dynamically via LoRARequest during generate()
-        print(f"   LoRA enabled: {args.lora_name} from {args.lora_path}")
-
-    llm = LLM(**llm_kwargs)
-    print("✓ vLLM initialized successfully\n")
-    
-    # Prepare all inputs
-    print("Preparing inputs for vLLM...")
-    all_inputs = []
-    
-    for item in tqdm(question_list, desc="Building prompts"):
-        vllm_input = prepare_inputs_for_vllm(item['messages'], processor)
-        all_inputs.append(vllm_input)
-    
-    print(f"✓ Prepared {len(all_inputs)} inputs\n")
-    
-    # Batch inference
-    print("="*80)
-    print("🚀 Running vLLM batch inference")
-    print("="*80)
+    results = []
     start_time = time.time()
 
-    # Prepare LoRA request if LoRA is enabled
-    lora_request = None
-    if HAS_LORA_REQUEST and hasattr(args, 'enable_lora') and args.enable_lora and args.lora_path:
-        lora_request = LoRARequest(
-            lora_name=args.lora_name,
-            lora_int_id=1,
-            lora_local_path=args.lora_path,
-        )
-        print(f"   Using LoRA: {args.lora_name}")
+    if api_url:
+        # External server mode: do NOT initialize vLLM locally (GPUs are already occupied by the server).
+        api_concurrency = max(1, int(getattr(args, "api_concurrency", 16) or 16))
+        print(f"Using external API server (concurrency={api_concurrency})")
 
-    outputs = llm.generate(all_inputs, sampling_params=sampling_params, lora_request=lora_request)
+        def normalize_messages(messages):
+            # Strip file:// from local paths for better compatibility with server preprocessing.
+            norm = []
+            for msg in messages:
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    new_content = []
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") in ("image", "video"):
+                            key = "image" if item.get("type") == "image" else "video"
+                            val = item.get(key)
+                            if isinstance(val, str) and val.startswith("file://"):
+                                item = dict(item)
+                                item[key] = val[len("file://"):]
+                        new_content.append(item)
+                    norm.append({"role": msg.get("role", "user"), "content": new_content})
+                else:
+                    norm.append({"role": msg.get("role", "user"), "content": content})
+            return norm
+
+        def call_api(item):
+            payload = {
+                "messages": normalize_messages(item["messages"]),
+                "max_tokens": int(args.max_new_tokens),
+                "temperature": float(args.temperature),
+                "top_p": float(args.top_p),
+                "presence_penalty": float(args.presence_penalty),
+                "repetition_penalty": float(args.repetition_penalty),
+            }
+            last_err = None
+            for attempt in range(3):
+                try:
+                    resp = requests.post(api_url, json=payload, timeout=300)
+                    if resp.status_code != 200:
+                        last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                        raise RuntimeError(last_err)
+                    data = resp.json()
+                    text = data["choices"][0]["message"]["content"]
+                    return item["question_id"], text, None
+                except Exception as e:
+                    last_err = str(e)
+                    time.sleep((2 ** attempt) + random.random())
+            return item["question_id"], None, last_err
+
+        results_by_qid = {}
+        if api_concurrency == 1:
+            for item in tqdm(question_list, desc="ODinW infer (api)"):
+                qid, text, err = call_api(item)
+                if err is not None:
+                    print(f"Error for question_id {qid}: {err}")
+                    continue
+                results_by_qid[qid] = text
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=api_concurrency) as ex:
+                futs = [ex.submit(call_api, item) for item in question_list]
+                for fut in tqdm(concurrent.futures.as_completed(futs), total=len(futs), desc="ODinW infer (api)"):
+                    qid, text, err = fut.result()
+                    if err is not None:
+                        print(f"Error for question_id {qid}: {err}")
+                        continue
+                    results_by_qid[qid] = text
+
+        for item in question_list:
+            qid = item["question_id"]
+            if qid not in results_by_qid:
+                continue
+            response = results_by_qid[qid]
+            response_final = str(response).split("</think>")[-1].strip()
+            results.append({
+                "question_id": qid,
+                "annotation": item["annotation"],
+                "extra_info": item["extra_info"],
+                "result": {"gen": response_final, "gen_raw": response},
+                "messages": item["messages"],
+            })
+    else:
+        # Local vLLM mode.
+        print(f"Loading processor from {args.model_path}")
+        processor = AutoProcessor.from_pretrained(args.model_path)
+        print("✓ Processor loaded\n")
+
+        print(f"Initializing vLLM with model: {args.model_path}")
+        print(f"   GPU count: {torch.cuda.device_count()}")
+        print(f"   Tensor parallel size: {args.tensor_parallel_size}")
+
+        llm_kwargs = {
+            "model": args.model_path,
+            "tensor_parallel_size": args.tensor_parallel_size,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
+            "trust_remote_code": True,
+            "max_model_len": args.max_model_len,
+            "limit_mm_per_prompt": {"image": args.max_images_per_prompt},
+            "seed": 42,
+        }
+
+        if hasattr(args, 'enable_lora') and args.enable_lora and args.lora_path:
+            llm_kwargs["enable_lora"] = True
+            llm_kwargs["max_lora_rank"] = args.max_lora_rank
+            llm_kwargs["max_loras"] = 1
+            print(f"   LoRA enabled: {args.lora_name} from {args.lora_path}")
+
+        llm = LLM(**llm_kwargs)
+        print("✓ vLLM initialized successfully\n")
+
+        print("Preparing inputs for vLLM...")
+        all_inputs = []
+        for item in tqdm(question_list, desc="Building prompts"):
+            vllm_input = prepare_inputs_for_vllm(item['messages'], processor)
+            all_inputs.append(vllm_input)
+        print(f"✓ Prepared {len(all_inputs)} inputs\n")
+
+        print("="*80)
+        print("🚀 Running vLLM batch inference")
+        print("="*80)
+
+        lora_request = None
+        if HAS_LORA_REQUEST and hasattr(args, 'enable_lora') and args.enable_lora and args.lora_path:
+            lora_request = LoRARequest(
+                lora_name=args.lora_name,
+                lora_int_id=1,
+                lora_local_path=args.lora_path,
+            )
+            print(f"   Using LoRA: {args.lora_name}")
+
+        outputs = llm.generate(all_inputs, sampling_params=sampling_params, lora_request=lora_request)
+
+        for item, output in zip(question_list, outputs):
+            response = output.outputs[0].text
+            response_final = str(response).split("</think>")[-1].strip()
+            results.append({
+                "question_id": item["question_id"],
+                "annotation": item["annotation"],
+                "extra_info": item["extra_info"],
+                "result": {"gen": response_final, "gen_raw": response},
+                "messages": item["messages"],
+            })
 
     end_time = time.time()
     total_time = end_time - start_time
-    print(f"\n✓ Inference completed in {total_time:.2f} seconds")
-    print(f"  Average: {total_time/len(question_list):.2f} seconds/sample")
-    print(f"  Throughput: {len(question_list)/total_time:.2f} samples/second\n")
+    if results:
+        print(f"\n✓ Inference completed in {total_time:.2f} seconds")
+        print(f"  Average: {total_time/len(results):.2f} seconds/sample")
+        print(f"  Throughput: {len(results)/total_time:.2f} samples/second\n")
     
     # Save results
     print("Saving results...")
-    results = []
-    
-    for idx, (item, output) in enumerate(zip(question_list, outputs)):
-        response = output.outputs[0].text
-        
-        # Handle </think> tag
-        response_final = str(response).split("</think>")[-1].strip()
-        
-        result = {
-            "question_id": item['question_id'],
-            "annotation": item['annotation'],
-            "extra_info": item['extra_info'],
-            "result": {"gen": response_final, "gen_raw": response},
-            "messages": item['messages']
-        }
-        results.append(result)
-    
-    # Save results
     with open(args.output_file, 'w') as f:
         for res in results:
             f.write(json.dumps(res) + '\n')
@@ -345,7 +442,8 @@ def run_evaluation(args):
                 if len(data.get("bbox_2d", [])) != 4:
                     continue
                 pred_bboxes.append(data["bbox_2d"])
-                pred_labels.append(data["label"])
+                # Some models omit the label field; fall back to the known category for this job.
+                pred_labels.append(data.get("label") or job.get("extra_info", {}).get("category_name", ""))
 
             if len(pred_bboxes) == 0:
                 empty_predictions += 1
@@ -576,6 +674,12 @@ def main():
                              help="Limit inference to N samples (deterministic sampling)")
 
     # vLLM specific parameters
+    # Server inference parameters
+    infer_parser.add_argument("--api-url", type=str, default=None,
+                            help="Use external API server for inference (e.g., http://localhost:8016/v1/chat/completions)")
+    infer_parser.add_argument("--api-concurrency", type=int, default=32,
+                            help="Concurrent in-flight requests when using --api-url (default: 32)")
+
     infer_parser.add_argument("--tensor-parallel-size", type=int, default=None,
                             help="Tensor parallel size (default: number of GPUs)")
     infer_parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
@@ -639,4 +743,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

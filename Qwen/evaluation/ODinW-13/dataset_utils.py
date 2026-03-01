@@ -238,7 +238,8 @@ def generate_odinw_jobs(data_dir: str, args) -> Tuple[List[Dict], Dict]:
                     "content": [
                         {
                             "type": "image",
-                            "image": f"file://{img_path}",
+                            # Use a plain filesystem path for local images (more compatible than file:// URIs).
+                            "image": img_path,
                             "min_pixels": min_pixels,
                             "max_pixels": max_pixels
                         },
@@ -275,4 +276,3 @@ def generate_odinw_jobs(data_dir: str, args) -> Tuple[List[Dict], Dict]:
     print(f"Total ODinW questions: {len(question_list)}")
     
     return question_list, datasets
-

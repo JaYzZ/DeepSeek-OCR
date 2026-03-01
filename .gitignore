@@ -31,6 +31,12 @@ outputs/
 *.temp
 .DS_Store
 
+# pip install development mode artifacts
+*.egg-info/
+dist/
+build/
+*.whl
+
 # Model checkpoints (optional - uncomment if needed)
 # *.bin
 # *.safetensors
@@ -58,3 +64,4 @@ swanlog/*
 Qwen/results/*
 Qwen/evaluation/data/*
 *.tsv
+.vscode/launch.json

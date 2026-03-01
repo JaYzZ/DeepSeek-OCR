@@ -1,129 +1,206 @@
 #!/usr/bin/env python3
 """
-Backfill transparent evaluation for existing training checkpoints.
+Backfill transparent evaluation for existing training checkpoints using vLLM with LoRA.
 
-This script loads a checkpoint WITHOUT FSDP and runs transparent eval,
-then saves results back to the checkpoint directory. Use this to recover
-eval_results for checkpoints that didn't have transparent eval enabled
-during training.
-
-Usage:
-    # Backfill latest checkpoint
-    python Qwen/scripts/backfill_transparent_eval.py --checkpoint_dir Qwen/checkpoints/qwen3vl-2b/lora/r1_onevision_thinking
-
-    # Backfill specific checkpoint
-    python Qwen/scripts/backfill_transparent_eval.py --checkpoint_dir ... --checkpoint run_20260208_192913
-
-    # Quick test on 5 samples
-    python Qwen/scripts/backfill_transparent_eval.py --checkpoint_dir ... --max_samples 5
+This script loads the base model with vLLM and applies LoRA dynamically via LoRARequest,
+matching the approach used in Qwen/evaluation/run_all_benchmarks.py.
 """
 import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
-import torch
-from PIL import Image
-from transformers import AutoModelForVision2Seq, AutoProcessor
+from PIL import Image, ImageFont, ImageDraw
+from transformers import AutoProcessor, AutoTokenizer
+from vllm import LLM, SamplingParams
+from vllm.v1.engine import LoRARequest
 
-# Add repo root to path
 _REPO_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
 def find_latest_checkpoint(checkpoint_dir: Path) -> Path:
-    """Find the latest checkpoint subdirectory."""
-    # First, check if this is a valid model directory directly
-    config_files = list(checkpoint_dir.glob("config.json")) + list(checkpoint_dir.glob("model_config.json"))
-    if config_files:
-        return checkpoint_dir
-
-    # Look for run_* subdirectories
-    checkpoints = list(checkpoint_dir.glob("run_*/"))
-    if not checkpoints:
-        checkpoints = list(checkpoint_dir.glob("checkpoint-*"))
-
-    if not checkpoints:
-        # If still no checkpoints, assume checkpoint_dir is the model path
-        return checkpoint_dir
-
-    # Sort by modification time
-    checkpoints.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return checkpoints[0]
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+    run_dirs = [d for d in checkpoint_dir.iterdir() if d.is_dir() and d.name.startswith('run_')]
+    if not run_dirs:
+        raise FileNotFoundError(f"No run directories found in {checkpoint_dir}")
+    latest_run = max(run_dirs, key=lambda d: d.stat().st_mtime)
+    checkpoint_dirs = [d for d in latest_run.iterdir() if d.is_dir() and d.name.startswith('checkpoint-')]
+    if not checkpoint_dirs:
+        raise FileNotFoundError(f"No checkpoints found in {latest_run}")
+    return max(checkpoint_dirs, key=lambda d: int(d.name.split('-')[1]))
 
 
-def load_model(checkpoint_path: Path, device: str = "cuda"):
-    """Load model checkpoint WITHOUT FSDP wrapping."""
-    logger.info(f"Loading model from {checkpoint_path}...")
+def load_model_vllm(checkpoint_path: Path, tensor_parallel_size: int = 1, gpu_memory_utilization: float = 0.8):
+    """Load model with vLLM - handles LoRA detection and setup."""
 
-    model = AutoModelForVision2Seq.from_pretrained(
-        checkpoint_path,
-        torch_dtype=torch.bfloat16,
-        device_map=device,
-        trust_remote_code=True,
+    # Official base model path - LoRA trained on Linear is transferable to official model
+    OFFICIAL_BASE_MODEL = "/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking"
+
+    # Check for LoRA adapter
+    adapter_config_path = checkpoint_path / "adapter_config.json"
+    base_model_path = None
+    lora_path = None
+
+    if adapter_config_path.exists():
+        with open(adapter_config_path) as f:
+            adapter_config = json.load(f)
+        # Use official base model (LoRA is transferable)
+        base_model_path = OFFICIAL_BASE_MODEL
+        lora_path = str(checkpoint_path)
+        logger.info(f"Detected LoRA adapter. Using official base model: {base_model_path}")
+        logger.info(f"LoRA path: {lora_path}")
+    else:
+        base_model_path = str(checkpoint_path)
+        logger.info(f"Loading base model from {base_model_path}")
+
+    # ============================================================================
+    # CRITICAL: Add special tokens for latent thinking BEFORE loading vLLM
+    # Also enable auto-patch for worker processes
+    # ============================================================================
+
+    # Enable auto-patch so worker processes will apply the thinking mode patch
+    os.environ["VLLM_THINKING_AUTO_PATCH"] = "1"
+
+    # Load tokenizer and add special tokens
+    tokenizer_with_special_tokens = AutoTokenizer.from_pretrained(
+        base_model_path, trust_remote_code=True
     )
 
-    processor = AutoProcessor.from_pretrained(checkpoint_path, trust_remote_code=True)
+    # Add <latent> and <think_sep> as special tokens
+    special_tokens = ["<latent>", "<think_sep>"]
+    added_count = 0
+    for token in special_tokens:
+        encoded = tokenizer_with_special_tokens.encode(token, add_special_tokens=False)
+        if len(encoded) > 1:
+            num_added = tokenizer_with_special_tokens.add_special_tokens(
+                {"additional_special_tokens": [token]},
+                replace_additional_special_tokens=False
+            )
+            added_count += num_added
 
-    logger.info(f"Model loaded: {type(model).__name__}")
-    return model, processor
+    if added_count > 0:
+        logger.info(f"Added {added_count} special thinking tokens to tokenizer:")
+        for token in special_tokens:
+            token_id = tokenizer_with_special_tokens.convert_tokens_to_ids(token)
+            logger.info(f"  {token} -> ID {token_id}")
+            # Set environment variables for vLLM thinking mode
+            if token == "<latent>":
+                os.environ["QWEN3VL_LATENT_TOKEN_ID"] = str(token_id)
+            elif token == "<think_sep>":
+                os.environ["QWEN3VL_THINKING_SEP_ID"] = str(token_id)
+
+    # Enable vLLM thinking plugin
+    os.environ["VLLM_THINKING_MODE_ENABLED"] = "1"
+
+    # Initialize vLLM
+    llm_kwargs = {
+        "model": base_model_path,
+        "tensor_parallel_size": tensor_parallel_size,
+        "gpu_memory_utilization": gpu_memory_utilization,
+        "trust_remote_code": True,
+        "enforce_eager": True,  # Required for thinking mode
+        "disable_log_stats": True,
+    }
+
+    if lora_path:
+        llm_kwargs["enable_lora"] = True
+        llm_kwargs["max_lora_rank"] = 64
+        llm_kwargs["max_loras"] = 1
+
+    llm = LLM(**llm_kwargs)
+    tokenizer = llm.get_tokenizer()
+
+    # Load processor separately (tokenizer doesn't have image_processor)
+    processor = AutoProcessor.from_pretrained(base_model_path, trust_remote_code=True)
+
+    logger.info(f"Model loaded with vLLM (thinking mode enabled)")
+    return llm, tokenizer, processor, lora_path
 
 
-def run_evaluation(model, processor, eval_metadata: Path, max_samples: int = None):
-    """Run transparent evaluation on loaded model."""
-    # Load metadata
+def run_evaluation(llm, tokenizer, processor, eval_metadata: Path, lora_path: str = None, max_samples: int = None, repo_root: Path = None):
+    if repo_root is None:
+        repo_root = _REPO_ROOT
+
+    # Load metadata - support both JSON (with samples array) and JSONL format
     with open(eval_metadata, 'r') as f:
-        metadata = json.load(f)
-
-    samples = metadata['samples'][:max_samples] if max_samples else metadata['samples']
+        first_char = f.read(1)
+        f.seek(0)
+        if first_char == '[':
+            # JSON format with samples array directly
+            samples = json.load(f)
+            samples = samples[:max_samples] if max_samples else samples
+        else:
+            # JSON format with samples key OR JSONL format
+            try:
+                metadata = json.load(f)
+                if isinstance(metadata, dict) and 'samples' in metadata:
+                    samples = metadata['samples'][:max_samples] if max_samples else metadata['samples']
+                else:
+                    raise ValueError("Unknown JSON format")
+            except json.JSONDecodeError:
+                # JSONL format - each line is a sample
+                f.seek(0)
+                samples = []
+                for line in f:
+                    if line.strip():
+                        samples.append(json.loads(line.strip()))
+                samples = samples[:max_samples] if max_samples else samples
 
     logger.info(f"Running transparent eval on {len(samples)} samples...")
 
-    # Load full samples from JSONL to get ground_truth
+    # Build full_samples dict from samples for ground_truth lookup
     full_samples = {}
-    jsonl_path = eval_metadata.parent / "ocrvl_transparent_eval.jsonl"
-    if jsonl_path.exists():
-        with open(jsonl_path, 'r') as f:
-            for line in f:
-                sample = json.loads(line.strip())
-                sample_id = sample.get('id')
-                if sample_id:
-                    if 'ground_truth' not in sample:
-                        for msg in sample.get('messages', []):
-                            if msg.get('role') == 'assistant':
-                                sample['ground_truth'] = msg.get('content', '')
-                                break
-                    full_samples[sample_id] = sample
-
-    # Merge ground_truth
     for sample in samples:
         sample_id = sample.get('id')
-        if sample_id in full_samples:
-            if 'ground_truth' not in sample or not sample['ground_truth']:
-                sample['ground_truth'] = full_samples[sample_id].get('ground_truth', '')
+        if sample_id:
+            # Extract ground_truth from assistant message
+            if 'ground_truth' not in sample or not sample.get('ground_truth'):
+                for msg in sample.get('messages', []):
+                    if msg.get('role') == 'assistant':
+                        gt_content = msg.get('content', '')
+                        # Filter out thinking tags
+                        if "<think>" in gt_content and "</think>" in gt_content:
+                            gt_content = gt_content.split("</think>", 1)[-1].strip()
+                        if gt_content and gt_content != "Let me analyze this math problem step by step.":
+                            sample['ground_truth'] = gt_content
+                        break
+            full_samples[sample_id] = sample
 
-    # Run generation
     results = []
     start_time = time.time()
 
-    for i, sample in enumerate(samples):
-        sample_start = time.time()
+    # Prepare LoRA request if LoRA is enabled
+    lora_request = None
+    lora_name = "backfill_lora"
+    if lora_path:
+        lora_request = LoRARequest(
+            lora_name=lora_name,
+            lora_int_id=1,
+            lora_path=lora_path,
+        )
+        logger.info(f"Using LoRA: {lora_name} from {lora_path}")
 
+    # ============ BATCH MODE: Pre-process all samples first ============
+    logger.info(f"Pre-processing {len(samples)} samples for batch inference...")
+    batch_inputs = []
+    valid_indices = []
+
+    for i, sample in enumerate(samples):
         try:
             # Load images
             images = []
             for img_path in sample['images']:
-                full_path = _REPO_ROOT / img_path
+                full_path = repo_root / img_path
                 if full_path.exists():
                     images.append(Image.open(full_path).convert('RGB'))
                 else:
@@ -134,94 +211,136 @@ def run_evaluation(model, processor, eval_metadata: Path, max_samples: int = Non
                 logger.warning(f"Expected 1 or 2 images, got {len(images)}")
                 continue
 
-            # Process images
-            image_processor = processor.image_processor
-            mm_inputs = image_processor(images, return_tensors="pt")
+            # Extract instruction from messages (user message content)
+            instruction_text = ""
+            if 'messages' in sample and isinstance(sample['messages'], list):
+                user_msg = next((m for m in sample['messages'] if m.get('role') == 'user'), None)
+                if user_msg:
+                    content = user_msg.get('content', '')
+                    if isinstance(content, str):
+                        # Extract text, removing <image> markers
+                        instruction_text = content.replace('<image>', '').strip()
+                    elif isinstance(content, list):
+                        # Multi-modal format: list of {"type": "text/image", ...}
+                        for item in content:
+                            if item.get('type') == 'text':
+                                instruction_text = item.get('text', '').replace('<image>', '').strip()
+                                break
+            if not instruction_text:
+                instruction_text = "Describe the image."
 
-            # Calculate vision placeholders
-            image_grid_thw = mm_inputs.get("image_grid_thw")
-            merge_length = getattr(image_processor, "merge_size", 2) ** 2
+            # Extract ground_truth from assistant message
+            ground_truth = ""
+            if 'messages' in sample and isinstance(sample['messages'], list):
+                assistant_msg = next((m for m in sample['messages'] if m.get('role') == 'assistant'), None)
+                if assistant_msg:
+                    gt_content = assistant_msg.get('content', '')
+                    if isinstance(gt_content, str):
+                        # Filter out thinking tags for ground truth
+                        if "<think>" in gt_content and "</think>" in gt_content:
+                            gt_content = gt_content.split("</think>", 1)[-1].strip()
+                        if gt_content and gt_content != "Let me analyze this math problem step by step.":
+                            ground_truth = gt_content
 
-            vision_placeholders = []
-            for j in range(len(images)):
-                if image_grid_thw is not None:
-                    image_seqlen = image_grid_thw[j].prod().item() // merge_length
-                else:
-                    image_seqlen = 100
-                placeholder = "<|vision_start|>" + "<|image_pad|>" * image_seqlen + "<|vision_end|>"
-                vision_placeholders.append(placeholder)
+            # Build conversation for vLLM - let vLLM handle everything
+            # Use official vLLM format: prompt with image placeholders, raw images passed directly
+            messages = [{"role": "user", "content": []}]
 
-            # Build conversation
-            instruction_text = sample.get('instruction', 'Describe the image:').replace('<image>', '').strip()
+            # Add images with proper placeholder
+            for idx, img in enumerate(images):
+                messages[0]["content"].append({"type": "image", "image": img})
 
-            if len(images) == 1:
-                user_content = instruction_text + " " + vision_placeholders[0]
-            else:
-                user_content = instruction_text + " " + vision_placeholders[0] + vision_placeholders[1]
+            # Add text instruction
+            messages[0]["content"].append({"type": "text", "text": instruction_text})
 
-            conversation = [{"role": "user", "content": user_content}]
+            # Apply chat template to get prompt with proper placeholders
+            # This will insert <|vision_start|><|image_pad|><|vision_end|> for each image
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            text = text + "<|im_start|>assistant\n"
 
-            # Tokenize
-            tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
-            text = tokenizer.apply_chat_template(
-                conversation,
-                tokenize=False,
-                add_generation_prompt=True
-            )
-            text_inputs = tokenizer(
-                text,
-                return_tensors="pt",
-                padding=False,
-                add_special_tokens=False
-            )
+            # Get min/max pixels from processor for vLLM image processing
+            min_pixels = getattr(processor.image_processor, 'min_pixels', 28 * 28 * 256)
+            max_pixels = getattr(processor.image_processor, 'max_pixels', 28 * 28 * 2048)
 
-            # Move to device
-            device = next(model.parameters()).device
-            input_ids = text_inputs['input_ids'].to(device)
-            attention_mask = text_inputs['attention_mask'].to(device)
-            pixel_values = mm_inputs['pixel_values'].to(device=device, dtype=torch.bfloat16)
-            image_grid_thw = mm_inputs['image_grid_thw'].to(device)
+            # Pass RAW images directly - let vLLM handle everything
+            mm_data = {}
+            if images:
+                mm_data['image'] = images  # Raw PIL images
 
-            # Generate
-            with torch.no_grad():
-                outputs = model.generate(
-                    input_ids=input_ids,
-                    pixel_values=pixel_values,
-                    image_grid_thw=image_grid_thw,
-                    attention_mask=attention_mask,
-                    max_new_tokens=512,
-                    do_sample=False,
-                )
-
-            # Decode
-            input_len = input_ids.shape[1]
-            generated_ids = outputs[0][input_len:].tolist()
-            full_output = tokenizer.decode(generated_ids, skip_special_tokens=False).strip()
-
-            # Extract display output (strip thinking tags)
-            display_output = full_output
-            if "</think>" in display_output:
-                display_output = display_output.split("</think>", 1)[-1].strip()
-            display_output = display_output.replace("<think>", "").replace("</think>", "").strip()
-
-            sample_elapsed = time.time() - sample_start
-            logger.info(f"[{i+1}/{len(samples)}] {sample['id']} ({sample_elapsed:.1f}s): {display_output[:60]}...")
-
-            results.append({
-                'id': sample['id'],
-                'task': sample['task'],
-                'images': sample['images'],
-                'instruction': sample.get('instruction', ''),
-                'ground_truth': sample.get('ground_truth', ''),
-                'generated_answer': full_output if full_output else "[EMPTY]",
-                'generated_answer_display': display_output if display_output else "[EMPTY]",
+            batch_inputs.append({
+                'prompt': text,
+                'multi_modal_data': mm_data,
+                'mm_processor_kwargs': {
+                    'min_pixels': min_pixels,
+                    'max_pixels': max_pixels,
+                },
+                'sample': sample,
+                'instruction_text': instruction_text,
+                'ground_truth': ground_truth,
             })
+            valid_indices.append(i)
 
         except Exception as e:
-            logger.warning(f"Failed to process sample {sample.get('id', 'unknown')}: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.warning(f"Failed to pre-process sample {sample.get('id', 'unknown')}: {e}")
             continue
+
+    logger.info(f"Pre-processed {len(batch_inputs)}/{len(samples)} samples")
+
+    # ============ BATCH INFERENCE: All at once ============
+    if not batch_inputs:
+        logger.warning("No valid samples to process")
+        return results
+
+    # Prepare batch inputs for vLLM
+    llm_inputs = [
+        {
+            'prompt': inp['prompt'],
+            'multi_modal_data': inp['multi_modal_data'],
+            'mm_processor_kwargs': inp['mm_processor_kwargs']
+        }
+        for inp in batch_inputs
+    ]
+
+    # Sampling params - match TransparentEvalCallback
+    sampling_params = SamplingParams(
+        max_tokens=8192,
+        temperature=0.0,  # Greedy for reproducibility
+        stop_token_ids=[tokenizer.eos_token_id],
+    )
+
+    logger.info(f"Running batch inference on {len(llm_inputs)} samples...")
+    if lora_request:
+        outputs = llm.generate(llm_inputs, sampling_params, lora_request=lora_request)
+    else:
+        outputs = llm.generate(llm_inputs, sampling_params)
+
+    # ============ Post-process results ============
+    for i, (inp, output) in enumerate(zip(batch_inputs, outputs)):
+        sample = inp['sample']
+        sample_elapsed = time.time() - start_time
+
+        generated_text = output.outputs[0].text
+        full_output = generated_text.strip()
+
+        # Extract display output (strip thinking tags)
+        display_output = full_output
+
+        # Check for thinking end tag
+        # Note: Qwen3VL thinking uses </think> (token ID 151668) as the end marker
+        if '<think>' in display_output and '</think>' in display_output:
+            display_output = display_output.split('</think>', 1)[-1].strip()
+
+        logger.info(f"[{i+1}/{len(batch_inputs)}] {sample['id']}: {display_output[:60]}...")
+
+        results.append({
+            'id': sample['id'],
+            'task': sample['task'],
+            'images': sample['images'],
+            'instruction': inp['instruction_text'],
+            'ground_truth': inp['ground_truth'],
+            'generated_answer': full_output if full_output else "[EMPTY]",
+            'generated_answer_display': display_output if display_output else "[EMPTY]",
+        })
 
     elapsed = time.time() - start_time
     logger.info(f"Generated {len(results)}/{len(samples)} samples in {elapsed:.1f}s ({elapsed/len(results):.1f}s/sample)")
@@ -229,43 +348,196 @@ def run_evaluation(model, processor, eval_metadata: Path, max_samples: int = Non
     return results
 
 
-def save_results(results: list, checkpoint_dir: Path):
-    """Save results to checkpoint directory in the same format as training callback."""
+def wrap_text(text: str, font, max_width: int) -> list:
+    """Wrap text to fit within max_width."""
+    if not text:
+        return []
+    lines = []
+    words = text.split()
+    current_line = ""
+    for word in words:
+        test_line = current_line + " " + word if current_line else word
+        bbox = font.getbbox(test_line)
+        width = bbox[2] - bbox[0]
+        if width <= max_width:
+            current_line = test_line
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = word
+    if current_line:
+        lines.append(current_line)
+    return lines
+
+
+def save_results(results: list, checkpoint_dir: Path, repo_root: Path = None):
     eval_dir = checkpoint_dir / "eval_results"
     eval_dir.mkdir(parents=True, exist_ok=True)
-
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-    # Save JSON in same format as TransparentEvalCallback
+    # Save JSON
     json_path = eval_dir / f"backfill_{timestamp}.json"
     with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump({
-            'timestamp': timestamp,
-            'num_samples': len(results),
-            'results': results,
-        }, f, indent=2, ensure_ascii=False)
+        json.dump({'timestamp': timestamp, 'num_samples': len(results), 'results': results}, f, indent=2, ensure_ascii=False)
 
     logger.info(f"Saved {len(results)} results to {json_path}")
 
+    # Generate composite images
+    composite_dir = eval_dir / f"backfill_{timestamp}_composite"
+    composite_dir.mkdir(parents=True, exist_ok=True)
+
+    if repo_root is None:
+        repo_root = Path.cwd()
+
+    # Try to load fonts
+    try:
+        title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+        label_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+        text_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+    except:
+        title_font = ImageFont.load_default()
+        label_font = ImageFont.load_default()
+        text_font = ImageFont.load_default()
+
+    img_width = 800
+    padding = 20
+
+    for idx, result in enumerate(results, 1):
+        sample_id = result.get('id', f'sample_{idx}')
+        output_path = composite_dir / f"{idx:02d}_{sample_id}.png"
+
+        # Load images
+        images = []
+        for img_path in result.get('images', []):
+            # Handle both absolute and relative paths
+            if os.path.isabs(img_path):
+                full_path = Path(img_path)
+            else:
+                full_path = repo_root / img_path
+            if full_path.exists():
+                img = Image.open(full_path).convert('RGB')
+                images.append(img)
+
+        # For bbox_ocr tasks, draw bbox
+        if result.get('task') == 'bbox_ocr' and images:
+            instruction = result.get('instruction', '')
+            bbox_match = re.search(r'\[([^\]]+)\]', instruction)
+            if bbox_match:
+                try:
+                    bbox_coords = [float(x.strip()) for x in bbox_match.group(1).split(',')]
+                    if len(bbox_coords) == 4:
+                        img = images[0]
+                        draw = ImageDraw.Draw(img)
+                        x1, y1, x2, y2 = bbox_coords
+                        abs_x1 = int(x1 * img.width / 1000)
+                        abs_y1 = int(y1 * img.height / 1000)
+                        abs_x2 = int(x2 * img.width / 1000)
+                        abs_y2 = int(y2 * img.height / 1000)
+                        draw.rectangle([abs_x1, abs_y1, abs_x2, abs_y2], outline='red', width=5)
+                        overlay = Image.new('RGBA', img.size, (255, 0, 0, 0))
+                        overlay_draw = ImageDraw.Draw(overlay)
+                        overlay_draw.rectangle([abs_x1, abs_y1, abs_x2, abs_y2], fill=(255, 0, 0, 30))
+                        images[0] = Image.alpha_composite(img.convert('RGBA'), overlay).convert('RGB')
+                except (ValueError, IndexError):
+                    pass
+
+        if not images:
+            continue
+
+        # For VQA, keep only first image
+        if result.get('task') == 'visual_question_answering' and len(images) == 2:
+            images = [images[0]]
+
+        # Resize images
+        max_img_width = img_width - 2 * padding
+        resized_images = []
+        for img in images:
+            ratio = max_img_width / img.width
+            new_height = int(img.height * ratio)
+            img = img.resize((max_img_width, new_height), Image.Resampling.LANCZOS)
+            resized_images.append(img)
+
+        # Get text content
+        instruction = result.get('instruction', '')
+        ground_truth = result.get('ground_truth', '')
+        generated = result.get('generated_answer_display') or result.get('generated_answer', '[EMPTY]')
+
+        # Estimate height
+        text_area_height = 400
+        total_img_height = sum(img.height for img in resized_images)
+        spacing = 15
+        total_height = total_img_height + text_area_height + (len(resized_images) - 1) * spacing + 3 * padding
+
+        # Create composite
+        composite = Image.new('RGB', (img_width, max(total_height, 400)), color='white')
+        draw = ImageDraw.Draw(composite)
+
+        # Draw title
+        task = result.get('task', 'unknown').replace('_', ' ').title()
+        title = f"Sample: {sample_id} | Task: {task}"
+        draw.rectangle([padding - 5, padding - 5, img_width - padding + 5, padding + 30], fill='#2196F3')
+        draw.text((padding, padding), title, fill='white', font=title_font)
+
+        y_offset = padding + 40
+
+        # Draw images
+        for img in resized_images:
+            composite.paste(img, (padding, y_offset))
+            y_offset += img.height + spacing
+
+        y_offset += 10
+
+        # Draw instruction
+        if instruction:
+            draw.text((padding, y_offset), "Instruction:", fill='#9C27B0', font=label_font)
+            y_offset += 20
+            # Wrap and draw instruction text
+            instruction_lines = wrap_text(instruction, text_font, img_width - 2 * padding)
+            for line in instruction_lines:
+                draw.text((padding, y_offset), line, fill='black', font=text_font)
+                y_offset += 18
+
+        y_offset += 10
+
+        # Draw ground truth
+        draw.text((padding, y_offset), "Ground Truth:", fill='#4CAF50', font=label_font)
+        y_offset += 20
+        gt_lines = wrap_text(ground_truth, text_font, img_width - 2 * padding)
+        for line in gt_lines:
+            draw.text((padding, y_offset), line, fill='black', font=text_font)
+            y_offset += 18
+
+        y_offset += 10
+
+        # Draw generated answer
+        draw.text((padding, y_offset), "Model Output:", fill='#FF9800', font=label_font)
+        y_offset += 20
+        gen_lines = wrap_text(generated, text_font, img_width - 2 * padding)
+        for line in gen_lines:
+            draw.text((padding, y_offset), line, fill='black', font=text_font)
+            y_offset += 18
+
+        composite.save(output_path, optimize=True, quality=95)
+        logger.info(f"Generated composite: {output_path.name}")
+
+    logger.info(f"Generated {len(results)} composite images to {composite_dir}/")
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Backfill transparent eval for existing checkpoints")
-    parser.add_argument("--checkpoint_dir", type=str, required=True,
-                        help="Path to training output directory (e.g., Qwen/checkpoints/qwen3vl-2b/lora/r1_onevision_thinking)")
-    parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Specific checkpoint subdirectory (default: latest)")
-    parser.add_argument("--metadata", type=str, default=None,
-                        help="Path to eval metadata JSON (default: OCRVL/data/ocrvl_transparent_eval.metadata.json)")
-    parser.add_argument("--max_samples", type=int, default=None,
-                        help="Max samples to evaluate (default: all)")
-    parser.add_argument("--device", type=str, default="cuda",
-                        help="Device to load model on (default: cuda)")
-
+    parser = argparse.ArgumentParser(description="Backfill transparent eval using vLLM with LoRA")
+    parser.add_argument("--checkpoint_dir", type=str, required=True)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--metadata", type=str, default=None)
+    parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--tensor_parallel_size", type=int, default=1)
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.8)
     args = parser.parse_args()
 
-    checkpoint_dir = Path(args.checkpoint_dir)
+    # Log GPU info
+    cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "not set")
+    logger.info(f"CUDA_VISIBLE_DEVICES: {cuda_devices}")
 
-    # Find checkpoint
+    checkpoint_dir = Path(args.checkpoint_dir)
     if args.checkpoint:
         checkpoint_path = checkpoint_dir / args.checkpoint
     else:
@@ -273,24 +545,25 @@ def main():
 
     logger.info(f"Using checkpoint: {checkpoint_path}")
 
-    # Find metadata
     if args.metadata:
         eval_metadata = Path(args.metadata)
     else:
-        eval_metadata = _REPO_ROOT / "OCRVL/data/ocrvl_transparent_eval.metadata.json"
+        eval_metadata = _REPO_ROOT / "Qwen/data/transparent_eval.jsonl"
 
     if not eval_metadata.exists():
         raise FileNotFoundError(f"Metadata not found: {eval_metadata}")
 
-    # Load model WITHOUT FSDP (for backfilling)
-    model, processor = load_model(checkpoint_path, args.device)
+    # Set checkpoint path for VAE loading in vLLM plugin
+    os.environ["VLLM_LORA_CHECKPOINT_PATH"] = str(checkpoint_path)
 
-    # Run evaluation
-    results = run_evaluation(model, processor, eval_metadata, args.max_samples)
+    llm, tokenizer, processor, lora_path = load_model_vllm(
+        checkpoint_path,
+        tensor_parallel_size=args.tensor_parallel_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+    )
 
-    # Save results
-    save_results(results, checkpoint_path)
-
+    results = run_evaluation(llm, tokenizer, processor, eval_metadata, lora_path, args.max_samples, _REPO_ROOT)
+    save_results(results, checkpoint_path, _REPO_ROOT)
     logger.info("Backfill complete!")
 
 

@@ -6,7 +6,7 @@ Uses Qwen3VL Native Vision Encoder for end-to-end feature extraction:
 1. Question image → Vision Encoder (ViT + Projector) → LLM space (2048-dim)
 2. Thinking text → Adaptive renderer → Images → Vision Encoder → LLM space
 3. Latent format:
-   - latent_ground_truth: Thinking image features (for injection at <|latent_step|>)
+   - latent_ground_truth: Thinking image features (for injection at <latent>)
    - latent_supervision: Original image features (for OT loss reference)
 
 All features are cached in .feature_cache directory and reused across runs.
@@ -28,6 +28,7 @@ from typing import List, Optional, Tuple
 import pandas as pd
 import torch
 import torch.distributed as dist
+from transformers import AutoTokenizer
 from PIL import Image
 
 # Setup path for local imports
@@ -75,6 +76,19 @@ def compress_newlines(text: str) -> str:
     """Compress multiple consecutive newlines to a single newline."""
     # Replace 2+ consecutive newlines with a single newline
     return re.sub(r'\n{2,}', '\n', text)
+
+
+def format_cot_subsequences(thinking_chunks: Optional[List[str]]) -> str:
+    """
+    Format COT text to match CE-loss "subsequence" composition.
+
+    Expected shape:
+      <think>[subseq1]<think_sep>[subseq2]<think_sep>...</think>
+    """
+    chunks = [c.strip() for c in (thinking_chunks or []) if c and c.strip()]
+    if not chunks:
+        return ""
+    return f"<think>{'<think_sep>'.join(chunks)}</think>"
 
 
 def chunk_thinking_text(
@@ -380,19 +394,17 @@ def process_parquet_file(
                 question_text = conversations[0]['value']
                 assistant_msg = conversations[1]['value']
 
-                # Extract thinking and answer
-                thinking, answer = extract_thinking_and_answer(assistant_msg, return_chunks=False)
+                # Extract thinking chunks and answer in one step (handles chunking internally)
+                thinking_chunks, answer = extract_thinking_and_answer(
+                    assistant_msg,
+                    max_chars=max_chars_per_chunk,
+                    return_chunks=True,
+                )
 
                 # Render thinking text to adaptive-sized images
                 thinking_image_paths = []
-                if thinking:
+                if thinking_chunks:
                     stats['with_thinking'] += 1
-
-                    # Chunk thinking for rendering
-                    thinking_chunks = chunk_thinking_text(
-                        thinking,
-                        max_chars=max_chars_per_chunk,
-                    )
 
                     for chunk_idx, chunk in enumerate(thinking_chunks):
                         chunk_suffix = f"thinking_{chunk_idx}"
@@ -644,9 +656,8 @@ def main_encode_only_ddp(args):
         logger.info(f"Sample-level splitting across {world_size} GPUs")
         logger.info("")
 
-    # Call the main encode function with encoder
-    # DDP wrapping is not needed for encode-only since we don't train
-    return main_encode_only(args, encoder)
+    # Call main_ddp which properly handles DDP for encoding
+    return main_ddp(args)
 
 
 def main_encode_only(args, encoder):
@@ -795,8 +806,10 @@ def main_encode_only(args, encoder):
                             'question_text': question_text,
                             'answer': answer,
                             'query_image_path': str(query_image_path),
-                            'query_cache_key': filename,  # Use filename as cache key
-                            'thinking_image_paths': thinking_image_paths,
+                            'query_cache_key': filename,
+                            'question_text_path': str(question_text_path),  # Add question_text.pt path
+                            'thinking_chunks': thinking,  # Actual thinking text for 'cot' field
+                            'thinking_image_paths': thinking_image_paths,  # For encoding (includes question_text + thinking)
                         })
                         query_image_paths.append(str(query_image_path))
 
@@ -880,23 +893,31 @@ def main_encode_only(args, encoder):
                     try:
                         # Cache paths
                         query_cache_path = str(unified_cache_dir / f"{Path(sample['query_image_path']).stem}.pt")
-                        thinking_cache_paths = [
-                            str(unified_cache_dir / f"{Path(tp).stem}.pt")
-                            for tp in sample['thinking_image_paths']
-                        ]
+                        # thinking_image_paths includes question_text + thinking chunks.
+                        # For training, latent_ground_truth should contain ONLY thinking chunks (exclude question_text),
+                        # and the number of <latent> placeholders must match len(latent_ground_truth).
+                        thinking_cache_paths = []
+                        for tp in sample["thinking_image_paths"]:
+                            stem = Path(tp).stem
+                            if "question_text" in stem:
+                                continue
+                            thinking_cache_paths.append(str(unified_cache_dir / f"{stem}.pt"))
 
-                        num_latent_steps = len(sample['thinking_image_paths'])
+                        num_thinking_chunks = len(thinking_cache_paths)
+                        if num_thinking_chunks == 0:
+                            # No thinking chunks -> skip (otherwise we would build <think></think> with empty latent GT).
+                            continue
 
-                        # latent_ground_truth: Thinking chunks (for injection at <|latent_step|>)
+                        # latent_ground_truth: One entry per thinking chunk (for injection at <latent>)
                         latent_ground_truth = thinking_cache_paths
 
-                        # latent_supervision: Question image (reference for loss, repeated for each chunk)
-                        latent_supervision = [query_cache_path] * num_latent_steps
+                        # latent_supervision: Main question image feature (used by OT/MSE/REPA/NCE losses)
+                        latent_supervision = [query_cache_path]
 
                         # Reconstruct assistant message with thinking tags and latent placeholders
-                        # Format: <think><|latent_step|><|thinking_sep|><|latent_step|>...</think>{answer}
-                        # Note: <|latent_step│> and <|thinking_sep|> are TEXT tokens with CE loss
-                        latent_placeholders = '<|thinking_sep|>'.join(['<|latent_step|>'] * num_latent_steps)
+                        # Format: <think><latent><think_sep><latent>...</think>{answer}
+                        # Note: <latent> and <think_sep> are TEXT tokens with CE loss
+                        latent_placeholders = '<think_sep>'.join(['<latent>'] * num_thinking_chunks)
                         thinking_content = f"<think>{latent_placeholders}</think>{sample['answer']}"
 
                         # Write JSONL entry in llamafactory format
@@ -914,7 +935,11 @@ def main_encode_only(args, encoder):
                             'images': [sample['query_image_path']],
                             'latent_ground_truth': latent_ground_truth,
                             'latent_supervision': latent_supervision,
-                            'num_latent_steps': num_latent_steps
+                            'num_latent_steps': num_thinking_chunks,
+                            # Mirror CE-loss subsequence boundaries with <think_sep>.
+                            # This stays a string for backward compatibility with existing JSONL.
+                            'cot': format_cot_subsequences(sample.get('thinking_chunks')),
+                            'task': 'r1_onevision_thinking',
                         }
 
                         f_out.write(json.dumps(json_entry) + '\n')
@@ -1306,7 +1331,7 @@ def main():
     logger.info("During training:")
     logger.info("  1. Load question image via Qwen3VL native vision tower")
     logger.info("  2. Load .latent.pt files containing [seq, hidden_dim] features")
-    logger.info("  3. Inject latents at <|latent_step|> token positions")
+    logger.info("  3. Inject latents at <latent> token positions")
     logger.info("  4. Loss: Cross-entropy on answer + MSE on latent reconstruction")
 
     return 0
@@ -1353,6 +1378,13 @@ def main_ddp(args):
         device=device,  # e.g., "cuda:0", "cuda:1", etc.
         dtype=torch.bfloat16,
         use_vllm_kernels=True,
+    )
+
+    # Initialize tokenizer for cot_token_ids (pre-tokenize CoT for efficient training)
+    tokenizer = AutoTokenizer.from_pretrained(
+        "/share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking",
+        trust_remote_code=True,
+        use_fast=True,
     )
 
     if local_rank == 0:
@@ -1422,6 +1454,7 @@ def main_ddp(args):
                 dataset_name=dataset_name,
                 renderer=renderer,
                 encoder=encoder,
+                tokenizer=tokenizer,
                 max_chars_per_chunk=args.max_chars_per_chunk,
                 max_samples=args.max_samples,
                 batch_size=batch_size,
@@ -1511,6 +1544,7 @@ def process_parquet_file_ddp(
     dataset_name: str,
     renderer: AdaptiveVelloRenderer,
     encoder: torch.nn.parallel.DistributedDataParallel,
+    tokenizer,
     max_chars_per_chunk: int = 4800,
     max_samples: Optional[int] = None,
     batch_size: int = 8,
@@ -1577,7 +1611,12 @@ def process_parquet_file_ddp(
                         stats['errors'] += 1
                         continue
 
-                    thinking, answer = extract_thinking_and_answer(assistant_msg, return_chunks=False)
+                    # Keep chunking consistent with render/encode phases (controls thinking_{i}.png count).
+                    thinking, answer = extract_thinking_and_answer(
+                        assistant_msg,
+                        max_chars=max_chars_per_chunk,
+                        return_chunks=True,
+                    )
 
                     if not thinking:
                         # Save question image even without thinking
@@ -1653,11 +1692,9 @@ def process_parquet_file_ddp(
                             with open(image_path, 'wb') as f_img:
                                 f_img.write(image_data)
 
-                    # Chunk thinking text
-                    thinking_chunks = chunk_thinking_text(
-                        thinking,
-                        max_chars_per_chunk=max_chars_per_chunk
-                    )
+                    # thinking is already a list of chunks from return_chunks=True
+                    # Just use it directly (already chunked)
+                    thinking_chunks = thinking if isinstance(thinking, list) else [thinking]
 
                     # Render thinking chunks to images (stored in Qwen cache)
                     thinking_image_paths = []
@@ -1721,46 +1758,51 @@ def process_parquet_file_ddp(
                             continue
 
                     # Load cached features for thinking images (for latent_ground_truth)
+                    # Only include thinking chunks, NOT question_text
                     latent_ground_truth_paths = []
                     for thinking_path_str in thinking_image_paths:
                         thinking_path = Path(thinking_path_str)
+                        # Skip question_text, only include thinking_0, thinking_1, etc.
+                        if 'question_text' in thinking_path.stem:
+                            continue
                         cache_path = unified_cache_dir / f"{thinking_path.stem}.pt"
                         if cache_path.exists():
-                            # Use cached features as-is (no cross-attention needed)
-                            latent_path = unified_cache_dir / f"{thinking_path.stem}.latent.pt"
-                            # Copy cache to latent file (same format)
-                            shutil.copy(cache_path, latent_path)
-                            latent_ground_truth_paths.append(str(latent_path))
+                            # Use cached features directly
+                            latent_ground_truth_paths.append(str(cache_path))
 
                     # Load cached features for original image (for latent_supervision)
+                    # Only ONE entry - the main question image
                     original_image_path = Path(image_path)
                     original_cache_path = unified_cache_dir / f"{original_image_path.stem}.pt"
                     latent_supervision_paths = []
 
                     if original_cache_path.exists():
-                        # Create latent supervision for EACH thinking chunk
-                        # Each thinking chunk has the same supervision target (original image)
-                        for idx, thinking_path_str in enumerate(thinking_image_paths):
-                            thinking_path = Path(thinking_path_str)
-                            # Supervision latent: original image features
-                            # Name it to match the thinking chunk for correspondence
-                            superv_latent_name = f"{original_image_path.stem}_superv_{idx}"
-                            superv_latent_path = unified_cache_dir / f"{superv_latent_name}.latent.pt"
-                            # Copy original image features as supervision
-                            shutil.copy(original_cache_path, superv_latent_path)
-                            latent_supervision_paths.append(str(superv_latent_path))
+                        # Use cached features directly
+                        latent_supervision_paths.append(str(original_cache_path))
+
+                    # Note: question_text.pt path is available in sample['question_text_path'] if needed
+
+                    # Count thinking chunks (exclude question_text)
+                    num_thinking_chunks = len(latent_ground_truth_paths)
 
                     if not latent_ground_truth_paths or not latent_supervision_paths:
                         stats['errors'] += 1
                         continue
 
-                    # Ensure lengths match
-                    if len(latent_ground_truth_paths) != len(latent_supervision_paths):
-                        logger.warning(f"  Mismatch: {len(latent_ground_truth_paths)} ground_truth vs {len(latent_supervision_paths)} supervision")
-                        stats['errors'] += 1
-                        continue
+                    # latent_ground_truth: one entry per thinking chunk
+                    # latent_supervision: one entry (main image) - used as supervision target for all thinking chunks
+                    # No length check needed since they serve different purposes now
 
                     stats['extracted_features'] += 1
+
+                    # Build thinking placeholders for messages (only thinking chunks, not question_text)
+                    # Each thinking chunk gets <latent>, separated by <think_sep>
+                    latent_placeholders = '<think_sep>'.join(['<latent>'] * num_thinking_chunks)
+                    thinking_content = "<think>" + latent_placeholders + "</think>" + answer
+
+                    # Get actual thinking text for 'cot' field
+                    # 'thinking' variable contains the list of thinking chunks
+                    cot_text = format_cot_subsequences(thinking if isinstance(thinking, list) else [thinking] if thinking else [])
 
                     # Write JSONL entry with proper separation
                     # Adaptively add <image> token only if question_text doesn't already have one
@@ -1768,16 +1810,25 @@ def process_parquet_file_ddp(
                         user_content = question_text
                     else:
                         user_content = f'<image>\n{question_text}'
+                    # Build sample
+                    question_pt = str(unified_cache_dir / f"{get_hash_filename(dataset_name, sample_id, 'question_text')}.pt")
+
                     sample = {
                         'id': sample_id,
                         'messages': [
                             {'role': 'user', 'content': user_content},
-                            {'role': 'assistant', 'content': answer}
+                            {'role': 'assistant', 'content': thinking_content}
                         ],
                         'images': [str(image_path)],
-                        'latent_ground_truth': latent_ground_truth_paths,  # Thinking features (for injection)
-                        'latent_supervision': latent_supervision_paths,      # Original features (for OT, one per chunk)
-                        'num_latent_steps': len(latent_ground_truth_paths),
+                        'question': question_pt,
+                        'latent_ground_truth': latent_ground_truth_paths,  # Only thinking images
+                        'latent_supervision': latent_supervision_paths,      # Only main image (one entry)
+                        'num_latent_steps': num_thinking_chunks,  # Only thinking chunks count
+                        # Mirror CE-loss subsequence boundaries with <think_sep>.
+                        # This stays a string for backward compatibility with existing JSONL.
+                        'cot': cot_text,
+                        # Pre-tokenized CoT for efficient training (avoids re-tokenizing every batch)
+                        'cot_token_ids': tokenizer.encode(cot_text, add_special_tokens=False),
                         'task': 'r1_onevision_thinking'
                     }
                     f_out.write(json.dumps(sample) + '\n')

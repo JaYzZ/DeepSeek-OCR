@@ -25,47 +25,64 @@ try:
 except ImportError:
     HAS_LORA_REQUEST = False
     LoRARequest = None
-from qwen_vl_utils import process_vision_info
+# Note: Image preprocessing now handled by vLLM internally
 from transformers import AutoProcessor
 
 # Local imports from refactored files
-from dataset_utils import load_dataset, dump_image, build_realworldqa_prompt
-from eval_utils import build_judge, eval_single_sample
+try:
+    from .dataset_utils import load_dataset, dump_image, build_realworldqa_prompt
+    from .eval_utils import build_judge, eval_single_sample
+except ImportError:
+    from dataset_utils import load_dataset, dump_image, build_realworldqa_prompt
+    from eval_utils import build_judge, eval_single_sample
 
 # Set vLLM multiprocessing method
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 
 def prepare_inputs_for_vllm(messages, processor):
     """
-    Prepare inputs for vLLM.
-    
+    Prepare inputs for vLLM - let vLLM handle everything (official approach).
+
     Args:
         messages: List of messages in standard conversation format
         processor: AutoProcessor instance
-    
+
     Returns:
         dict: Input format required by vLLM
     """
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    
-    # qwen_vl_utils 0.0.14+ required
-    image_inputs, video_inputs, video_kwargs = process_vision_info(
-        messages,
-        image_patch_size=processor.image_processor.patch_size,
-        return_video_kwargs=True,
-        return_video_metadata=True
-    )
-    
+
+    # Apply chat template to get prompt with proper placeholders
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    text = text + "<|im_start|>assistant\n"
+
+    # Extract raw images from messages - let vLLM handle preprocessing
+    raw_images = []
+    raw_videos = []
+
+    for item in messages[0].get('content', []):
+        if isinstance(item, dict):
+            if item.get('type') == 'image':
+                raw_images.append(item['image'])  # Can be path, PIL image, or base64
+            elif item.get('type') == 'video':
+                raw_videos.append(item['video'])
+
+    # Get min/max pixels from processor
+    min_pixels = getattr(processor.image_processor, 'min_pixels', 28 * 28 * 256)
+    max_pixels = getattr(processor.image_processor, 'max_pixels', 28 * 28 * 2048)
+
     mm_data = {}
-    if image_inputs is not None:
-        mm_data['image'] = image_inputs
-    if video_inputs is not None:
-        mm_data['video'] = video_inputs
-    
+    if raw_images:
+        mm_data['image'] = raw_images
+    if raw_videos:
+        mm_data['video'] = raw_videos
+
     return {
         'prompt': text,
         'multi_modal_data': mm_data,
-        'mm_processor_kwargs': video_kwargs
+        'mm_processor_kwargs': {
+            'min_pixels': min_pixels,
+            'max_pixels': max_pixels,
+        }
     }
 
 def run_inference(args):
@@ -86,6 +103,24 @@ def run_inference(args):
     print(f"Loading dataset: {args.dataset}")
     data = load_dataset(args.dataset)
     print(f"✓ Loaded {len(data)} samples from {args.dataset}")
+
+    # Optional deterministic limiting for inference. (Historically this was done via
+    # EVAL_NUM_SAMPLES in dataset_utils; keeping this CLI makes behavior explicit and
+    # consistent with other benchmarks.)
+    limit = None
+    if getattr(args, "num_samples", -1) and args.num_samples > 0:
+        limit = int(args.num_samples)
+    if getattr(args, "limit", None) is not None:
+        if limit is not None and int(args.limit) != limit:
+            raise ValueError(f"Conflicting limits: --num-samples={limit} vs --limit={args.limit}")
+        limit = int(args.limit)
+
+    if limit is not None and limit < len(data):
+        import hashlib
+        print(f"Applying DETERMINISTIC sampling for inference: {limit} samples from {len(data)}")
+        data["_hash"] = data["index"].apply(lambda x: hashlib.md5(str(x).encode()).hexdigest())
+        data = data.sort_values("_hash").head(limit).drop("_hash", axis=1)
+        print(f"✓ Limited inference dataset to {len(data)} samples")
     
     # DEBUG: Process only first N samples if specified
     if os.getenv('DEBUG_SAMPLE_SIZE'):
@@ -206,7 +241,7 @@ def run_inference(args):
         lora_request = LoRARequest(
             lora_name=args.lora_name,
             lora_int_id=1,
-            lora_local_path=args.lora_path,
+            lora_path=args.lora_path,
         )
         print(f"   Using LoRA: {args.lora_name}")
 
@@ -380,6 +415,11 @@ def main():
                            help="Path to RealWorldQA data directory")
     infer_parser.add_argument("--output-file", type=str, required=True,
                            help="Output file path (relative to evaluation root or absolute)")
+
+    infer_parser.add_argument("--num-samples", type=int, default=-1,
+                            help="Limit inference to N samples (deterministic sampling; default: all)")
+    infer_parser.add_argument("--limit", type=int, default=None,
+                            help="Alias for --num-samples (deterministic sampling)")
     
     # Image resolution parameters
     infer_parser.add_argument("--min-pixels", type=int, default=None,
@@ -437,7 +477,7 @@ def main():
     eval_parser.add_argument("--api-type", type=str, default="custom", choices=["custom", "local", "dash", "mit"],
                             help="API type for evaluation (default: custom)")
     eval_parser.add_argument("--api-url", type=str, default=None,
-                            help="API URL for local API (default: http://localhost:8000/v1/chat/completions)")
+                            help="API URL for local API (default: http://localhost:8016/v1/chat/completions)")
     eval_parser.add_argument("--api-key", type=str, default=None,
                             help="API key for local API (default: EMPTY)")
     eval_parser.add_argument("--nproc", type=int, default=4, help="Number of processes to use")

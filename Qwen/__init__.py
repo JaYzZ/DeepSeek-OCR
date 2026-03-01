@@ -9,7 +9,7 @@ Latent supervision is automatically enabled when:
 - Training config name contains "thinking"
 
 The integration handles:
-1. Latent injection at <|latent_step|> positions
+1. Latent injection at <latent> positions
 2. Latent supervision loading from .latent.pt files
 3. Thinking loss computation (REPA/Contrastive/OT loss)
 4. Model patching for thinking_projection module
@@ -18,8 +18,8 @@ The integration handles:
 # Import the integration on package import
 # This applies patches when PYTHONPATH includes the repo root
 try:
-    from .scripts.llamafactory_integration import _patch_once
-    # Patches are applied automatically in llamafactory_integration.py
+    from .llamafactory.integration import _patch_once
+    # Patches are applied automatically in integration.py
 except ImportError:
     pass
 
