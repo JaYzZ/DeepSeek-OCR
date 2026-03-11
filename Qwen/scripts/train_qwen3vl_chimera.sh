@@ -1,5 +1,5 @@
 #!/bin/bash
-# Qwen3VL R1-OneVision SFT Training with Latent Supervision
+# Qwen3VL CHIMERA SFT Training with Latent Supervision
 #
 # This script trains Qwen3VL-2B-Thinking on R1-OneVision dataset using:
 # - Pre-encoded vision features (no encoding during training)
@@ -7,7 +7,8 @@
 # - Thinking loss (REPA/OT/NCE/MSE) on latent predictions
 #
 # Usage:
-#   bash Qwen/scripts/train_qwen3vl_r1onevision.sh [config.yaml]
+#   bash Qwen/scripts/train_qwen3vl_chimera.sh [config.yaml]
+#   tmux new-session -d -s chi_sft 'bash Qwen/scripts/train_qwen3vl_chimera.sh Qwen/configs/qwen3vl_native_chimera_thinking.yaml'
 
 set -euo pipefail
 
@@ -23,7 +24,7 @@ if [ ! -x "$PYTHON_BIN" ]; then
 fi
 
 # Default config
-DEFAULT_CONFIG="$REPO_ROOT/Qwen/configs/qwen3vl_native_r1onevision_thinking.yaml"
+DEFAULT_CONFIG="$REPO_ROOT/Qwen/configs/qwen3vl_native_chimera_thinking.yaml"
 DEFAULT_RUNTIME_ENV_CONFIG="$REPO_ROOT/Qwen/configs/qwen3vl_runtime_env.yaml"
 
 CONFIG_PATH="${1:-$DEFAULT_CONFIG}"
@@ -148,23 +149,66 @@ RUN_BENCHMARK="$(_get_runtime_config "benchmark_enable" "0")"
 BENCHMARK_LIST="$(_get_runtime_config "benchmark_list" "MathVision,RealWorldQA")"
 BENCHMARK_NUM_SAMPLES="$(_get_runtime_config "benchmark_num_samples" "100")"
 
-# Check dataset exists
-DATASET_JSONL="$REPO_ROOT/Qwen/data/r1_onevision_thinking.jsonl"
-if [ ! -f "$DATASET_JSONL" ]; then
-    echo "❌ Dataset not found: $DATASET_JSONL" >&2
-    echo "" >&2
-    echo "Please build the dataset first:" >&2
-    echo "  bash Qwen/scripts/build_r1_onevision_thinking.sh --encode-only --all" >&2
-    exit 1
+# Resolve requested dataset(s) from config + CLI overrides.
+DATASET_SPEC="$(_get_main_config "dataset" || echo "")"
+for arg in "$@"; do
+  if [[ "$arg" == dataset=* ]]; then
+    DATASET_SPEC="${arg#dataset=}"
+  fi
+done
+
+if [ -z "$DATASET_SPEC" ]; then
+  echo "❌ No dataset specified in config or CLI override (dataset=...)" >&2
+  exit 1
 fi
 
-echo "✓ Dataset found: $DATASET_JSONL"
-echo "  Samples: $(wc -l < "$DATASET_JSONL")"
+# Check only the dataset files that are actually requested.
+declare -a DATASET_PATHS=()
+declare -a MISSING_DATASETS=()
+IFS=',' read -ra DATASET_NAMES <<< "$DATASET_SPEC"
+for dataset_name in "${DATASET_NAMES[@]}"; do
+  dataset_name="$(echo "$dataset_name" | xargs)"
+  case "$dataset_name" in
+    qwen3vl_chimera_thinking_image_input)
+      DATASET_PATHS+=("$REPO_ROOT/Qwen/data/chimera_qwen35_thinking_image_input.jsonl")
+      ;;
+    qwen3vl_chimera_thinking_text_input)
+      DATASET_PATHS+=("$REPO_ROOT/Qwen/data/chimera_qwen35_thinking_text_input.jsonl")
+      ;;
+    *)
+      echo "❌ Unsupported CHIMERA dataset in dataset=...: $dataset_name" >&2
+      echo "   Supported: qwen3vl_chimera_thinking_text_input, qwen3vl_chimera_thinking_image_input" >&2
+      exit 1
+      ;;
+  esac
+done
+
+for dataset_path in "${DATASET_PATHS[@]}"; do
+  if [ ! -f "$dataset_path" ]; then
+    MISSING_DATASETS+=("$dataset_path")
+  fi
+done
+
+if [ "${#MISSING_DATASETS[@]}" -gt 0 ]; then
+  echo "❌ CHIMERA dataset file(s) not found for dataset=$DATASET_SPEC" >&2
+  for missing in "${MISSING_DATASETS[@]}"; do
+    echo "   - $missing" >&2
+  done
+  echo "" >&2
+  echo "Please build the dataset first:" >&2
+  echo "  python Qwen/scripts/build_chimera_thinking.py --encode-only --num-gpus 8" >&2
+  exit 1
+fi
+
+echo "✓ CHIMERA dataset(s) found for dataset=$DATASET_SPEC:"
+for dataset_path in "${DATASET_PATHS[@]}"; do
+  echo "  - $dataset_path (Samples: $(wc -l < "$dataset_path"))"
+done
 echo ""
 
 # Generate timestamp for unique output directory
 TIMESTAMP="${QWEN3VL_TIMESTAMP:-$(date '+%Y%m%d_%H%M%S')}"
-DEFAULT_OUTDIR="$REPO_ROOT/Qwen/checkpoints/qwen3vl-2b/lora/r1_onevision_thinking/run_${TIMESTAMP}"
+DEFAULT_OUTDIR="$REPO_ROOT/Qwen/checkpoints/qwen3vl-2b/lora/chimera_thinking/run_${TIMESTAMP}"
 
 # Check if user specified output_dir in command line
 HAS_OUTDIR=false
@@ -235,7 +279,6 @@ fi
 # Set Python path for llamafactory and sitecustomize.py integration
 # sitecustomize.py at repo root enables latent supervision patches
 export PYTHONPATH="$REPO_ROOT/../LlamaFactory/src:$REPO_ROOT:${PYTHONPATH:-}"
-export OCRVL_APPLY_PATCHES="${OCRVL_APPLY_PATCHES:-0}"
 
 # If linear checkpoint provides a preferred HF modules cache, use it unless overridden
 if [ -z "${HF_MODULES_CACHE:-}" ] && [ -n "${MODEL_PATH:-}" ] && [ -f "$MODEL_PATH/hf_modules_cache.path" ]; then
@@ -291,19 +334,19 @@ export QWEN3VL_CUTOFF_LEN="${QWEN3VL_CUTOFF_LEN:-$MAIN_CUTOFF_LEN}"
 
 
 # Display configuration
-TRAINING_TYPE="R1-OneVision SFT Training (Latent Supervision)"
+TRAINING_TYPE="CHIMERA SFT Training (Latent Supervision)"
 
 LOSS_TYPE="$QWEN3VL_LOSS_TYPE"
 LOSS_WEIGHT="$QWEN3VL_THINKING_LOSS_WEIGHT"
 LOSS_TYPE_DISPLAY="$LOSS_TYPE (weight: $LOSS_WEIGHT)"
 
 echo "========================================================================"
-echo "Qwen3VL R1-OneVision SFT Training"
+echo "Qwen3VL CHIMERA SFT Training"
 echo "========================================================================"
 echo "Training Type: $TRAINING_TYPE"
 echo "Distributed Backend: $([ "$USE_DEEPSPEED" = true ] && echo "DeepSpeed" || ([ "$USE_FSDP" = true ] && echo "FSDP" || echo "Unknown"))"
 echo "Config: $CONFIG_PATH"
-echo "Dataset: $DATASET_JSONL"
+echo "Dataset(s): $DATASET_SPEC"
 echo "GPUs: $CUDA_VISIBLE_DEVICES"
 echo ""
 echo "Latent Supervision:"

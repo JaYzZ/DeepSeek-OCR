@@ -28,12 +28,27 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from tokenizers import AddedToken
+
+_REPO_ROOT = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(_REPO_ROOT))
+
+from Qwen.scripts.vllm_utils import (
+    apply_runtime_env_for_thinking,
+    infer_tensor_parallel_size,
+    normalize_checkpoint_name,
+    parse_cuda_visible_devices,
+)
 
 # Set vLLM multiprocessing method BEFORE importing vLLM
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 
 # Enable thinking mode with VAE
 os.environ.setdefault("VLLM_THINKING", "1")
+existing_plugins = [p.strip() for p in os.environ.get("VLLM_PLUGINS", "").split(",") if p.strip()]
+if "vllm_thinking" not in existing_plugins:
+    existing_plugins.append("vllm_thinking")
+os.environ["VLLM_PLUGINS"] = ",".join(existing_plugins)
 
 # Import thinking mode plugin BEFORE vLLM to apply patches
 from vllm_thinking.runner_patch import apply_thinking_mode_patch
@@ -117,6 +132,7 @@ async def chat_completions(request: ChatCompletionRequest):
             presence_penalty=request.presence_penalty,
             repetition_penalty=request.repetition_penalty,
             stop_token_ids=[151643, 151645],
+            skip_special_tokens=False,
         )
 
         # Run inference
@@ -173,6 +189,8 @@ def prepare_inputs_for_vllm(messages, processor):
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     # Manually add generation prompt as per repo's common practice
     text = text + "<|im_start|>assistant\n"
+    if os.environ.get("VLLM_FORCE_THINK", "0") == "1":
+        text = text + "<think>"
 
     # Extract media from messages and, if provided, preserve benchmark-specific
     # min/max pixel constraints (MathVision/RealWorldQA/etc).
@@ -264,28 +282,37 @@ def load_model(
         model_path, trust_remote_code=True
     )
 
-    # Add <latent> and <think_sep> as special tokens
+    # Ensure <latent>/<think_sep> are single tokens for inference.
+    # Use regular added tokens (not "special") so they are generated/displayed
+    # like <think> and </think>.
     special_tokens = ["<latent>", "<think_sep>"]
     added_count = 0
     for token in special_tokens:
         encoded = tokenizer_with_special_tokens.encode(token, add_special_tokens=False)
         if len(encoded) > 1:
-            num_added = tokenizer_with_special_tokens.add_special_tokens(
-                {"additional_special_tokens": [token]},
-                replace_additional_special_tokens=False
-            )
+            num_added = tokenizer_with_special_tokens.add_tokens([token], special_tokens=False)
             added_count += num_added
 
+    # If checkpoint tokenizer marks these as special, demote them at runtime.
+    # vLLM generation then treats them like regular tokens.
+    for token in special_tokens:
+        token_id = tokenizer_with_special_tokens.convert_tokens_to_ids(token)
+        added = tokenizer_with_special_tokens.added_tokens_decoder.get(token_id)
+        if added is not None and getattr(added, "special", False):
+            tokenizer_with_special_tokens._tokenizer.add_tokens([AddedToken(token, special=False)])
+            print(f"Demoted special token to regular token at runtime: {token} (ID {token_id})")
+
     if added_count > 0:
-        print(f"Added {added_count} special thinking tokens to tokenizer:")
-        for token in special_tokens:
-            token_id = tokenizer_with_special_tokens.convert_tokens_to_ids(token)
-            print(f"  {token} -> ID {token_id}")
-            # Set environment variables for vLLM thinking mode
-            if token == "<latent>":
-                os.environ["QWEN3VL_LATENT_TOKEN_ID"] = str(token_id)
-            elif token == "<think_sep>":
-                os.environ["QWEN3VL_THINKING_SEP_ID"] = str(token_id)
+        print(f"Added {added_count} regular thinking tokens to tokenizer")
+
+    # Always export unified token IDs used by both training and vLLM plugin.
+    for token in special_tokens:
+        token_id = tokenizer_with_special_tokens.convert_tokens_to_ids(token)
+        print(f"  {token} -> ID {token_id}")
+        if token == "<latent>":
+            os.environ["QWEN3VL_LATENT_TOKEN_ID"] = str(token_id)
+        elif token == "<think_sep>":
+            os.environ["QWEN3VL_THINKING_SEP_ID"] = str(token_id)
 
     # Apply thinking mode patch BEFORE loading vLLM (patches GPUModelRunner class)
     apply_thinking_mode_patch()
@@ -304,6 +331,7 @@ def load_model(
         "trust_remote_code": True,
         "max_model_len": 128000,
         "limit_mm_per_prompt": {"image": 10},
+        "enforce_eager": os.environ.get("VLLM_ENFORCE_EAGER", "0") == "1",
     }
 
     # Add LoRA config if path provided
@@ -315,9 +343,13 @@ def load_model(
     llm = LLM(**llm_kwargs)
 
     # Create LoRA request
+    effective_lora_name = lora_name
+    if lora_path and lora_name == "default":
+        effective_lora_name = normalize_checkpoint_name(lora_path)
+
     if HAS_LORA_REQUEST and lora_path:
         lora_request = LoRARequest(
-            lora_name=lora_name,
+            lora_name=effective_lora_name,
             lora_int_id=1,
             lora_path=lora_path,
         )
@@ -339,12 +371,27 @@ def main():
     parser.add_argument("--model-path", type=str, required=True, help="Path to model")
     parser.add_argument("--port", type=int, default=8016, help="Server port")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
-    parser.add_argument("--tensor-parallel-size", type=int, default=1, help="Tensor parallel size")
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=0,
+        help="Tensor parallel size. Use 0 to auto-infer from CUDA_VISIBLE_DEVICES.",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="GPU memory utilization")
     parser.add_argument("--lora-path", type=str, default=None, help="LoRA adapter path")
     parser.add_argument("--lora-name", type=str, default="default", help="LoRA adapter name")
 
     args = parser.parse_args()
+    apply_runtime_env_for_thinking(repo_root=_REPO_ROOT)
+
+    visible_gpus = parse_cuda_visible_devices(os.environ.get("CUDA_VISIBLE_DEVICES"))
+    resolved_tp = (
+        infer_tensor_parallel_size(os.environ.get("CUDA_VISIBLE_DEVICES"), fallback=1)
+        if args.tensor_parallel_size <= 0
+        else args.tensor_parallel_size
+    )
+    print(f"CUDA_VISIBLE_DEVICES: {','.join(visible_gpus) if visible_gpus else 'not set'}")
+    print(f"Tensor parallel (resolved): {resolved_tp}")
 
     # Auto-find free port if default is taken
     def find_free_port(start_port):
@@ -391,7 +438,7 @@ def main():
     # Load model
     load_model(
         model_path=args.model_path,
-        tensor_parallel_size=args.tensor_parallel_size,
+        tensor_parallel_size=resolved_tp,
         gpu_memory_utilization=args.gpu_memory_utilization,
         lora_path=args.lora_path,
         lora_name=args.lora_name,

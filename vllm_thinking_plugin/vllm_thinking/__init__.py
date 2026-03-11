@@ -14,7 +14,6 @@ The plugin will be automatically loaded in all vLLM processes (main and workers)
 """
 
 import logging
-import sys
 import os
 
 
@@ -38,10 +37,10 @@ def vllm_thinking_plugin():
     This function is called by vLLM in all processes during initialization.
     It applies the thinking mode patch to GPUModelRunner.
     """
-    print("[PLUGIN] vllm_thinking_plugin() called!", file=sys.stderr)
-
-    # Check if thinking mode should be enabled
+    # Canonical enable flag.
     enabled = _env_flag("VLLM_THINKING", default=False)
+    if "VLLM_THINKING_MODE_ENABLED" in os.environ and "VLLM_THINKING" not in os.environ:
+        logger.warning("[PLUGIN] Ignoring legacy VLLM_THINKING_MODE_ENABLED; set VLLM_THINKING=1")
     if "VLLM_THINKING" in os.environ:
         logger.info(f"[PLUGIN] VLLM_THINKING={enabled}")
     if not enabled:

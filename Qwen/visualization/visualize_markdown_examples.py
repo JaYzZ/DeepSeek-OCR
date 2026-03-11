@@ -166,8 +166,8 @@ def render_markdown_html(md_text: str, width: int = 600) -> np.ndarray:
             Path(html_path).unlink()
             if img is not None:
                 return img
-    except:
-        pass
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
+        print(f"Warning: wkhtmltoimage failed ({e}); falling back to text rendering.")
 
     # Fallback: render as text with basic markdown formatting
     Path(html_path).unlink()

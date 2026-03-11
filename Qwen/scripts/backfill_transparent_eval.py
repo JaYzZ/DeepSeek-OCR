@@ -8,6 +8,7 @@ matching the approach used in Qwen/evaluation/run_all_benchmarks.py.
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -15,16 +16,167 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from PIL import Image, ImageFont, ImageDraw
-from transformers import AutoProcessor, AutoTokenizer
-from vllm import LLM, SamplingParams
-from vllm.v1.engine import LoRARequest
-
 _REPO_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
+# Enable thinking plugin before importing vLLM so worker processes also load it.
+os.environ.setdefault("VLLM_THINKING", "1")
+existing_plugins = [p.strip() for p in os.environ.get("VLLM_PLUGINS", "").split(",") if p.strip()]
+if "vllm_thinking" not in existing_plugins:
+    existing_plugins.append("vllm_thinking")
+os.environ["VLLM_PLUGINS"] = ",".join(existing_plugins)
+
+from PIL import Image, ImageFont, ImageDraw
+from tokenizers import AddedToken
+from transformers import AutoProcessor, AutoTokenizer
+
+from vllm_thinking.runner_patch import apply_thinking_mode_patch
+from vllm import LLM, SamplingParams
+from vllm.v1.engine import LoRARequest
+
+from Qwen.scripts.vllm_utils import (
+    apply_runtime_env_for_thinking,
+    infer_tensor_parallel_size,
+    normalize_checkpoint_name,
+    parse_cuda_visible_devices,
+)
+
+apply_thinking_mode_patch()
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+_WARNED_KEYS: set[str] = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    if key in _WARNED_KEYS:
+        return
+    _WARNED_KEYS.add(key)
+    logger.warning(message)
+
+
+def _safe_float(value):
+    if value is None:
+        return None
+    try:
+        v = float(value)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+    except Exception:
+        return None
+
+
+def _serialize_logprob_item(token_id, item):
+    """Serialize a vLLM logprob item across vLLM versions."""
+    # vLLM objects can be plain floats or objects with logprob/rank/decoded_token.
+    logprob = _safe_float(getattr(item, "logprob", item))
+    rank = getattr(item, "rank", None)
+    decoded_token = getattr(item, "decoded_token", None)
+    return {
+        "token_id": int(token_id),
+        "logprob": logprob,
+        "rank": int(rank) if isinstance(rank, int) else rank,
+        "decoded_token": decoded_token,
+    }
+
+
+def _serialize_logprobs_for_steps(token_logprobs, max_steps: int, topk: int):
+    """Convert vLLM token logprobs into JSON-serializable summaries."""
+    if not token_logprobs:
+        return []
+
+    serialized = []
+    steps = min(len(token_logprobs), max_steps)
+    for idx in range(steps):
+        step = token_logprobs[idx]
+        if not isinstance(step, dict):
+            serialized.append({"step": idx, "topk": []})
+            continue
+
+        entries = []
+        for tid, item in step.items():
+            try:
+                token_id = int(tid)
+            except Exception:
+                continue
+            entries.append(_serialize_logprob_item(token_id, item))
+
+        entries.sort(key=lambda x: (x["logprob"] is None, -(x["logprob"] or -1e9)))
+        serialized.append({"step": idx, "topk": entries[:topk]})
+    return serialized
+
+
+def _extract_post_think_candidates(
+    generated_token_ids,
+    token_logprobs,
+    think_start_id: int,
+    probe_token_ids: list[int],
+):
+    think_positions = [i for i, t in enumerate(generated_token_ids) if t == think_start_id]
+    if not think_positions:
+        return None
+    probe_idx = think_positions[0] + 1
+    if probe_idx < 0 or probe_idx >= len(token_logprobs) or not isinstance(token_logprobs[probe_idx], dict):
+        return None
+    lp_map = token_logprobs[probe_idx]
+    candidates = []
+    for tok_id in probe_token_ids:
+        item = lp_map.get(tok_id)
+        if item is None:
+            candidates.append({"token_id": tok_id, "logprob": None, "rank": None, "decoded_token": None})
+        else:
+            candidates.append(_serialize_logprob_item(tok_id, item))
+    return {
+        "probe_step": probe_idx,
+        "chosen_token_id": generated_token_ids[probe_idx] if probe_idx < len(generated_token_ids) else None,
+        "candidates": candidates,
+    }
+
+
+def _extract_display_output(
+    full_output: str,
+) -> str:
+    """Return the visible answer span after the final </think> marker."""
+    return full_output.rsplit("</think>", 1)[-1].strip()
+
+
+def _load_target_prob_trace(path: str) -> dict[str, list[dict]]:
+    traces: dict[str, list[dict]] = {}
+    if not path or not os.path.exists(path):
+        return traces
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            req_id = str(rec.get("req_id", ""))
+            if not req_id:
+                continue
+            traces.setdefault(req_id, []).append(rec)
+    for req_id in traces:
+        traces[req_id].sort(key=lambda x: int(x.get("step", 0)))
+    return traces
+
+
+def _load_target_prob_trace_records(path: str) -> list[dict]:
+    records: list[dict] = []
+    if not path or not os.path.exists(path):
+        return records
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except Exception:
+                continue
+    return records
 
 
 def find_latest_checkpoint(checkpoint_dir: Path) -> Path:
@@ -65,42 +217,47 @@ def load_model_vllm(checkpoint_path: Path, tensor_parallel_size: int = 1, gpu_me
 
     # ============================================================================
     # CRITICAL: Add special tokens for latent thinking BEFORE loading vLLM
-    # Also enable auto-patch for worker processes
     # ============================================================================
 
-    # Enable auto-patch so worker processes will apply the thinking mode patch
-    os.environ["VLLM_THINKING_AUTO_PATCH"] = "1"
+    # Enable thinking plugin in all vLLM processes.
+    os.environ["VLLM_THINKING"] = "1"
 
     # Load tokenizer and add special tokens
     tokenizer_with_special_tokens = AutoTokenizer.from_pretrained(
         base_model_path, trust_remote_code=True
     )
 
-    # Add <latent> and <think_sep> as special tokens
+    # Ensure <latent>/<think_sep> are single tokens for inference.
+    # Use regular added tokens (not "special") so they can be generated/displayed
+    # like <think> and </think>.
     special_tokens = ["<latent>", "<think_sep>"]
     added_count = 0
     for token in special_tokens:
         encoded = tokenizer_with_special_tokens.encode(token, add_special_tokens=False)
         if len(encoded) > 1:
-            num_added = tokenizer_with_special_tokens.add_special_tokens(
-                {"additional_special_tokens": [token]},
-                replace_additional_special_tokens=False
-            )
+            num_added = tokenizer_with_special_tokens.add_tokens([token], special_tokens=False)
             added_count += num_added
 
-    if added_count > 0:
-        logger.info(f"Added {added_count} special thinking tokens to tokenizer:")
-        for token in special_tokens:
-            token_id = tokenizer_with_special_tokens.convert_tokens_to_ids(token)
-            logger.info(f"  {token} -> ID {token_id}")
-            # Set environment variables for vLLM thinking mode
-            if token == "<latent>":
-                os.environ["QWEN3VL_LATENT_TOKEN_ID"] = str(token_id)
-            elif token == "<think_sep>":
-                os.environ["QWEN3VL_THINKING_SEP_ID"] = str(token_id)
+    # If checkpoint tokenizer marks these as special, demote them at runtime.
+    # vLLM generation then treats them like regular tokens.
+    for token in special_tokens:
+        token_id = tokenizer_with_special_tokens.convert_tokens_to_ids(token)
+        added = tokenizer_with_special_tokens.added_tokens_decoder.get(token_id)
+        if added is not None and getattr(added, "special", False):
+            tokenizer_with_special_tokens._tokenizer.add_tokens([AddedToken(token, special=False)])
+            logger.info(f"Demoted special token to regular token at runtime: {token} (ID {token_id})")
 
-    # Enable vLLM thinking plugin
-    os.environ["VLLM_THINKING_MODE_ENABLED"] = "1"
+    if added_count > 0:
+        logger.info(f"Added {added_count} regular thinking tokens to tokenizer")
+
+    # Always export unified token IDs used by both training and vLLM plugin.
+    for token in special_tokens:
+        token_id = tokenizer_with_special_tokens.convert_tokens_to_ids(token)
+        logger.info(f"  {token} -> ID {token_id}")
+        if token == "<latent>":
+            os.environ["QWEN3VL_LATENT_TOKEN_ID"] = str(token_id)
+        elif token == "<think_sep>":
+            os.environ["QWEN3VL_THINKING_SEP_ID"] = str(token_id)
 
     # Initialize vLLM
     llm_kwargs = {
@@ -108,7 +265,7 @@ def load_model_vllm(checkpoint_path: Path, tensor_parallel_size: int = 1, gpu_me
         "tensor_parallel_size": tensor_parallel_size,
         "gpu_memory_utilization": gpu_memory_utilization,
         "trust_remote_code": True,
-        "enforce_eager": True,  # Required for thinking mode
+        "enforce_eager": os.environ.get("VLLM_ENFORCE_EAGER", "0") == "1",
         "disable_log_stats": True,
     }
 
@@ -127,7 +284,18 @@ def load_model_vllm(checkpoint_path: Path, tensor_parallel_size: int = 1, gpu_me
     return llm, tokenizer, processor, lora_path
 
 
-def run_evaluation(llm, tokenizer, processor, eval_metadata: Path, lora_path: str = None, max_samples: int = None, repo_root: Path = None):
+def run_evaluation(
+    llm,
+    tokenizer,
+    processor,
+    eval_metadata: Path,
+    lora_path: str = None,
+    max_samples: int = None,
+    repo_root: Path = None,
+    logprobs_k: int = 10,
+    logprobs_max_steps: int = 8,
+    target_prob_trace_path: str | None = None,
+):
     if repo_root is None:
         repo_root = _REPO_ROOT
 
@@ -177,12 +345,14 @@ def run_evaluation(llm, tokenizer, processor, eval_metadata: Path, lora_path: st
             full_samples[sample_id] = sample
 
     results = []
+    debug_samples = []
     start_time = time.time()
 
     # Prepare LoRA request if LoRA is enabled
     lora_request = None
     lora_name = "backfill_lora"
     if lora_path:
+        lora_name = f"backfill_{normalize_checkpoint_name(lora_path)}"
         lora_request = LoRARequest(
             lora_name=lora_name,
             lora_int_id=1,
@@ -257,6 +427,8 @@ def run_evaluation(llm, tokenizer, processor, eval_metadata: Path, lora_path: st
             # This will insert <|vision_start|><|image_pad|><|vision_end|> for each image
             text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
             text = text + "<|im_start|>assistant\n"
+            if os.environ.get("VLLM_FORCE_THINK", "0") == "1":
+                text = text + "<think>"
 
             # Get min/max pixels from processor for vLLM image processing
             min_pixels = getattr(processor.image_processor, 'min_pixels', 28 * 28 * 256)
@@ -302,10 +474,17 @@ def run_evaluation(llm, tokenizer, processor, eval_metadata: Path, lora_path: st
     ]
 
     # Sampling params - match TransparentEvalCallback
+    logger.info(
+        f"Logprob capture: topk={logprobs_k}, max_steps={logprobs_max_steps} "
+        "(target token probs come from runner trace)"
+    )
+
     sampling_params = SamplingParams(
         max_tokens=8192,
         temperature=0.0,  # Greedy for reproducibility
         stop_token_ids=[tokenizer.eos_token_id],
+        skip_special_tokens=False,
+        logprobs=logprobs_k,
     )
 
     logger.info(f"Running batch inference on {len(llm_inputs)} samples...")
@@ -315,22 +494,137 @@ def run_evaluation(llm, tokenizer, processor, eval_metadata: Path, lora_path: st
         outputs = llm.generate(llm_inputs, sampling_params)
 
     # ============ Post-process results ============
+    target_traces = _load_target_prob_trace(target_prob_trace_path or "")
+    if target_prob_trace_path:
+        trace_records = sum(len(v) for v in target_traces.values())
+        logger.info(
+            "Target prob trace loaded: path=%s, requests=%d, records=%d",
+            target_prob_trace_path,
+            len(target_traces),
+            trace_records,
+        )
+        if trace_records == 0:
+            logger.warning(
+                "Target prob trace is empty. step_target_token_logprobs_runner will be empty; "
+                "fallback step_target_token_logprobs only reflects top-k visibility."
+            )
+    think_start_id = int(os.environ.get("QWEN3VL_THINKING_START_ID", "151667"))
+    think_end_id = int(os.environ.get("QWEN3VL_THINKING_END_ID", "151668"))
+    latent_id = int(os.environ.get("QWEN3VL_LATENT_TOKEN_ID", "151669"))
+    think_sep_id = int(os.environ.get("QWEN3VL_THINKING_SEP_ID", "151670"))
+
     for i, (inp, output) in enumerate(zip(batch_inputs, outputs)):
         sample = inp['sample']
         sample_elapsed = time.time() - start_time
 
         generated_text = output.outputs[0].text
+        generated_token_ids = list(output.outputs[0].token_ids or [])
+        token_logprobs = output.outputs[0].logprobs or []
         full_output = generated_text.strip()
+        req_id = str(getattr(output, "request_id", ""))
 
-        # Extract display output (strip thinking tags)
-        display_output = full_output
+        think_start_positions = [idx for idx, tid in enumerate(generated_token_ids) if tid == think_start_id]
+        think_end_positions = [idx for idx, tid in enumerate(generated_token_ids) if tid == think_end_id]
+        latent_positions = [idx for idx, tid in enumerate(generated_token_ids) if tid == latent_id]
+        think_sep_positions = [idx for idx, tid in enumerate(generated_token_ids) if tid == think_sep_id]
 
-        # Check for thinking end tag
-        # Note: Qwen3VL thinking uses </think> (token ID 151668) as the end marker
-        if '<think>' in display_output and '</think>' in display_output:
-            display_output = display_output.split('</think>', 1)[-1].strip()
+        display_output = _extract_display_output(full_output)
 
-        logger.info(f"[{i+1}/{len(batch_inputs)}] {sample['id']}: {display_output[:60]}...")
+        logger.info(f"[{datetime.now().strftime('%H:%M:%S')}] [{i+1}/{len(batch_inputs)}] {sample['id']}: {display_output[:60]}...")
+
+        think_span_token_count = 0
+        if think_start_positions and think_end_positions:
+            start = think_start_positions[0]
+            end = think_end_positions[-1]
+            if end > start:
+                think_span_token_count = max(0, end - start - 1)
+
+        # Focus diagnostics: immediately after first <think>, compare </think> vs <latent>.
+        probe_token_ids = [think_start_id, think_end_id, latent_id, think_sep_id]
+        probe_name_by_id = {
+            think_start_id: "think_start",
+            think_end_id: "think_end",
+            latent_id: "latent",
+            think_sep_id: "think_sep",
+        }
+        probe_text_by_id = {
+            think_start_id: "<think>",
+            think_end_id: "</think>",
+            latent_id: "<latent>",
+            think_sep_id: "<think_sep>",
+        }
+        post_think_token_logprobs = _extract_post_think_candidates(
+            generated_token_ids=generated_token_ids,
+            token_logprobs=token_logprobs,
+            think_start_id=think_start_id,
+            probe_token_ids=probe_token_ids,
+        )
+
+        runner_by_step: dict[int, dict] = {}
+        for rec in target_traces.get(req_id, []):
+            try:
+                runner_by_step[int(rec.get("step", 0))] = rec.get("target_logprobs", {}) or {}
+            except Exception:
+                continue
+
+        step_target_logprobs = []
+        max_steps = min(max(len(token_logprobs), len(runner_by_step)), logprobs_max_steps)
+        for step_idx in range(max_steps):
+            if step_idx < len(token_logprobs) and isinstance(token_logprobs[step_idx], dict):
+                step_map = token_logprobs[step_idx]
+            else:
+                step_map = {}
+            step_entry = {"step": step_idx, "tokens": []}
+            for tok_id in probe_token_ids:
+                token_name = probe_name_by_id[tok_id]
+                runner_item = runner_by_step.get(step_idx, {}).get(token_name)
+                if isinstance(runner_item, dict):
+                    step_entry["tokens"].append(
+                        {
+                            "token_id": int(tok_id),
+                            "logprob": _safe_float(runner_item.get("logprob")),
+                            "rank": runner_item.get("rank"),
+                            "decoded_token": probe_text_by_id.get(int(tok_id), tokenizer.decode([int(tok_id)], skip_special_tokens=False)),
+                        }
+                    )
+                    continue
+
+                item = step_map.get(tok_id)
+                if item is None:
+                    step_entry["tokens"].append(
+                        {
+                            "token_id": int(tok_id),
+                            "logprob": None,
+                            "rank": None,
+                            "decoded_token": probe_text_by_id.get(int(tok_id), tokenizer.decode([int(tok_id)], skip_special_tokens=False)),
+                        }
+                    )
+                else:
+                    serialized = _serialize_logprob_item(tok_id, item)
+                    if serialized.get("decoded_token") is None:
+                        serialized["decoded_token"] = probe_text_by_id.get(int(tok_id), tokenizer.decode([int(tok_id)], skip_special_tokens=False))
+                    step_entry["tokens"].append(serialized)
+            step_target_logprobs.append(step_entry)
+
+        token_logprobs_topk = _serialize_logprobs_for_steps(
+            token_logprobs, max_steps=max_steps, topk=logprobs_k
+        )
+        existing_steps = {int(x.get("step", -1)) for x in token_logprobs_topk}
+        for step_idx in range(max_steps):
+            if step_idx not in existing_steps:
+                token_logprobs_topk.append({"step": step_idx, "topk": []})
+        token_logprobs_topk.sort(key=lambda x: int(x.get("step", 0)))
+        for step_entry in token_logprobs_topk:
+            step_idx = int(step_entry.get("step", 0))
+            existing_ids = {int(x.get("token_id")) for x in step_entry.get("topk", [])}
+            for entry in step_entry.get("topk", []):
+                tok_id = int(entry.get("token_id"))
+                if tok_id in probe_text_by_id and not entry.get("decoded_token"):
+                    entry["decoded_token"] = probe_text_by_id[tok_id]
+            for special in step_target_logprobs[step_idx]["tokens"]:
+                tok_id = int(special["token_id"])
+                if tok_id not in existing_ids:
+                    step_entry["topk"].append(special)
 
         results.append({
             'id': sample['id'],
@@ -341,11 +635,31 @@ def run_evaluation(llm, tokenizer, processor, eval_metadata: Path, lora_path: st
             'generated_answer': full_output if full_output else "[EMPTY]",
             'generated_answer_display': display_output if display_output else "[EMPTY]",
         })
+        debug_samples.append({
+            'id': sample['id'],
+            'task': sample['task'],
+            'request_id': getattr(output, "request_id", None),
+            'debug': {
+                'request_id': getattr(output, "request_id", None),
+                'generated_token_ids': generated_token_ids,
+                'generated_num_tokens': len(generated_token_ids),
+                'prompt_num_tokens': len(getattr(output, "prompt_token_ids", []) or []),
+                'think_start_positions': think_start_positions,
+                'think_end_positions': think_end_positions,
+                'latent_positions': latent_positions,
+                'think_sep_positions': think_sep_positions,
+                'think_span_token_count': think_span_token_count,
+                'token_logprobs_topk': token_logprobs_topk,
+                'post_think_token_logprobs': post_think_token_logprobs,
+                'step_target_token_logprobs': step_target_logprobs,
+                'step_target_token_logprobs_runner': target_traces.get(req_id, []),
+            },
+        })
 
     elapsed = time.time() - start_time
     logger.info(f"Generated {len(results)}/{len(samples)} samples in {elapsed:.1f}s ({elapsed/len(results):.1f}s/sample)")
 
-    return results
+    return results, debug_samples
 
 
 def wrap_text(text: str, font, max_width: int) -> list:
@@ -370,7 +684,13 @@ def wrap_text(text: str, font, max_width: int) -> list:
     return lines
 
 
-def save_results(results: list, checkpoint_dir: Path, repo_root: Path = None):
+def save_results(
+    results: list,
+    debug_samples: list,
+    checkpoint_dir: Path,
+    repo_root: Path = None,
+    target_prob_trace_path: str | None = None,
+):
     eval_dir = checkpoint_dir / "eval_results"
     eval_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -381,6 +701,40 @@ def save_results(results: list, checkpoint_dir: Path, repo_root: Path = None):
         json.dump({'timestamp': timestamp, 'num_samples': len(results), 'results': results}, f, indent=2, ensure_ascii=False)
 
     logger.info(f"Saved {len(results)} results to {json_path}")
+
+    # Save compact debug bundle and clean up temporary trace file.
+    trace_records = _load_target_prob_trace_records(target_prob_trace_path or "")
+    trace_by_req: dict[str, list[dict]] = {}
+    for rec in trace_records:
+        req_id = str(rec.get("req_id", ""))
+        if not req_id:
+            continue
+        trace_by_req.setdefault(req_id, []).append(rec)
+    for req_id in trace_by_req:
+        trace_by_req[req_id].sort(key=lambda x: int(x.get("step", 0)))
+
+    debug_path = eval_dir / f"debug_{timestamp}.json"
+    with open(debug_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "timestamp": timestamp,
+                "num_samples": len(results),
+                "source_backfill": str(json_path),
+                "source_debug_trace_file": str(target_prob_trace_path) if target_prob_trace_path else None,
+                "num_target_prob_records": len(trace_records),
+                "sample_debug": debug_samples,
+                "target_prob_trace_records": trace_records,
+                "target_prob_trace_by_req": trace_by_req,
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+    logger.info("Saved debug bundle to %s (records=%d)", debug_path, len(trace_records))
+
+    if target_prob_trace_path and os.path.exists(target_prob_trace_path):
+        os.remove(target_prob_trace_path)
+        logger.info("Removed temporary debug trace file: %s", target_prob_trace_path)
 
     # Generate composite images
     composite_dir = eval_dir / f"backfill_{timestamp}_composite"
@@ -438,8 +792,11 @@ def save_results(results: list, checkpoint_dir: Path, repo_root: Path = None):
                         overlay_draw = ImageDraw.Draw(overlay)
                         overlay_draw.rectangle([abs_x1, abs_y1, abs_x2, abs_y2], fill=(255, 0, 0, 30))
                         images[0] = Image.alpha_composite(img.convert('RGBA'), overlay).convert('RGB')
-                except (ValueError, IndexError):
-                    pass
+                except (ValueError, IndexError) as e:
+                    _warn_once(
+                        "bbox_parse_failure",
+                        f"[Backfill] Failed to parse bbox instruction; skipping overlay. Error: {e}",
+                    )
 
         if not images:
             continue
@@ -524,24 +881,43 @@ def save_results(results: list, checkpoint_dir: Path, repo_root: Path = None):
 
 
 def main():
+    start_time = datetime.now()
+    logger.info(f"=== BACKFILL START: {start_time.strftime('%Y-%m-%d %H:%M:%S')} ===")
+
     parser = argparse.ArgumentParser(description="Backfill transparent eval using vLLM with LoRA")
     parser.add_argument("--checkpoint_dir", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--metadata", type=str, default=None)
     parser.add_argument("--max_samples", type=int, default=None)
-    parser.add_argument("--tensor_parallel_size", type=int, default=1)
+    parser.add_argument(
+        "--tensor_parallel_size",
+        type=int,
+        default=0,
+        help="Tensor parallel size. Use 0 to auto-infer from CUDA_VISIBLE_DEVICES.",
+    )
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.8)
+    parser.add_argument("--logprobs_k", type=int, default=10)
+    parser.add_argument("--logprobs_max_steps", type=int, default=8)
     args = parser.parse_args()
+    apply_runtime_env_for_thinking(repo_root=_REPO_ROOT, logger=logger)
 
     # Log GPU info
-    cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "not set")
-    logger.info(f"CUDA_VISIBLE_DEVICES: {cuda_devices}")
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    visible_gpus = parse_cuda_visible_devices(cuda_visible)
+    resolved_tp = (
+        infer_tensor_parallel_size(cuda_visible, fallback=1)
+        if args.tensor_parallel_size <= 0
+        else args.tensor_parallel_size
+    )
+    logger.info(f"CUDA_VISIBLE_DEVICES: {','.join(visible_gpus) if visible_gpus else 'not set'}")
+    logger.info(f"Tensor parallel (resolved): {resolved_tp}")
 
     checkpoint_dir = Path(args.checkpoint_dir)
     if args.checkpoint:
         checkpoint_path = checkpoint_dir / args.checkpoint
     else:
         checkpoint_path = find_latest_checkpoint(checkpoint_dir)
+    checkpoint_path = checkpoint_path.resolve()
 
     logger.info(f"Using checkpoint: {checkpoint_path}")
 
@@ -555,16 +931,44 @@ def main():
 
     # Set checkpoint path for VAE loading in vLLM plugin
     os.environ["VLLM_LORA_CHECKPOINT_PATH"] = str(checkpoint_path)
+    trace_dir = checkpoint_path / "eval_results"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    target_prob_trace_path = str(
+        (trace_dir / f"_debug_trace_{int(time.time())}_{os.getpid()}.jsonl").resolve()
+    )
+    os.environ["VLLM_THINKING_TARGET_PROB_PATH"] = target_prob_trace_path
+    os.environ["VLLM_THINKING_TARGET_PROB_MAX_STEPS"] = str(args.logprobs_max_steps)
+    if os.path.exists(target_prob_trace_path):
+        os.remove(target_prob_trace_path)
 
     llm, tokenizer, processor, lora_path = load_model_vllm(
         checkpoint_path,
-        tensor_parallel_size=args.tensor_parallel_size,
+        tensor_parallel_size=resolved_tp,
         gpu_memory_utilization=args.gpu_memory_utilization,
     )
 
-    results = run_evaluation(llm, tokenizer, processor, eval_metadata, lora_path, args.max_samples, _REPO_ROOT)
-    save_results(results, checkpoint_path, _REPO_ROOT)
-    logger.info("Backfill complete!")
+    results, debug_samples = run_evaluation(
+        llm=llm,
+        tokenizer=tokenizer,
+        processor=processor,
+        eval_metadata=eval_metadata,
+        lora_path=lora_path,
+        max_samples=args.max_samples,
+        repo_root=_REPO_ROOT,
+        logprobs_k=args.logprobs_k,
+        logprobs_max_steps=args.logprobs_max_steps,
+        target_prob_trace_path=target_prob_trace_path,
+    )
+    save_results(
+        results=results,
+        debug_samples=debug_samples,
+        checkpoint_dir=checkpoint_path,
+        repo_root=_REPO_ROOT,
+        target_prob_trace_path=target_prob_trace_path,
+    )
+    end_time = datetime.now()
+    duration = end_time - start_time
+    logger.info(f"=== BACKFILL COMPLETE: {end_time.strftime('%Y-%m-%d %H:%M:%S')} | Duration: {duration} ===")
 
 
 if __name__ == "__main__":

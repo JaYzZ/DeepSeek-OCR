@@ -1,30 +1,34 @@
 ### model
-# Native Qwen3-VL-2B-Thinking with latent supervision for thinking training
+# Native Qwen3-VL-2B-Thinking with latent supervision for R1-OneVision training.
 #
-# Special tokens for thinking/reasoning:
-# - <think> (151667): Opens thinking section
-# - </think> (151668): Closes thinking section
-# - <latent> (auto-added): Marker where latent supervision is applied
-# - <think_sep> (auto-added): Separator between thinking steps
+# Sequence format:
+# - Assistant target is `<think><latent>...<think_sep>... </think>{answer}`.
+# - In this dataset, most samples are single-step, so the common case is
+#   `<think><latent></think>{answer}` (no `<think_sep>` present).
 #
-# Architecture:
-# 1. Input: Question TEXT + Question IMAGE (both present in forward pass)
-#    Example: "What's in this image?" + <vision_start><image_pad>*N<vision_end>
+# Token / latent handling at train time:
+# 1. The collator expands each `<latent>` token to match the latent sequence length
+#    recorded in `latent_seq_lens` / `latent_ground_truth`.
+# 2. The expanded positions receive injected latent embeddings from
+#    `latent_ground_truth`.
+# 3. Main full-sequence CE still supervises the structural scaffold:
+#    `<think>`, `</think>`, and `<think_sep>` when present.
+# 4. Optional latent-step CE on the expanded latent region is controlled by the
+#    shared runtime env (`qwen3vl_runtime_env.yaml`, used by train/backfill/server):
+#    - `latent_step_ce_loss=1` enables CE on expanded latent positions.
+#    - `latent_step_ce_token=0` uses the prebuilt `cot_chunk_token_ids`.
+#    - `latent_step_ce_token=1` forces `<latent>` labels on those positions.
 #
-# 2. Output: <think><latent></think> Answer text
+# Hidden-state losses:
+# - `pre_think_mse` compares shifted hidden states against `latent_ground_truth`.
+# - `ot/mse/repa/nce` compare latent positions to `latent_supervision`.
+# - `vae` enables the latent VAE and an auxiliary `pred_embed_forward` CE pass
+#   that reuses the same supervision region/targets as the main CE path.
 #
-# 3. Training:
-#    - Pre-encoding (offline): Question image + rendered thinking text → cross-attention
-#      → [100, 2048] latent reference saved as .latent.pt
-#    - Forward pass: Question text + question image → LLM hidden states at <latent>
-#    - Loss: CE loss + Thinking loss (OT/MSE/REPA on LLM hidden states vs latent reference)
-#    - NO reverse projection - direct supervision on LLM hidden states
-#
-# Key differences from DPSK/OCRVL:
-# - Uses Qwen3VL's native vision model (not DPSK OCR encoder)
-# - Question TEXT in input (not just encoded image)
-# - Direct LLM hidden state supervision (no LatentVisualHead reverse projection)
-# - Latent supervision via OT/MSE/REPA loss on [B, seq, 2048] hidden states
+# Key differences from OCRVL / DPSK-based setups:
+# - Native Qwen3-VL vision tower, no OCRVL wrapper or DPSK encoder in this run.
+# - Question text stays in the normal chat sequence.
+# - Direct hidden-state supervision, no reverse projection head.
 model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking
 add_special_tokens: "<latent>,<think_sep>"
 image_max_pixels: 262144
@@ -35,35 +39,25 @@ flash_attn: fa2
 ### method
 stage: sft
 do_train: true
-do_eval: false  # Use transparent evaluation callback instead
+do_eval: false  # Transparent eval is run later via backfill; no in-trainer eval loop here.
 finetuning_type: lora
 lora_rank: 8
 lora_alpha: 16
 lora_dropout: 0.05
 lora_target: q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj
-
-# No OCR connectors needed (using Qwen3VL native vision)
 freeze_vision_tower: true
 
 ### dataset
-# R1-OneVision Thinking Training with Qwen3VL Native Cross-Attention
-#
-# Dataset format (LlamaFactory ShareGPT):
-#   {
-#     "messages": [
-#       {"role": "user", "content": "<image>\nQuestion"},
-#       {"role": "assistant", "content": "Thinking...\nAnswer"}
-#     ],
-#     "images": ["question.png"],
-#     "latent_supervision": ["question.png__thinking_0.latent.pt"],
-#     "num_latent_steps": 3
-#   }
-#
-# During training:
-# 1. Question image: Processed by Qwen3VL native vision tower
-# 2. Latent supervision: Pre-extracted [100, hidden_dim] features from cross-attention
-# 3. Injection: Latents injected at `<latent>` token positions
-# 4. Loss: Cross-entropy on answer + MSE on latent reconstruction
+# Dataset columns expected by the patched collator / latent forward path:
+# - `messages`: standard ShareGPT chat sequence
+# - `images`: question image path(s)
+# - `latent_ground_truth`: one latent tensor path per thinking chunk
+# - `latent_supervision`: optional hidden-state supervision targets
+# - `latent_seq_lens`: expanded latent lengths, used to size latent expansion without
+#   loading tensors in dataloader workers
+# - `cot_chunk_token_ids`: one tokenized CoT chunk per latent step, used when
+#   `latent_step_ce_token=0`
+# - `num_latent_steps`: number of thinking chunks (`<think_sep>` count + 1)
 dataset: qwen3vl_r1_onevision_thinking
 dataset_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/data
 template: qwen3vl_latent
@@ -71,9 +65,9 @@ cutoff_len: 8192
 max_samples: null
 streaming: false
 packing: false
-preprocessing_num_workers: 4
-dataloader_num_workers: 4
-dataloader_prefetch_factor: 2
+preprocessing_num_workers: 8
+dataloader_num_workers: 8
+dataloader_prefetch_factor: 4
 
 ### eval
 # eval_dataset: qwen3vl_transparent_eval
@@ -92,8 +86,15 @@ overwrite_output_dir: false
 save_only_model: false
 report_to: none
 log_level: info
+use_swanlab: true
+swanlab_mode: cloud
+swanlab_project: qwen3vl-r1-onevision
 
 ### train
+# FSDP note:
+# - Keep `gradient_checkpointing=false` here.
+# - Use `fsdp_config.activation_checkpointing=true` instead to avoid the redundant
+#   all-gather warning path seen with FSDP + `gradient_checkpointing=true`.
 per_device_train_batch_size: 32
 gradient_accumulation_steps: 2
 dataloader_drop_last: true
@@ -103,19 +104,21 @@ lr_scheduler_type: cosine
 warmup_ratio: 0.1
 bf16: true
 pure_bf16: true
+gradient_checkpointing: false
 dataloader_pin_memory: true
 dataloader_persistent_workers: true
 
-# FSDP configuration
+# FSDP configuration for LoRA + latent-VAE training.
 fsdp:
   - full_shard
   - auto_wrap
 fsdp_config:
+  activation_checkpointing: true
   fsdp_auto_wrap_policy: SIZE_BASED_WRAP
   fsdp_min_num_params: 100000
   fsdp_backward_prefetch: BACKWARD_PRE
   fsdp_forward_prefetch: false
-  fsdp_use_orig_params: true  # CRITICAL: Required for summon_full_params to work with LoRA modules
+  fsdp_use_orig_params: true  # Required for summon_full_params with LoRA / extra modules.
   fsdp_cpu_ram_efficient_loading: false
   fsdp_sync_module_states: true
   fsdp_state_dict_type: full_state_dict
@@ -124,4 +127,3 @@ ddp_find_unused_parameters: false
 ddp_timeout: 180000000
 resume_from_checkpoint: null
 adapter_name_or_path: null
-

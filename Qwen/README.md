@@ -97,7 +97,7 @@ Supported terms:
 3) **VAE loss (optional, when `vae` is included in `QWEN3VL_LOSS_TYPE`)**
 - Adds a `latent_vae` module to map shifted hidden states -> latent distribution.
 - Computes NLL against the `latent_ground_truth` targets.
-- Also runs a **second forward** (`pred_embed_forward`) with VAE-sampled latents inserted, and applies CE **on answer tokens only**.
+- Also runs a **second forward** (`pred_embed_forward`) with VAE-sampled latents inserted, and reuses the **same CE supervision mask/targets as the main forward**.
 
 ## Curriculum Learning
 
@@ -146,9 +146,6 @@ export VLLM_THINKING_MODE_ENABLED=1
 
 Useful env vars:
 ```bash
-# Let vLLM auto-apply the plugin patch (used by our evaluation scripts).
-export VLLM_THINKING_AUTO_PATCH=1
-
 # Helps the plugin find `vae.safetensors` for latent_vae loading (optional).
 export VLLM_LORA_CHECKPOINT_PATH=/path/to/your/checkpoint-dir
 ```

@@ -428,7 +428,7 @@ def run_evaluation(args):
                         # Validate that it has the expected structure
                         if isinstance(json_data, list):
                             break
-                    except:
+                    except (SyntaxError, ValueError):
                         continue
 
                 # If no JSON found, skip this prediction
@@ -700,8 +700,8 @@ def main():
                             help="Maximum LoRA rank (default: 64)")
 
     # Generation parameters
-    infer_parser.add_argument("--max-new-tokens", type=int, default=32768,
-                            help="Maximum number of tokens to generate (default: 32768)")
+    infer_parser.add_argument("--max-new-tokens", type=int, default=8192,
+                            help="Maximum number of tokens to generate (default: 8192)")
     infer_parser.add_argument("--temperature", type=float, default=0.7,
                             help="Temperature for sampling (default: 0.7)")
     infer_parser.add_argument("--top-p", type=float, default=0.8,

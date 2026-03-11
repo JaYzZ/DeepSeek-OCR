@@ -3,6 +3,7 @@ Thinking Mode Patch for vLLM - Continuous Latent AR
 """
 
 import functools
+import json
 import logging
 import os
 import sys
@@ -17,18 +18,76 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
 logger = logging.getLogger(__name__)
-_THINKING_DEBUG = os.environ.get("VLLM_THINKING_DEBUG", "1") == "1"
+_THINKING_DEBUG = os.environ.get("VLLM_THINKING_DEBUG", "0") == "1"
+_TARGET_PROB_IO_WARNED = False
 
 # Persistent debug log file
 _DEBUG_LOG_FILE = "/tmp/vllm_thinking_debug.log"
 
 def _debug_log(msg: str):
-    """Write debug message to stderr - visible in worker output"""
+    """Write debug message to stderr - visible in worker output."""
+    if not _THINKING_DEBUG:
+        return
     timestamp = time.strftime("%H:%M:%S.%f")[:-3]
     log_msg = f"[{timestamp}] [VLLM_THINK] {msg}"
     print(log_msg, flush=True, file=sys.stderr)
 
+
+def _append_target_prob(record: dict):
+    global _TARGET_PROB_IO_WARNED
+    target_prob_path = os.environ.get("VLLM_THINKING_TARGET_PROB_PATH", "")
+    if not target_prob_path:
+        return
+    try:
+        with open(target_prob_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        # Never fail generation because of debug I/O.
+        if not _TARGET_PROB_IO_WARNED:
+            _TARGET_PROB_IO_WARNED = True
+            logger.warning("[Thinking] Failed to write target prob trace to %s", target_prob_path)
+
 import time
+
+
+# Lazy token ID resolution - reads from env vars set by llamafactory integration.py
+# This ensures train/infer consistency
+
+def _get_thinking_token_ids():
+    """Resolve thinking token IDs.
+
+    Canonical source is QWEN3VL_* IDs exported by training/eval scripts.
+    """
+    return (
+        int(os.environ.get("QWEN3VL_THINKING_START_ID", "151667")),
+        int(os.environ.get("QWEN3VL_THINKING_END_ID", "151668")),
+        int(os.environ.get("QWEN3VL_LATENT_TOKEN_ID", "151669")),
+        int(os.environ.get("QWEN3VL_THINKING_SEP_ID", "151670")),
+    )
+
+
+# Lazy initialization - token IDs resolved at runtime
+_THINK_START_ID = None
+_THINK_END_ID = None
+_LATENT_TOKEN_ID = None
+_THINK_SEP_ID = None
+
+
+def _get_token_id(name):
+    """Lazy load token ID on first access."""
+    global _THINK_START_ID, _THINK_END_ID, _LATENT_TOKEN_ID, _THINK_SEP_ID
+    if _THINK_START_ID is None:
+        _THINK_START_ID, _THINK_END_ID, _LATENT_TOKEN_ID, _THINK_SEP_ID = _get_thinking_token_ids()
+        logger.info(f"[Thinking] Token IDs resolved: start={_THINK_START_ID}, end={_THINK_END_ID}, latent={_LATENT_TOKEN_ID}, sep={_THINK_SEP_ID}")
+    if name == 'think_start':
+        return _THINK_START_ID
+    elif name == 'think_end':
+        return _THINK_END_ID
+    elif name == 'latent':
+        return _LATENT_TOKEN_ID
+    elif name == 'think_sep':
+        return _THINK_SEP_ID
+    return None
 
 
 class LatentVAE(nn.Module):
@@ -75,13 +134,17 @@ class LatentVAE(nn.Module):
         return dist.rsample()
 
 
-# Token IDs
-THINK_START_ID = 151667  # <think>
-THINK_END_ID = 151668   # </think>
-
-LATENT_TOKEN_ID = 151669  # <latent>
-THINK_SEP_ID = 151670   # <think_sep>
+# Token IDs now resolved lazily via _get_token_id() - see section above
 DEFAULT_THINKING_LENGTH = 1024  # Will be min(max_tokens//2, 1024)
+DEFAULT_MIN_CONTINUOUS_STEPS = 0
+
+
+def _get_min_continuous_steps() -> int:
+    """Minimum continuous AR steps before allowing </think> to exit mode."""
+    try:
+        return max(0, int(os.environ.get("MIN_CONTINUOUS_STEPS", str(DEFAULT_MIN_CONTINUOUS_STEPS))))
+    except Exception:
+        return DEFAULT_MIN_CONTINUOUS_STEPS
 
 _patch_applied = False
 
@@ -97,6 +160,14 @@ def apply_thinking_mode_patch():
         return
     if hasattr(GPUModelRunner, '_thinking_patch_applied'):
         return
+    target_prob_path = os.environ.get("VLLM_THINKING_TARGET_PROB_PATH", "")
+    target_prob_max_steps = int(os.environ.get("VLLM_THINKING_TARGET_PROB_MAX_STEPS", "8"))
+    if target_prob_path:
+        logger.info(
+            "[Thinking] Target prob trace enabled: path=%s max_steps=%s",
+            target_prob_path,
+            target_prob_max_steps,
+        )
 
     # ============== VAE Loading ==============
     def _load_latent_vae_from_checkpoint(self):
@@ -136,6 +207,22 @@ def apply_thinking_mode_patch():
 
         logger.warning("[Thinking] No VAE found")
 
+    def _detect_initial_mode_from_prompt(prompt_ids) -> str:
+        prompt_ids = list(prompt_ids or [])
+        if not prompt_ids:
+            return "discrete"
+
+        think_start_id = _get_token_id("think_start")
+        think_end_id = _get_token_id("think_end")
+        last_start = -1
+        last_end = -1
+        for idx, tok in enumerate(prompt_ids):
+            if tok == think_start_id:
+                last_start = idx
+            elif tok == think_end_id:
+                last_end = idx
+        return "continuous" if last_start > last_end else "discrete"
+
     # ============== Init ==============
     _orig_init = GPUModelRunner.__init__
 
@@ -145,6 +232,118 @@ def apply_thinking_mode_patch():
         self._thinking_state = {}
         self._vae_loaded = False
         self.latent_vae = None
+        # Use vLLM's native mixed token/embed input path so the model call
+        # signature stays static across decode iterations.
+        self.enable_prompt_embeds = True
+
+    def _get_or_create_req_embed_storage(self, req_idx: int) -> torch.Tensor:
+        storage = self.input_batch.req_prompt_embeds.get(req_idx)
+        if storage is None or storage.shape[0] != self.max_model_len:
+            storage = torch.zeros(
+                (self.max_model_len, self.hidden_size),
+                dtype=self.dtype,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
+            self.input_batch.req_prompt_embeds[req_idx] = storage
+        return storage
+
+    def _set_next_decode_embedding(
+        self,
+        req_idx: int,
+        token_pos: int,
+        embedding: torch.Tensor | None,
+    ) -> None:
+        if token_pos < 0 or token_pos >= self.max_model_len:
+            return
+        if embedding is None:
+            self.input_batch.is_token_ids[req_idx, token_pos] = True
+            return
+
+        storage = _get_or_create_req_embed_storage(self, req_idx)
+        emb = embedding.detach()
+        if emb.ndim == 3:
+            emb = emb[0, 0]
+        elif emb.ndim == 2:
+            emb = emb[0]
+        if emb.device.type != "cpu":
+            emb = emb.to(device="cpu", non_blocking=False)
+        if emb.dtype != self.dtype:
+            emb = emb.to(dtype=self.dtype)
+        storage[token_pos].copy_(emb)
+        self.input_batch.is_token_ids[req_idx, token_pos] = False
+
+    def _verify_continuous_decode_inputs(self, scheduler_output) -> None:
+        if not _THINKING_DEBUG or scheduler_output is None:
+            return
+
+        req_data = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if req_data is None or not getattr(req_data, "req_ids", None):
+            return
+
+        num_sched_map = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+        req_to_num_computed = {
+            req_id: int(req_data.num_computed_tokens[i])
+            for i, req_id in enumerate(req_data.req_ids)
+        }
+
+        for req_id, decode_pos in req_to_num_computed.items():
+            if int(num_sched_map.get(req_id, 0)) <= 0:
+                continue
+            state = self._thinking_state.get(req_id)
+            if not state or state.get("mode") != "continuous":
+                continue
+
+            expected = state.get("embedding")
+            if expected is None:
+                _debug_log(f"[VERIFY] req={req_id} continuous but has no cached embedding")
+                continue
+
+            req_idx = self.input_batch.req_id_to_index.get(req_id)
+            if req_idx is None:
+                raise RuntimeError(f"[VLLM_THINK][VERIFY] req={req_id} missing from req_id_to_index")
+
+            if decode_pos < 0 or decode_pos >= self.max_model_len:
+                raise RuntimeError(
+                    f"[VLLM_THINK][VERIFY] req={req_id} invalid decode_pos={decode_pos} max_model_len={self.max_model_len}"
+                )
+
+            is_token = bool(self.input_batch.is_token_ids[req_idx, decode_pos])
+            if is_token:
+                raise RuntimeError(
+                    f"[VLLM_THINK][VERIFY] req={req_id} decode_pos={decode_pos} unexpectedly marked as token-id input"
+                )
+
+            storage = self.input_batch.req_prompt_embeds.get(req_idx)
+            if storage is None:
+                raise RuntimeError(
+                    f"[VLLM_THINK][VERIFY] req={req_id} decode_pos={decode_pos} missing req_prompt_embeds storage"
+                )
+
+            actual = storage[decode_pos]
+            ref = expected.detach()
+            if ref.ndim == 3:
+                ref = ref[0, 0]
+            elif ref.ndim == 2:
+                ref = ref[0]
+            if ref.device.type != "cpu":
+                ref = ref.to(device="cpu", non_blocking=False)
+            if ref.dtype != actual.dtype:
+                ref = ref.to(dtype=actual.dtype)
+
+            max_abs_diff = float((actual - ref).abs().max().item())
+            actual_norm = float(actual.float().norm().item())
+            ref_norm = float(ref.float().norm().item())
+            _debug_log(
+                f"[VERIFY] req={req_id} mode=continuous decode_pos={decode_pos} "
+                f"is_token_ids=False embed_norm={actual_norm:.6f} ref_norm={ref_norm:.6f} "
+                f"max_abs_diff={max_abs_diff:.6e}"
+            )
+            if max_abs_diff > 1e-3:
+                raise RuntimeError(
+                    f"[VLLM_THINK][VERIFY] req={req_id} decode_pos={decode_pos} "
+                    f"embed mismatch max_abs_diff={max_abs_diff:.6e}"
+                )
 
     # ============== VAE Transform Helper ==============
     def _transform_hidden_to_embedding(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -180,10 +379,7 @@ def apply_thinking_mode_patch():
                 if req.req_id not in self._thinking_state:
                     # Initial mode detection from prompt
                     prompt_ids = req.prompt_token_ids or []
-                    has_think = THINK_START_ID in prompt_ids
-                    has_end = THINK_END_ID in prompt_ids
-                    # If prompt has think_start without think_end, start in continuous mode
-                    mode = 'continuous' if (has_think and not has_end) else 'discrete'
+                    mode = _detect_initial_mode_from_prompt(prompt_ids)
 
                     max_tokens = getattr(req, 'max_tokens', 2048) or 2048
                     thinking_length = min(max_tokens // 2, DEFAULT_THINKING_LENGTH)
@@ -195,8 +391,16 @@ def apply_thinking_mode_patch():
                         'embedding': None,
                         'thinking_length': thinking_length,
                         'max_thinking_length': thinking_length,  # Store max for reset on think_sep
+                        'min_continuous_steps': _get_min_continuous_steps(),
                     }
-                    _debug_log(f"[DEBUG] New req {req.req_id}: mode={mode}, thinking_length={thinking_length}")
+                    _debug_log(
+                        f"[DEBUG] New req {req.req_id}: mode={mode}, "
+                        f"thinking_length={thinking_length}, "
+                        f"prompt_len={len(prompt_ids)}, "
+                        f"start_count={sum(1 for t in prompt_ids if t == _get_token_id('think_start'))}, "
+                        f"end_count={sum(1 for t in prompt_ids if t == _get_token_id('think_end'))}, "
+                        f"prompt_tail={prompt_ids[-12:]}"
+                    )
 
         # Track cached requests
         if hasattr(scheduler_output, 'scheduled_cached_reqs') and scheduler_output.scheduled_cached_reqs:
@@ -211,106 +415,8 @@ def apply_thinking_mode_patch():
                 self._thinking_state.pop(req_id, None)
                 _debug_log(f"[DEBUG] Finished req {req_id}: removed from state")
 
-        # Link model to runner
-        if not hasattr(self.model, '_model_runner'):
-            self.model._model_runner = self
-            # Wrap the model call to inject inputs_embeds
-            _wrap_model_call(self)
-
+        _verify_continuous_decode_inputs(self, scheduler_output)
         return _orig_execute_model(self, scheduler_output, intermediate_tensors)
-
-    # ============== Wrap Model Call ==============
-    def _wrap_model_call(self):
-        """Wrap self.model() to inject inputs_embeds for continuous mode."""
-        if hasattr(self.model, '_model_call_wrapped'):
-            return
-
-        orig_model = self.model.__class__.__call__
-
-        @functools.wraps(orig_model)
-        def patched_model_call(*args, **kwargs):
-            # Check if we have continuous mode with embedding
-            inputs_embeds = None
-            if hasattr(self, '_thinking_state'):
-                # Get batch info
-                batch_size = 1
-                batch_req_ids = []
-                if hasattr(self, 'input_batch') and hasattr(self.input_batch, 'req_ids'):
-                    batch_req_ids = self.input_batch.req_ids
-                    batch_size = len(batch_req_ids)
-
-                # Check if any request is in continuous mode
-                any_continuous = any(
-                    self._thinking_state.get(rid, {}).get('mode') == 'continuous'
-                    for rid in batch_req_ids
-                ) if batch_req_ids else False
-
-                if any_continuous and batch_req_ids:
-                    # Need to build inputs_embeds for ENTIRE batch
-                    input_ids = kwargs.get('input_ids')
-                    hidden_size = self.model.config.text_config.hidden_size
-
-                    # Get token embeddings from model
-                    token_embeds = None
-                    embed_found = False
-                    if input_ids is not None and hasattr(self.model, 'language_model'):
-                        # Get embedding layer from language model
-                        lm = self.model.language_model
-                        if hasattr(lm, 'embed_tokens'):
-                            token_embeds = lm.embed_tokens(input_ids)
-                            embed_found = True
-                        elif hasattr(lm, 'model') and hasattr(lm.model, 'embed_tokens'):
-                            token_embeds = lm.model.embed_tokens(input_ids)
-                            embed_found = True
-
-                    _debug_log(f"[DEBUG] patched_model_call: embed_tokens found={embed_found}, token_embeds={token_embeds.shape if token_embeds is not None else None}")
-
-                    inputs_embeds_list = []
-                    for idx, rid in enumerate(batch_req_ids):
-                        state = self._thinking_state.get(rid, {})
-                        mode = state.get('mode', 'discrete')
-                        if state.get('mode') == 'continuous' and state.get('embedding') is not None:
-                            # Continuous mode: use VAE embedding
-                            e = state['embedding']
-                            if e.device != torch.device('cuda'):
-                                e = e.cuda()
-                            if e.dtype != torch.bfloat16:
-                                e = e.to(dtype=torch.bfloat16)
-                            inputs_embeds_list.append(e)
-                            _debug_log(f"[DEBUG] patched_model_call: req={rid} idx={idx} using VAE emb")
-                        elif token_embeds is not None:
-                            # Discrete mode: use token embedding (last token)
-                            inputs_embeds_list.append(token_embeds[idx, -1, :].unsqueeze(0))
-                            _debug_log(f"[DEBUG] patched_model_call: req={rid} idx={idx} using token emb")
-                        else:
-                            # Fallback: cannot handle
-                            inputs_embeds_list = None
-                            _debug_log(f"[DEBUG] patched_model_call: req={rid} idx={idx} FAILED")
-                            break
-
-                    if inputs_embeds_list is not None:
-                        # Each element is [1, hidden], stack gives [batch, 1, hidden]
-                        inputs_embeds = torch.stack(inputs_embeds_list)
-                        _debug_log(f"[DEBUG] patched_model_call: mixed batch embeddings shape={inputs_embeds.shape}")
-                    else:
-                        _debug_log(f"[DEBUG] patched_model_call: cannot get token embeddings, falling back to discrete")
-
-            if inputs_embeds is not None:
-                kwargs['inputs_embeds'] = inputs_embeds
-                # Qwen3VL forward requires input_ids as first positional arg, but ignores it when inputs_embeds is provided
-                # We need to replace input_ids with a dummy tensor that has the right shape
-                if 'input_ids' in kwargs:
-                    # Get batch size from inputs_embeds
-                    batch_size = inputs_embeds.shape[0]
-                    # Create dummy input_ids with the same batch size (1 token per sample)
-                    dummy_input_ids = torch.zeros(batch_size, 1, dtype=torch.long, device=inputs_embeds.device)
-                    kwargs['input_ids'] = dummy_input_ids
-
-            return orig_model(*args, **kwargs)
-
-        self.model.__class__.__call__ = patched_model_call
-        self.model._model_call_wrapped = True
-        _debug_log("[DEBUG] Wrapped model call for VAE injection")
 
     # ============== Sample Tokens ==============
     # This is where hidden_states is available from execute_model_state
@@ -319,10 +425,13 @@ def apply_thinking_mode_patch():
     @functools.wraps(_orig_sample_tokens)
     def patched_sample_tokens(self, grammar_output):
         _debug_log(f"[DEBUG] patched_sample_tokens CALLED")
-        # Get hidden_states from execute_model_state
+        # Cache ephemeral outputs before calling original sample_tokens().
+        # vLLM clears execute_model_state inside sample_tokens.
         hidden_states = None
+        logits_for_trace = None
         if hasattr(self, 'execute_model_state') and self.execute_model_state is not None:
             hidden_states = self.execute_model_state.hidden_states
+            logits_for_trace = self.execute_model_state.logits
             _debug_log(f"[DEBUG] sample_tokens: hidden_states shape={hidden_states.shape if hidden_states is not None else 'N/A'}")
 
         # Call original sample_tokens
@@ -373,16 +482,71 @@ def apply_thinking_mode_patch():
                         _debug_log(f"[ERROR] sample_tokens: failed to extract hidden: {e}")
                         continue
 
+                # Optional targeted probability tracing:
+                # compute exact logprobs/ranks for </think>, <latent>, <think_sep>
+                # directly from logits, without requesting full vocab logprobs via vLLM API.
+                target_prob_path = os.environ.get("VLLM_THINKING_TARGET_PROB_PATH", "")
+                target_prob_max_steps = int(os.environ.get("VLLM_THINKING_TARGET_PROB_MAX_STEPS", "8"))
+                if (
+                    target_prob_path
+                    and step < target_prob_max_steps
+                    and logits_for_trace is not None
+                ):
+                    try:
+                        logits = logits_for_trace
+                        if logits.ndim == 2:
+                            row = logits[i].float()
+                        elif logits.ndim == 3:
+                            row = logits[i, -1, :].float()
+                        else:
+                            row = None
+                        if row is not None:
+                            denom = torch.logsumexp(row, dim=-1)
+                            targets = {
+                                "think_start": _get_token_id("think_start"),
+                                "think_end": _get_token_id("think_end"),
+                                "latent": _get_token_id("latent"),
+                                "think_sep": _get_token_id("think_sep"),
+                            }
+                            target_logprobs = {}
+                            vocab = int(row.shape[-1])
+                            for name, tid in targets.items():
+                                if 0 <= tid < vocab:
+                                    tval = row[tid]
+                                    lp = float((tval - denom).item())
+                                    rank = int((row > tval).sum().item() + 1)
+                                    target_logprobs[name] = {"token_id": int(tid), "logprob": lp, "rank": rank}
+                                else:
+                                    target_logprobs[name] = {"token_id": int(tid), "logprob": None, "rank": None}
+                            _append_target_prob(
+                                {
+                                    "req_id": str(req_id),
+                                    "step": int(step),
+                                    "mode": mode,
+                                    "sampled_token_id": int(sampled),
+                                    "target_logprobs": target_logprobs,
+                                }
+                            )
+                    except Exception:
+                        pass
+
                 # Monitor sampled token for mode switching
-                if sampled == THINK_START_ID:
+                if sampled == _get_token_id('think_start'):
                     state['mode'] = 'continuous'
                     state['step'] = 0  # Reset step when starting thinking
                     _debug_log(f"[DEBUG] sample_tokens: switched to continuous (think_start)")
-                elif sampled == THINK_END_ID:
-                    state['mode'] = 'discrete'
-                    state['embedding'] = None
-                    _debug_log(f"[DEBUG] sample_tokens: switched to discrete (think_end)")
-                elif sampled == THINK_SEP_ID:
+                elif sampled == _get_token_id('think_end'):
+                    min_steps = int(state.get('min_continuous_steps', _get_min_continuous_steps()))
+                    if mode == 'continuous' and step < min_steps:
+                        # Ignore early </think> exit signal until minimum continuous steps is reached.
+                        _debug_log(
+                            f"[DEBUG] sample_tokens: ignore early think_end req={req_id} step={step} min_steps={min_steps}"
+                        )
+                    else:
+                        state['mode'] = 'discrete'
+                        state['embedding'] = None
+                        _debug_log(f"[DEBUG] sample_tokens: switched to discrete (think_end)")
+                elif sampled == _get_token_id('think_sep'):
                     # Reset thinking length to limit when think_sep is encountered
                     state['thinking_length'] = state.get('max_thinking_length', DEFAULT_THINKING_LENGTH)
                     state['step'] = 0  # Reset step counter
@@ -393,7 +557,14 @@ def apply_thinking_mode_patch():
                 if state.get('mode') == 'continuous' and step >= thinking_length:
                     # Force the think_end token by replacing the sampled token
                     if i < len(sampled_tokens_list) and sampled_tokens_list[i]:
-                        sampled_tokens_list[i][0] = THINK_END_ID
+                        sampled_tokens_list[i][0] = _get_token_id('think_end')
+                        sampled = sampled_tokens_list[i][0]
+                        req_pos = self.input_batch.num_tokens[ i ] - 1
+                        if req_pos >= 0:
+                            self.input_batch.token_ids_cpu[i, req_pos] = sampled
+                            req_state = self.requests.get(req_id)
+                            if req_state is not None and req_state.output_token_ids:
+                                req_state.output_token_ids[-1] = sampled
                         _debug_log(f"[DEBUG] sample_tokens: forced think_end for req={req_id}")
                     # Switch to discrete mode
                     state['mode'] = 'discrete'
@@ -413,6 +584,17 @@ def apply_thinking_mode_patch():
                         else:
                             # No VAE, use hidden directly as embedding
                             state['embedding'] = last_hidden
+
+                token_pos = self.input_batch.num_tokens[i] - 1
+                if state.get('mode') == 'continuous':
+                    _set_next_decode_embedding(
+                        self,
+                        i,
+                        token_pos,
+                        state.get('embedding'),
+                    )
+                else:
+                    _set_next_decode_embedding(self, i, token_pos, None)
 
         return result
 

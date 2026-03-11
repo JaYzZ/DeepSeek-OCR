@@ -403,7 +403,7 @@ def run_evaluation(args):
 
     # Build judge model
     model = build_judge(
-        model=getattr(args, 'eval_model', 'gpt-4o-2024-05-13'),
+        model=getattr(args, 'eval_model', 'gpt-4o'),
         api_type=getattr(args, 'api_type', 'dash'),
         api_url=getattr(args, 'api_url', None),
         api_key=getattr(args, 'api_key', None)

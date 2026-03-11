@@ -378,7 +378,7 @@ def run_evaluation(args):
 
     # Build judge model
     model = build_judge(
-        model=getattr(args, 'eval_model', 'gpt-3.5-turbo-0125'),
+        model=getattr(args, 'eval_model', 'gpt-4o'),
         api_type=getattr(args, 'api_type', 'dash'),
         api_url=getattr(args, 'api_url', None),
         api_key=getattr(args, 'api_key', None)
@@ -512,8 +512,8 @@ def main():
     eval_parser.add_argument("--dataset", type=str, default="MMMU_DEV_VAL", help="Dataset name")
     eval_parser.add_argument("--limit", type=int, default=None,
                             help="Limit evaluation to N samples (deterministic sampling, default: all)")
-    eval_parser.add_argument("--eval-model", type=str, default="gpt-3.5-turbo-0125",
-                            help="Model to use for evaluation (default: gpt-3.5-turbo-0125)")
+    eval_parser.add_argument("--eval-model", type=str, default="gpt-4o",
+                            help="Model to use for evaluation (default: gpt-4o)")
     eval_parser.add_argument("--api-type", type=str, default="custom", choices=["custom", "local", "dash", "mit"],
                             help="API type for evaluation (default: custom)")
     eval_parser.add_argument("--api-url", type=str, default=None,

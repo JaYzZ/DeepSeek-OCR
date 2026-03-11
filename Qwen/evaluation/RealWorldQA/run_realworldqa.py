@@ -329,18 +329,13 @@ def run_evaluation(args):
     output_dir = os.path.dirname(args.output_file)
     os.makedirs(output_dir, exist_ok=True)
     
-    # Build judge model (if specified)
-    model = None
-    if args.eval_model:
-        model = build_judge(
-            model=args.eval_model,
-            api_type=getattr(args, 'api_type', 'dash'),
-            api_url=getattr(args, 'api_url', None),
-            api_key=getattr(args, 'api_key', None)
-        )
-        print(f"✓ Evaluation model: {args.eval_model}")
-    else:
-        print("⚠️  No evaluation model specified, using rule-based extraction only")
+    model = build_judge(
+        model=getattr(args, 'eval_model', 'gpt-4o'),
+        api_type=getattr(args, 'api_type', 'dash'),
+        api_url=getattr(args, 'api_url', None),
+        api_key=getattr(args, 'api_key', None)
+    )
+    print(f"✓ Evaluation model: {args.eval_model}")
     
     # Prepare evaluation tasks
     items = []
@@ -472,8 +467,8 @@ def main():
     eval_parser.add_argument("--dataset", type=str, default="RealWorldQA", help="Dataset name")
     eval_parser.add_argument("--limit", type=int, default=None,
                             help="Limit evaluation to N samples (deterministic sampling, default: all)")
-    eval_parser.add_argument("--eval-model", type=str, default=None,
-                            help="Model to use for evaluation (default: None, use rule-based only)")
+    eval_parser.add_argument("--eval-model", type=str, default="gpt-4o",
+                            help="Model to use for evaluation (default: gpt-4o)")
     eval_parser.add_argument("--api-type", type=str, default="custom", choices=["custom", "local", "dash", "mit"],
                             help="API type for evaluation (default: custom)")
     eval_parser.add_argument("--api-url", type=str, default=None,

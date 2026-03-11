@@ -4,8 +4,7 @@ import os
 import time
 import argparse
 
-os.environ["VLLM_THINKING_MODE_ENABLED"] = "1"
-os.environ["VLLM_THINKING_AUTO_PATCH"] = "1"
+os.environ["VLLM_THINKING"] = "1"
 
 from PIL import Image
 from qwen_vl_utils import process_vision_info

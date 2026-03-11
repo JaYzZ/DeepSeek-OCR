@@ -1,0 +1,90 @@
+### model
+# Native Qwen3-VL-2B-Thinking with latent supervision for CHIMERA thinking training.
+# Kept aligned with r1-onevision defaults where possible.
+model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking
+add_special_tokens: "<latent>,<think_sep>"
+image_max_pixels: 262144
+video_max_pixels: 16384
+trust_remote_code: true
+flash_attn: fa2
+
+### method
+stage: sft
+do_train: true
+do_eval: false
+finetuning_type: lora
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target: q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj
+freeze_vision_tower: true
+
+### dataset
+# CHIMERA has two generated variants:
+# - image_input: user content includes <image> prompt + question image
+# - text_input: user content is raw question text
+dataset: qwen3vl_chimera_thinking_image_input,qwen3vl_chimera_thinking_text_input
+dataset_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/data
+template: qwen3vl_latent
+cutoff_len: 40960
+max_samples: null
+streaming: false
+packing: false
+preprocessing_num_workers: 4
+dataloader_num_workers: 4
+dataloader_prefetch_factor: 2
+
+### eval
+# eval_dataset: qwen3vl_transparent_eval
+# val_size: 0
+# per_device_eval_batch_size: 1
+# eval_strategy: steps
+# eval_steps: 500
+# predict_with_generate: false
+
+### output
+output_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/qwen3vl-2b/lora/chimera_thinking
+logging_steps: 10
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: false
+save_only_model: false
+report_to: none
+log_level: info
+use_swanlab: true
+swanlab_mode: cloud
+swanlab_project: qwen3vl-chimera
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+dataloader_drop_last: true
+learning_rate: 2.0e-4
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+pure_bf16: true
+gradient_checkpointing: false 
+dataloader_pin_memory: true
+dataloader_persistent_workers: true
+
+# FSDP configuration
+fsdp:
+  - full_shard
+  - auto_wrap
+fsdp_config:
+  fsdp_auto_wrap_policy: SIZE_BASED_WRAP
+  fsdp_min_num_params: 100000
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_forward_prefetch: false
+  fsdp_use_orig_params: true
+  fsdp_cpu_ram_efficient_loading: false
+  fsdp_sync_module_states: true
+  fsdp_state_dict_type: full_state_dict
+  activation_checkpointing: true 
+
+ddp_find_unused_parameters: false
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+adapter_name_or_path: null

@@ -36,7 +36,7 @@ def is_equal(asw: str, gt_asw: str) -> bool:
         b = eval(asw)
         if abs(a - b) < 1e-6:
             return True
-    except:
+    except (SyntaxError, NameError, TypeError, ValueError, ZeroDivisionError):
         pass
     if latex2sympy is not None:
         try:
@@ -46,7 +46,7 @@ def is_equal(asw: str, gt_asw: str) -> bool:
                 return True
             if abs(a - b) < 1e-6:
                 return True
-        except:
+        except (SyntaxError, NameError, TypeError, ValueError, ZeroDivisionError):
             pass
     return False
 
@@ -194,8 +194,9 @@ def post_check(line, prefetch=False):
         else:
             res = str(response)
             ans = str(ans)
-    except ValueError:
-        pass
+    except (ValueError, SyntaxError, NameError, TypeError):
+        res = str(response)
+        ans = str(ans)
 
     if is_equal(res, ans):
         return res if prefetch else True

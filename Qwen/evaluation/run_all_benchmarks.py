@@ -38,11 +38,11 @@ from config import get_data_path, QWEN3_VL_2B_THINKING
 
 
 class BenchmarkLogger:
-    """Logger that writes to both console and bench.log file."""
+    """Logger that writes to both console and benchmark.log file."""
 
     def __init__(self, run_dir: str):
         self.run_dir = run_dir
-        self.log_file = os.path.join(run_dir, "bench.log")
+        self.log_file = os.path.join(run_dir, "benchmark.log")
         self._file = None
 
     def __enter__(self):
@@ -197,8 +197,7 @@ def run_unified_inference(
     env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
 
     # Enable thinking mode for continuous latent AR
-    env["VLLM_THINKING_MODE_ENABLED"] = "1"
-    env["VLLM_THINKING_AUTO_PATCH"] = "1"
+    env["VLLM_THINKING"] = "1"
 
     # Set LoRA checkpoint path for VAE loading
     if lora_path:
@@ -217,8 +216,7 @@ def run_unified_inference(
         logger.log_command(" ".join(cmd))
         logger.log_dict("Environment", {
             "CUDA_VISIBLE_DEVICES": env["CUDA_VISIBLE_DEVICES"],
-            "VLLM_THINKING_MODE_ENABLED": env["VLLM_THINKING_MODE_ENABLED"],
-            "VLLM_THINKING_AUTO_PATCH": env["VLLM_THINKING_AUTO_PATCH"],
+            "VLLM_THINKING": env["VLLM_THINKING"],
         })
 
     print(f"\n{'='*80}")
@@ -786,28 +784,32 @@ def run_evaluation(
             "dataset": "MathVision",
             "output": "mathvision_eval_result.csv",
             "result_key": "mathvision_eval_result_eval_score.csv",
-            "limit_at_eval": False  # Already limited during inference
+            "limit_at_eval": False,  # Already limited during inference
+            "eval_model": "gpt-4o",
         },
         "MMMU": {
             "script": "mmmu/run_mmmu.py",
             "dataset": "MMMU_DEV_VAL",
             "output": "mmmu_eval_result.csv",
             "result_key": "mmmu_eval_result_acc.json",
-            "limit_at_eval": True   # Need to limit during evaluation
+            "limit_at_eval": True,   # Need to limit during evaluation
+            "eval_model": "gpt-3.5-turbo-0125",
         },
         "RealWorldQA": {
             "script": "RealWorldQA/run_realworldqa.py",
             "dataset": "RealWorldQA",
             "output": "realworldqa_eval_result.csv",
             "result_key": "realworldqa_eval_result_acc.json",
-            "limit_at_eval": True   # Need to limit during evaluation
+            "limit_at_eval": True,   # Need to limit during evaluation
+            "eval_model": "gpt-4o",
         },
         "ODinW-13": {
             "script": "ODinW-13/run_odinw.py",
             "dataset": None,
             "output": "odinw_eval_result.json",
             "result_key": None,
-            "limit_at_eval": False  # Already limited during inference
+            "limit_at_eval": False,  # Already limited during inference
+            "eval_model": None,
         }
     }
 
@@ -834,6 +836,8 @@ def run_evaluation(
     if benchmark != "ODinW-13":
         cmd.extend(["--api-type", "custom"])
         cmd.extend(["--api-url", judge_url])
+        if config.get("eval_model"):
+            cmd.extend(["--eval-model", config["eval_model"]])
 
     # Add dataset argument if applicable
     if config["dataset"]:
@@ -1194,8 +1198,7 @@ def start_vllm_server(
     # Set environment - CRITICAL: pass GPU IDs to server
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
-    env["VLLM_THINKING_MODE_ENABLED"] = "1"
-    env["VLLM_THINKING_AUTO_PATCH"] = "1"
+    env["VLLM_THINKING"] = "1"
     if lora_path:
         env["VLLM_LORA_CHECKPOINT_PATH"] = lora_path
 
@@ -1252,8 +1255,14 @@ def start_vllm_server(
                     print(f"✗ Port {port} is used by another service: {info}")
                     process.kill()
                     return None, None
-        except Exception:
+        except requests.RequestException:
+            # Expected while server is still booting.
             pass
+        except Exception as e:
+            msg = f"Warning: Unexpected error while polling server health: {e}"
+            print(msg)
+            if logger:
+                logger.log(msg)
         time.sleep(5)
 
     if not server_ready:
@@ -1442,8 +1451,7 @@ Examples:
         # Log relevant environment variables
         env_vars = [
             "CUDA_VISIBLE_DEVICES",
-            "VLLM_THINKING_MODE_ENABLED",
-            "VLLM_THINKING_AUTO_PATCH",
+            "VLLM_THINKING",
             "VLLM_LORA_CHECKPOINT_PATH",
             "JUDGE_SERVER_URL",
             "TRANSFORMERS_CACHE",
@@ -1595,8 +1603,10 @@ Examples:
                             os.killpg(server_process.pid, signal.SIGKILL)
                         else:
                             server_process.kill()
-                    except Exception:
-                        pass
+                    except Exception as kill_err:
+                        warn_msg = f"Warning: Failed to force-kill server process {server_process.pid}: {kill_err}"
+                        print(warn_msg)
+                        logger.log(warn_msg)
                 print("✓ Server stopped")
 
     return 0

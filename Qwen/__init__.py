@@ -15,12 +15,18 @@ The integration handles:
 4. Model patching for thinking_projection module
 """
 
+import warnings
+
 # Import the integration on package import
 # This applies patches when PYTHONPATH includes the repo root
 try:
     from .llamafactory.integration import _patch_once
     # Patches are applied automatically in integration.py
-except ImportError:
-    pass
+except ImportError as exc:
+    warnings.warn(
+        f"[Qwen3VL] Failed to import latent integration patches: {exc}",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 __all__ = []

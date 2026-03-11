@@ -25,6 +25,14 @@ from transformers.integrations import is_fsdp_managed_module
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 logger = logging.getLogger(__name__)
+_WARNED_KEYS: set[str] = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    if key in _WARNED_KEYS:
+        return
+    _WARNED_KEYS.add(key)
+    logger.warning(message)
 
 
 class QwenTransparentEvalCallback(TrainerCallback):
@@ -625,8 +633,11 @@ class QwenTransparentEvalCallback(TrainerCallback):
                             overlay_draw = ImageDraw.Draw(overlay)
                             overlay_draw.rectangle([abs_x1, abs_y1, abs_x2, abs_y2], fill=(255, 0, 0, 30))
                             images[0] = Image.alpha_composite(img.convert('RGBA'), overlay).convert('RGB')
-                    except (ValueError, IndexError):
-                        pass
+                    except (ValueError, IndexError) as e:
+                        _warn_once(
+                            "bbox_parse_failure",
+                            f"[QwenTransparentEval] Failed to parse bbox instruction; skipping overlay. Error: {e}",
+                        )
 
             if not images:
                 continue

@@ -34,6 +34,14 @@ except ImportError:
     ocrvl_integration = None
 
 
+def _ocrvl_patches_enabled() -> bool:
+    """Whether OCRVL sitecustomize patches should be applied in this process."""
+    flag = os.environ.get("OCRVL_APPLY_PATCHES")
+    if flag is None:
+        return True
+    return flag.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _patch_once() -> None:
     """Apply all patches."""
     logger = logging.getLogger(__name__)
@@ -49,7 +57,7 @@ def _patch_once() -> None:
             logger.warning(f"[sitecustomize] Failed to apply Qwen patches: {e}")
 
     # Apply OCRVL patches (OCRVL model support)
-    if ocrvl_integration is not None:
+    if ocrvl_integration is not None and _ocrvl_patches_enabled():
         try:
             if hasattr(ocrvl_integration, 'apply_ocrvl_patches'):
                 ocrvl_integration.apply_ocrvl_patches(logger)

@@ -100,8 +100,7 @@ def run_vllm_inference(
         env = os.environ.copy()
 
         # Enable thinking mode for continuous latent AR (if not already set)
-        env.setdefault("VLLM_THINKING_MODE_ENABLED", "1")
-        env.setdefault("VLLM_THINKING_AUTO_PATCH", "1")
+        env.setdefault("VLLM_THINKING", "1")
 
         # Set LoRA checkpoint path for VAE loading (if provided)
         if lora_path:

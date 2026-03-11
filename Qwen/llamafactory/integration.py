@@ -13,11 +13,9 @@ import functools
 import gc
 import logging
 import os
-import pathlib
 import sys
 import time
 import traceback
-import random
 from typing import Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -28,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions
 
-from transformers import AutoTokenizer, PreTrainedModel, TrainerCallback, Trainer
+from transformers import AutoTokenizer, TrainerCallback, Trainer
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
 from peft import PeftModelForCausalLM
 from llamafactory.data import SFTDataCollatorWith4DAttentionMask, loader as loader_module
@@ -51,6 +49,13 @@ from Qwen.llamafactory.curriculum_callback import QwenCurriculumCallback
 logger = logging.getLogger(__name__)
 
 
+def _is_rank0() -> bool:
+    try:
+        return (not dist.is_initialized()) or dist.get_rank() == 0
+    except Exception:
+        return True
+
+
 class QwenLossLoggingCallback(TrainerCallback):
     """Log loss spec + loss breakdown at Trainer logging cadence (rank 0 only).
 
@@ -63,12 +68,12 @@ class QwenLossLoggingCallback(TrainerCallback):
     def __init__(self, model: Any) -> None:
         self._model = model
         self._last_logged_step: int | None = None
+        self._swanlab: Any = None
+        self._swanlab_checked = False
+        self._swanlab_enabled: bool | None = None
 
     def on_log(self, args, state, control, logs=None, **kwargs):
-        try:
-            rank_0 = (not dist.is_initialized()) or dist.get_rank() == 0
-        except Exception:
-            rank_0 = True
+        rank_0 = _is_rank0()
         if not rank_0:
             return
 
@@ -91,11 +96,14 @@ class QwenLossLoggingCallback(TrainerCallback):
             ce = info.get("ce")
             thinking = info.get("thinking")
             vae = info.get("vae")
+            pred_embed = info.get("pred_embed_ce_loss", info.get("pred_embed"))
             total = info.get("total")
+            step_metrics: dict[str, float] = {}
 
             parts: list[str] = []
             if ce is not None:
                 parts.append(f"CE={ce:.4f}")
+                step_metrics["qwen3vl/loss/ce"] = float(ce)
             if thinking is not None:
                 # thinking loss name is embedded in loss_spec (e.g. pre_think_mse / ot / mse).
                 # Prefer showing the explicit spec string the user configured.
@@ -105,16 +113,86 @@ class QwenLossLoggingCallback(TrainerCallback):
                             parts.append(f"{name}={thinking:.4f}")
                 else:
                     parts.append(f"thinking={thinking:.4f}")
+                step_metrics["qwen3vl/loss/thinking"] = float(thinking)
             if vae is not None:
                 parts.append(f"vae={vae:.4f}")
+                step_metrics["qwen3vl/loss/vae"] = float(vae)
+            if use_latent_vae:
+                if pred_embed is not None:
+                    parts.append(f"pred_embed_ce_loss={pred_embed:.4f}")
+                    step_metrics["qwen3vl/loss/pred_embed_ce_loss"] = float(pred_embed)
+                else:
+                    parts.append("pred_embed_ce_loss=NA")
             if total is not None:
                 parts.append(f"Total={total:.4f}")
+                step_metrics["qwen3vl/loss/total"] = float(total)
+
+            if isinstance(logs, dict):
+                if "grad_norm" in logs and logs["grad_norm"] is not None:
+                    step_metrics["qwen3vl/train/grad_norm"] = float(logs["grad_norm"])
+                if "learning_rate" in logs and logs["learning_rate"] is not None:
+                    step_metrics["qwen3vl/train/learning_rate"] = float(logs["learning_rate"])
+                if "epoch" in logs and logs["epoch"] is not None:
+                    step_metrics["qwen3vl/train/epoch"] = float(logs["epoch"])
+                if "loss" in logs and logs["loss"] is not None:
+                    step_metrics["qwen3vl/train/loss"] = float(logs["loss"])
 
             loss_str = f"Loss: {', '.join(parts)}" if parts else "Loss: N/A"
             logger.info(
                 f"\n[Qwen3VL Latent] step={step} loss_spec={loss_spec}, use_latent_vae={use_latent_vae}, {loss_str}"
             )
+            self._log_to_swanlab(step, step_metrics, args)
         self._last_logged_step = step
+
+    def _swanlab_is_enabled(self, args: Any) -> bool:
+        if self._swanlab_enabled is not None:
+            return self._swanlab_enabled
+
+        env_flag = os.environ.get("USE_SWANLAB")
+        if env_flag is not None:
+            self._swanlab_enabled = env_flag.strip().lower() in {"1", "true", "yes", "on"}
+            return self._swanlab_enabled
+
+        use_swanlab = getattr(args, "use_swanlab", None)
+        if use_swanlab is not None:
+            if isinstance(use_swanlab, str):
+                self._swanlab_enabled = use_swanlab.strip().lower() in {"1", "true", "yes", "on"}
+            else:
+                self._swanlab_enabled = bool(use_swanlab)
+            return self._swanlab_enabled
+
+        report_to = getattr(args, "report_to", None)
+        if isinstance(report_to, str):
+            targets = [report_to]
+        elif isinstance(report_to, (list, tuple, set)):
+            targets = [str(x) for x in report_to]
+        else:
+            targets = []
+        self._swanlab_enabled = any(x.strip().lower() == "swanlab" for x in targets)
+        return self._swanlab_enabled
+
+    def _log_to_swanlab(self, step: int, metrics: dict[str, float], args: Any) -> None:
+        if not metrics:
+            return
+        if not self._swanlab_is_enabled(args):
+            return
+
+        if not self._swanlab_checked:
+            self._swanlab_checked = True
+            try:
+                import swanlab  # type: ignore
+
+                self._swanlab = swanlab
+            except Exception:
+                self._swanlab = None
+
+        if self._swanlab is None:
+            return
+
+        try:
+            self._swanlab.log(metrics, step=step)
+        except Exception as e:
+            logger.debug(f"[Qwen3VL Latent] swanlab.log failed: {e}")
 
 
 def _get_loss_spec() -> str:
@@ -281,12 +359,14 @@ def _patch_tokenizer_for_special_tokens(logger) -> None:
                     replace_additional_special_tokens=False
                 )
                 added_count += num_added
-                logger.warning(f"[Qwen3VL Latent] Added token to tokenizer: {token}")
+                if _is_rank0():
+                    logger.info(f"[Qwen3VL Latent] Added token to tokenizer: {token}")
 
         # Set up token ID environment variables
         os.environ["QWEN3VL_THINKING_START_ID"] = "151667"
         os.environ["QWEN3VL_THINKING_END_ID"] = "151668"
-        logger.warning("[Qwen3VL Latent] Using Qwen3VL native thinking tokens: start=151667, end=151668")
+        if _is_rank0():
+            logger.info("[Qwen3VL Latent] Using Qwen3VL native thinking tokens: start=151667, end=151668")
 
         # Store token IDs
         for token in special_tokens:
@@ -294,12 +374,15 @@ def _patch_tokenizer_for_special_tokens(logger) -> None:
             if token_id >= 0 and token_id != tokenizer.unk_token_id:
                 if token == "<latent>":
                     os.environ["QWEN3VL_LATENT_TOKEN_ID"] = str(token_id)
-                    logger.warning(f"[Qwen3VL Latent] {token} = ID {token_id} (env: QWEN3VL_LATENT_TOKEN_ID)")
+                    if _is_rank0():
+                        logger.info(f"[Qwen3VL Latent] {token} = ID {token_id} (env: QWEN3VL_LATENT_TOKEN_ID)")
                 elif token == "<think_sep>":
                     os.environ["QWEN3VL_THINKING_SEP_ID"] = str(token_id)
-                    logger.warning(f"[Qwen3VL Latent] {token} = ID {token_id} (env: QWEN3VL_THINKING_SEP_ID)")
+                    if _is_rank0():
+                        logger.info(f"[Qwen3VL Latent] {token} = ID {token_id} (env: QWEN3VL_THINKING_SEP_ID)")
             else:
-                logger.warning(f"[Qwen3VL Latent] Token {token} not found in vocab - will be added by LlamaFactory")
+                if _is_rank0():
+                    logger.info(f"[Qwen3VL Latent] Token {token} not found in vocab - will be added by LlamaFactory")
 
         return tokenizer
 
@@ -313,7 +396,8 @@ def _patch_once() -> None:
     if os.environ.get("QWEN3VL_LATENT_SUPERVISION", "1") != "1":
         return
 
-    logger.info(f"[Qwen3VL Latent] Starting latent supervision integration...")
+    if _is_rank0():
+        logger.info(f"[Qwen3VL Latent] Starting latent supervision integration...")
 
     # PID-based guard
     pid = str(os.getpid())
@@ -321,7 +405,8 @@ def _patch_once() -> None:
         return
     os.environ["QWEN3VL_LATENT_PATCHED_PID"] = pid
 
-    logger.info("[Qwen3VL Latent] Starting latent supervision integration...")
+    if _is_rank0():
+        logger.info("[Qwen3VL Latent] Starting latent supervision integration...")
 
     # Patch 0: Patch tokenizer for special tokens (<latent>, <think_sep>)
     try:
@@ -386,7 +471,8 @@ def _patch_once() -> None:
     except Exception as e:
         logger.warning(f"[Qwen3VL Latent] Failed to patch model generate: {e}")
 
-    logger.info("[Qwen3VL Latent] ✓ Latent supervision integration complete")
+    if _is_rank0():
+        logger.info("[Qwen3VL Latent] ✓ Latent supervision integration complete")
 
 
 def _patch_model_for_thinking_projection(logger) -> None:
@@ -516,7 +602,14 @@ def _patch_dataset_converter(logger) -> None:
         result = original_call(self, example)
 
         # Preserve latent supervision fields if present
-        latent_fields = ['latent_ground_truth', 'latent_supervision', 'num_latent_steps', 'cot', 'cot_token_ids']
+        latent_fields = [
+            'latent_ground_truth',
+            'latent_supervision',
+            'num_latent_steps',
+            'cot',
+            'latent_seq_lens',
+            'cot_chunk_token_ids',
+        ]
         for field in latent_fields:
             if field in example:
                 result[field] = example[field]
@@ -529,10 +622,87 @@ def _patch_dataset_converter(logger) -> None:
 
 
 def _patch_dataset_preprocessing(logger) -> None:
-    """No longer needed - latent fields are loaded from image path in data collator."""
-    # Latent fields are now loaded in the data collator based on image path
-    # No preprocessing patch required
-    pass
+    """Patch supervised preprocessing to preserve latent metadata fields.
+
+    LlamaFactory's supervised processors emit only model tensors by default.
+    We keep CHIMERA latent fields aligned with valid samples so the collator
+    receives them directly (no path-based reconstruction fallback).
+    """
+    original_preprocess = SupervisedDatasetProcessor.preprocess_dataset
+    latent_fields = [
+        "latent_ground_truth",
+        "latent_supervision",
+        "num_latent_steps",
+        "cot",
+        "latent_seq_lens",
+        "cot_chunk_token_ids",
+    ]
+
+    @functools.wraps(original_preprocess)
+    def wrapped_preprocess(self, examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
+        model_inputs = original_preprocess(self, examples)
+
+        if not any(field in examples for field in latent_fields):
+            return model_inputs
+
+        prompts = examples.get("_prompt", [])
+        responses = examples.get("_response", [])
+        kept_indices: list[int] = []
+        for i in range(len(prompts)):
+            if len(prompts[i]) % 2 != 1 or len(responses[i]) != 1:
+                continue
+            kept_indices.append(i)
+
+        output_len = len(model_inputs.get("input_ids", []))
+        if output_len != len(kept_indices):
+            raise ValueError(
+                "[Qwen3VL Latent] preprocess alignment mismatch: "
+                f"model_inputs={output_len} vs kept_indices={len(kept_indices)}."
+            )
+
+        for field in latent_fields:
+            if field in examples:
+                values = examples[field]
+                model_inputs[field] = [values[i] if i < len(values) else None for i in kept_indices]
+
+        return model_inputs
+
+    SupervisedDatasetProcessor.preprocess_dataset = wrapped_preprocess
+    logger.debug("[Qwen3VL Latent] ✓ Patched SupervisedDatasetProcessor to preserve latent fields")
+
+    # Force re-tokenization cache refresh for latent runs.
+    # Without this, HF datasets.map may reuse older cached artifacts that were
+    # created before latent fields were preserved in preprocess output.
+    original_get_preprocessed_dataset = loader_module._get_preprocessed_dataset
+
+    @functools.wraps(original_get_preprocessed_dataset)
+    def wrapped_get_preprocessed_dataset(
+        dataset,
+        data_args,
+        training_args,
+        stage,
+        template,
+        tokenizer,
+        processor=None,
+        is_eval: bool = False,
+    ):
+        latent_on = os.environ.get("QWEN3VL_LATENT_SUPERVISION", "1") == "1"
+        if not latent_on:
+            return original_get_preprocessed_dataset(
+                dataset, data_args, training_args, stage, template, tokenizer, processor, is_eval
+            )
+
+        prev_overwrite = getattr(data_args, "overwrite_cache", False)
+        data_args.overwrite_cache = True
+        try:
+            return original_get_preprocessed_dataset(
+                dataset, data_args, training_args, stage, template, tokenizer, processor, is_eval
+            )
+        finally:
+            data_args.overwrite_cache = prev_overwrite
+
+    loader_module._get_preprocessed_dataset = wrapped_get_preprocessed_dataset
+    logger.debug("[Qwen3VL Latent] ✓ Patched loader._get_preprocessed_dataset to refresh cache for latent runs")
 
 
 def _patch_packed_dataset_processor(logger) -> None:
@@ -558,7 +728,7 @@ def _get_cutoff_len_from_collator(collator, logger) -> int:
             if cutoff > 0:
                 return cutoff
         except ValueError:
-            pass
+            logger.warning(f"[Qwen3VL Latent] Invalid QWEN3VL_CUTOFF_LEN={env_cutoff!r}, falling back to collator/tokenizer settings")
 
     cutoff = getattr(collator, "max_length", None)
     if cutoff is not None and cutoff > 0:
@@ -605,30 +775,118 @@ def _flatten_latent_tensors(nested_list: list) -> list[torch.Tensor]:
     return []
 
 
+def _flatten_latent_values(nested_list: Any) -> list[Any]:
+    """Recursively flatten latent containers while preserving leaf values."""
+    if isinstance(nested_list, (torch.Tensor, str)):
+        return [nested_list]
+    if isinstance(nested_list, list):
+        result: list[Any] = []
+        for item in nested_list:
+            result.extend(_flatten_latent_values(item))
+        return result
+    return []
+
+
 # Marker CE is ALWAYS ON - thinking tokens always have their token IDs as labels
 # (no env var needed, no function needed - just use the token ID directly)
 
 
-def _get_latent_step_label(latent_token_id: int, ignore_index: int) -> int:
-    """Get the label for latent_step positions based on QWEN3VL_LATENT_STEP_CE_TOKEN.
+def _latent_step_ce_enabled() -> bool:
+    """Whether CE loss on expanded latent positions is enabled.
 
-    Controls what token to use as label for latent step positions in CE loss:
-    - QWEN3VL_LATENT_STEP_CE_TOKEN=1 (default): use latent_token_id -> predict <latent> token
-    - QWEN3VL_LATENT_STEP_CE_TOKEN=0: use cot_sampled_token_ids if available, else ignore_index
-
-    Args:
-        latent_token_id: The token ID for <latent>
-        ignore_index: The ignore index for CE loss (typically -100)
-
-    Returns:
-        The label value to use at latent_step positions
+    Controlled by QWEN3VL_LATENT_STEP_CE_LOSS (curriculum toggle, 1/0).
+    Defaults to enabled.
     """
-    # Default: use latent_token_id as label (predict <latent> token)
-    if os.environ.get("QWEN3VL_LATENT_STEP_CE_TOKEN", "1") == "1":
-        return latent_token_id
+    return os.environ.get("QWEN3VL_LATENT_STEP_CE_LOSS", "1").strip() == "1"
 
-    # Option 0: use cot_sampled_token_ids if available
-    return ignore_index
+
+def _resample_token_sequence(token_ids: list[int], target_len: int) -> list[int]:
+    """Resample an ordered token sequence to the requested length, preserving order."""
+    if target_len <= 0:
+        return []
+    if not token_ids:
+        return []
+    if len(token_ids) == target_len:
+        return list(token_ids)
+    indices = torch.linspace(0, len(token_ids) - 1, target_len).long().tolist()
+    return [token_ids[i] for i in indices]
+
+
+def _normalize_cot_chunk_token_ids(value: Any) -> Optional[list[list[int]]]:
+    """Normalize precomputed per-step chunk token ids from dataset metadata."""
+    if value is None:
+        return None
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if not isinstance(value, list):
+        return None
+
+    normalized: list[list[int]] = []
+    for chunk in value:
+        if hasattr(chunk, "tolist"):
+            chunk = chunk.tolist()
+        if not isinstance(chunk, list):
+            return None
+        normalized.append([int(tok) for tok in chunk])
+    return normalized
+
+
+def _normalize_int_list(value: Any) -> Optional[list[int]]:
+    """Normalize a dataset field that should be a flat list of ints."""
+    if value is None:
+        return None
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if not isinstance(value, list):
+        return None
+    return [int(x) for x in value]
+
+
+def _build_latent_ce_targets(
+    *,
+    exp_len: int,
+    boundary_label: int,
+    latent_label: int,
+    use_latent_token: bool,
+    use_cot_token: bool,
+    cot_step_token_ids: Optional[list[int]],
+    ignore_index: int,
+) -> tuple[int, torch.Tensor]:
+    """Build CE targets for one expanded latent block and its preceding scaffold token.
+
+    Behavior:
+    - The chunk subsequence is sampled only from the original CoT chunk tokens.
+    - Structural markers (<think_sep>, </think>) remain outside the chunk sequence.
+    - The scaffold token before a latent block predicts the first chunk token.
+    - The final latent position predicts the structural boundary token.
+    - If latent-step CE is configured to use CoT subsequences, preceding positions learn
+      an evenly distributed ordered subsequence of the original CoT step tokens.
+    """
+    if exp_len <= 0:
+        return ignore_index, torch.empty(0, dtype=torch.long)
+
+    if use_latent_token:
+        block_tokens = [latent_label] * exp_len
+    elif use_cot_token:
+        block_tokens = _resample_token_sequence(cot_step_token_ids or [], exp_len)
+        if len(block_tokens) < exp_len:
+            pad_value = ignore_index
+            if block_tokens:
+                pad_value = block_tokens[-1]
+            elif latent_label != ignore_index:
+                pad_value = latent_label
+            block_tokens.extend([pad_value] * (exp_len - len(block_tokens)))
+    else:
+        block_tokens = [ignore_index] * exp_len
+
+    first_target = block_tokens[0] if block_tokens else boundary_label
+
+    latent_labels = []
+    if exp_len > 1:
+        latent_labels.extend(block_tokens[1:])
+    latent_labels.append(boundary_label)
+
+    return first_target, torch.tensor(latent_labels, dtype=torch.long)
 
 
 def _expand_sample_for_latent_injection(
@@ -637,17 +895,16 @@ def _expand_sample_for_latent_injection(
     latent_token_id: int,
     thinking_start_id: int,
     thinking_end_id: int,
-    latent_ground_truth: list[torch.Tensor],
+    latent_ground_truth: Optional[list[torch.Tensor]],
+    latent_lengths: Optional[list[int]],
     ignore_index: int,
-    cot_sampled_token_ids: Optional[list[int]] = None,
+    cot_step_token_ids: Optional[list[list[int]]] = None,
 ) -> tuple[list[int], list[int]]:
     """Expand <latent> tokens into placeholder sequences to match latent lengths.
 
-    OPTIMIZED: Uses torch tensors for O(1) lookups instead of O(n) scans.
-
     Args:
-        cot_sampled_token_ids: Pre-sampled token IDs from CoT text (one per latent step).
-            If provided, these will be used as labels for latent positions instead of latent_token_id.
+        cot_step_token_ids: Ordered CoT token subsequences (one list per latent step).
+            Used when latent-step CE is configured to learn CoT tokens.
     """
     # Convert to tensor for O(1) indexing (faster than list.index() which is O(n))
     ids_tensor = torch.tensor(input_ids, dtype=torch.long)
@@ -670,25 +927,28 @@ def _expand_sample_for_latent_injection(
     latent_mask = (thinking_section == latent_token_id)
     latent_indices = torch.nonzero(latent_mask).flatten() + start_pos + 1
 
-    if len(latent_indices) == 0 or not latent_ground_truth:
+    if len(latent_indices) == 0:
         return input_ids, labels
 
     latent_indices = latent_indices.tolist()
 
+    if latent_lengths is not None:
+        expansion_lengths = [int(x) for x in latent_lengths if int(x) > 0]
+    elif latent_ground_truth:
+        expansion_lengths = [_latent_seq_len(feat) for feat in latent_ground_truth]
+    else:
+        return input_ids, labels
+
     # SKIP on mismatch: Each <latent> token must have exactly one corresponding ground truth tensor
-    if len(latent_indices) != len(latent_ground_truth):
+    if len(latent_indices) != len(expansion_lengths):
         logger.warning(
             f"[Qwen3VL Latent] Skipping sample: found {len(latent_indices)} <latent> tokens "
-            f"but {len(latent_ground_truth)} ground truth tensors. "
+            f"but {len(expansion_lengths)} latent expansions. "
             "Each <latent> token must have exactly one corresponding ground truth tensor."
         )
         return input_ids, labels  # Skip this sample, return original
 
-    # Pre-compute expansion lengths
-    expansion_lengths = [_latent_seq_len(feat) for feat in latent_ground_truth]
-
-    # Build new sequences using torch.cat (faster than list.extend)
-    # This is the key optimization - use tensor concatenation
+    # Build new sequences using torch.cat 
     result_segments = []
 
     # Add tokens before first latent
@@ -721,44 +981,52 @@ def _expand_sample_for_latent_injection(
     # Before first latent
     new_labels_tensor = labels_tensor[:latent_indices[0]]
 
-    # Get label value for latent_step positions (controlled by QWEN3VL_LATENT_STEP_CE_TOKEN)
-    latent_label = _get_latent_step_label(latent_token_id, ignore_index)
+    # Check latent-step CE controls:
+    # - CE_LOSS gate controls whether latent-position CE is active at all.
+    # - CE_TOKEN controls latent token vs CoT token labels when CE is active.
+    ce_enabled = _latent_step_ce_enabled()
+    use_latent_token = ce_enabled and os.environ.get("QWEN3VL_LATENT_STEP_CE_TOKEN", "0") == "1"
+    use_cot_token = ce_enabled and not use_latent_token
+    latent_label = latent_token_id if use_latent_token else ignore_index
 
-    # Add labels for latent tokens and content between
-    current_pos = latent_indices[0]
-
-    # Check if we should use latent_token_id directly (default) or cot_sampled_token_ids
-    use_latent_token = os.environ.get("QWEN3VL_LATENT_STEP_CE_TOKEN", "1") == "1"
-
+    block_first_targets: list[int] = []
+    block_label_tensors: list[torch.Tensor] = []
     for i, (latent_idx, exp_len) in enumerate(zip(latent_indices, expansion_lengths)):
-        # Use latent_token_id if CE_TOKEN=1 (default), otherwise use cot_sampled_token_ids if available
-        if use_latent_token:
-            # Use latent_token_id as label (predict <latent>)
-            new_labels_tensor = torch.cat([
-                new_labels_tensor,
-                torch.full((exp_len,), latent_label, dtype=torch.long)
-            ])
-        elif cot_sampled_token_ids is not None and i < len(cot_sampled_token_ids):
-            # Use the sampled token from CoT (one token per latent step)
-            sampled_label = cot_sampled_token_ids[i]
-            new_labels_tensor = torch.cat([
-                new_labels_tensor,
-                torch.full((exp_len,), sampled_label, dtype=torch.long)
-            ])
-        else:
-            # Use position mask via helper: latent_token_id (CE loss) or ignore_index (no CE loss)
-            new_labels_tensor = torch.cat([
-                new_labels_tensor,
-                torch.full((exp_len,), latent_label, dtype=torch.long)
-            ])
-        current_pos += 1  # Move past the latent_token we're replacing
+        step_tokens = None
+        if cot_step_token_ids is not None and i < len(cot_step_token_ids):
+            step_tokens = cot_step_token_ids[i]
+        boundary_label = int(labels_tensor[latent_idx].item()) if latent_idx < labels_tensor.shape[0] else ignore_index
+        first_target, latent_block_labels = _build_latent_ce_targets(
+            exp_len=exp_len,
+            boundary_label=boundary_label,
+            latent_label=latent_label,
+            use_latent_token=use_latent_token,
+            use_cot_token=use_cot_token,
+            cot_step_token_ids=step_tokens,
+            ignore_index=ignore_index,
+        )
+        block_first_targets.append(first_target)
+        block_label_tensors.append(latent_block_labels)
+
+    # The scaffold token before the first latent block predicts the first sampled chunk token.
+    if new_labels_tensor.numel() > 0 and block_first_targets:
+        new_labels_tensor = new_labels_tensor.clone()
+        new_labels_tensor[-1] = block_first_targets[0]
+
+    for i, (latent_idx, _exp_len) in enumerate(zip(latent_indices, expansion_lengths)):
+        new_labels_tensor = torch.cat([
+            new_labels_tensor,
+            block_label_tensors[i],
+        ])
 
         # Content between latents (keep original labels)
         if i < len(latent_indices) - 1:
             next_idx = latent_indices[i + 1]
-            segment_len = next_idx - latent_idx - 1
-            new_labels_tensor = torch.cat([new_labels_tensor, labels_tensor[latent_idx + 1:next_idx]])
-            current_pos = next_idx
+            inter_labels = labels_tensor[latent_idx + 1:next_idx].clone()
+            if inter_labels.numel() > 0:
+                # The structural separator token predicts the first sampled token of the next chunk.
+                inter_labels[-1] = block_first_targets[i + 1]
+            new_labels_tensor = torch.cat([new_labels_tensor, inter_labels])
         else:
             # After last latent - keep remaining labels
             new_labels_tensor = torch.cat([new_labels_tensor, labels_tensor[latent_idx + 1:]])
@@ -788,7 +1056,6 @@ def _pack_features_after_injection(
     ignore_index = getattr(collator, "label_pad_token_id", -100)
     pad_token_id = collator.tokenizer.pad_token_id
     block_diag_attn = getattr(collator, "block_diag_attn", False)
-    thinking_sep_id = int(os.environ.get("QWEN3VL_THINKING_SEP_ID", "-1"))
 
     if not hasattr(_pack_features_after_injection, "_logged"):
         logger.debug(
@@ -809,81 +1076,35 @@ def _pack_features_after_injection(
         labels = feature["labels"]
         latent_fields = latent_fields_list[idx] if idx < len(latent_fields_list) else {}
 
+        # Keep latent payload as file paths inside dataloader workers to avoid
+        # passing large tensors through multiprocessing shared memory.
         latent_gt = latent_fields.get("latent_ground_truth") or []
-        if latent_gt:
-            latent_gt = _load_latent_tensors(latent_gt)
-            latent_fields["latent_ground_truth"] = latent_gt
+        latent_gt_lengths = _normalize_int_list(latent_fields.get("latent_seq_lens"))
+        if latent_gt_lengths is not None and latent_gt and len(latent_gt_lengths) != len(latent_gt):
+            logger.warning(
+                "[Qwen3VL Latent] Ignoring latent_seq_lens due to length mismatch: %s vs %s",
+                len(latent_gt_lengths),
+                len(latent_gt),
+            )
+            latent_gt_lengths = None
+        if latent_gt and latent_gt_lengths is None:
+            if isinstance(latent_gt[0], torch.Tensor):
+                latent_gt_lengths = [_latent_seq_len(t) for t in latent_gt]
+            else:
+                latent_gt_lengths = _load_latent_seq_lens(latent_gt)
 
-        # Also load latent_supervision for VAE loss computation
         latent_sup = latent_fields.get("latent_supervision") or []
-        if latent_sup:
-            latent_sup = _load_latent_tensors(latent_sup)
-            latent_fields["latent_supervision"] = latent_sup
 
-        # Sample tokens from CoT text for latent step CE loss
-        # Use pre-tokenized cot_token_ids from dataset (preprocessed at build time)
-        cot_token_ids = None
-        pre_tokenized = latent_fields.get("cot_token_ids")
-        if pre_tokenized is not None:
-            # Use pre-tokenized CoT from dataset preprocessing
-            cot_token_ids = pre_tokenized if isinstance(pre_tokenized, list) else pre_tokenized.tolist()
-
-        cot_sampled_token_ids = None
-        if cot_token_ids and latent_gt:
+        cot_step_token_ids = _normalize_cot_chunk_token_ids(latent_fields.get("cot_chunk_token_ids"))
+        if cot_step_token_ids is not None and latent_gt:
             num_latent_steps = len(latent_gt)
-
-            def _pick_one(subseq: list[int]) -> Optional[int]:
-                # Avoid sampling marker/separator tokens as supervision targets.
-                banned = {thinking_start_id, thinking_end_id}
-                if thinking_sep_id >= 0:
-                    banned.add(thinking_sep_id)
-                pool = [t for t in subseq if t not in banned]
-                if not pool:
-                    return None
-                return pool[len(pool) // 2]  # deterministic "middle token"
-
-            # If CoT is formatted as <think>[subseq1]<think_sep>[subseq2]...</think>,
-            # sample within each subsequence so step i aligns with subseq i.
-            if thinking_sep_id >= 0 and thinking_sep_id in cot_token_ids:
-                ids = cot_token_ids
-                # Strip optional thinking markers if present (depends on tokenizer/template).
-                if ids and ids[0] == thinking_start_id:
-                    ids = ids[1:]
-                if ids and ids[-1] == thinking_end_id:
-                    ids = ids[:-1]
-
-                subseqs: list[list[int]] = []
-                cur: list[int] = []
-                for tid in ids:
-                    if tid == thinking_sep_id:
-                        subseqs.append(cur)
-                        cur = []
-                    else:
-                        cur.append(tid)
-                subseqs.append(cur)
-
-                if len(subseqs) == num_latent_steps:
-                    sampled: list[int] = []
-                    fallback_pool = [t for t in ids if t not in {thinking_start_id, thinking_end_id, thinking_sep_id}]
-                    for ss in subseqs:
-                        tok = _pick_one(ss)
-                        if tok is None:
-                            tok = random.choice(fallback_pool) if fallback_pool else None
-                        if tok is not None:
-                            sampled.append(tok)
-                    cot_sampled_token_ids = sampled if len(sampled) == num_latent_steps else None
-
-            # Fallback: sample evenly spaced tokens from the whole CoT token sequence.
-            if cot_sampled_token_ids is None:
-                banned = {thinking_start_id, thinking_end_id}
-                if thinking_sep_id >= 0:
-                    banned.add(thinking_sep_id)
-                cot_pool = [t for t in cot_token_ids if t not in banned]
-                if len(cot_pool) >= num_latent_steps:
-                    indices = torch.linspace(0, len(cot_pool) - 1, num_latent_steps).long().tolist()
-                    cot_sampled_token_ids = [cot_pool[i] for i in indices]
-                else:
-                    cot_sampled_token_ids = [random.choice(cot_pool) for _ in range(num_latent_steps)] if cot_pool else None
+            if len(cot_step_token_ids) != num_latent_steps:
+                logger.warning(
+                    "[Qwen3VL Latent] Ignoring cot_chunk_token_ids due to step mismatch: %s vs %s",
+                    len(cot_step_token_ids),
+                    num_latent_steps,
+                )
+                cot_step_token_ids = None
 
         new_input_ids, new_labels = _expand_sample_for_latent_injection(
             input_ids=input_ids,
@@ -892,8 +1113,9 @@ def _pack_features_after_injection(
             thinking_start_id=thinking_start_id,
             thinking_end_id=thinking_end_id,
             latent_ground_truth=latent_gt,
+            latent_lengths=latent_gt_lengths,
             ignore_index=ignore_index,
-            cot_sampled_token_ids=cot_sampled_token_ids,
+            cot_step_token_ids=cot_step_token_ids,
         )
 
         length = len(new_input_ids)
@@ -918,7 +1140,10 @@ def _pack_features_after_injection(
 
     if not lengths:
         logger.warning("[Qwen3VL Latent] pack-after-injection: no valid samples after expansion.")
-        return batch, latent_fields_list
+        # Clear latent fields since original batch is not expanded - continuing with
+        # original input_ids would cause STRICT mismatch in latent injection
+        empty_latent_fields = [{"latent_ground_truth": [], "latent_supervision": [], "num_latent_steps": 0} for _ in batch]
+        return batch, empty_latent_fields
 
     # Aggregate drop stats (log occasionally, only when debug enabled)
     debug_enabled = os.environ.get("QWEN3VL_DEBUG_FORWARD", "0") == "1"
@@ -1113,21 +1338,30 @@ def _patch_data_collator(logger) -> None:
                 latent_item = {}
                 # Keep non-token fields out of the tokenizer/collator path.
                 # `cot` is optional and is used only for optional CE labeling of latent positions.
-                for key in ['latent_ground_truth', 'latent_supervision', 'num_latent_steps', 'cot', 'cot_token_ids']:
+                for key in [
+                    'latent_ground_truth',
+                    'latent_supervision',
+                    'num_latent_steps',
+                    'cot',
+                    'latent_seq_lens',
+                    'cot_chunk_token_ids',
+                ]:
                     if key in item:
                         latent_item[key] = item.pop(key)  # Remove from batch item
                         has_latent = True
 
-                # If latent fields not in batch, try to load from image path
-                # This happens when dataset_info.json doesn't include latent columns
-                if not latent_item.get('latent_ground_truth'):
-                    images = item.get('images', [])
-                    if images and isinstance(images, list) and len(images) > 0:
-                        # Get the first image path and construct latent path
-                        image_path = images[0] if isinstance(images[0], str) else str(images[0])
-                        latent_item = _load_latent_from_image_path(image_path)
-                        if latent_item.get('latent_ground_truth'):
-                            has_latent = True
+                # Strictness: if sample still contains <latent> token ids, metadata must exist.
+                # Avoid implicit image-path fallback to keep dataflow deterministic.
+                input_ids = item.get("input_ids", [])
+                if (
+                    isinstance(input_ids, list)
+                    and int(os.environ.get("QWEN3VL_LATENT_TOKEN_ID", "151669")) in input_ids
+                    and not latent_item.get("latent_ground_truth")
+                ):
+                    raise ValueError(
+                        "[Qwen3VL Latent] Missing latent_ground_truth in preprocessed sample "
+                        "that contains <latent> token(s). Ensure dataset_info columns are preserved."
+                    )
 
                 latent_fields_list.append(latent_item)
 
@@ -1270,7 +1504,10 @@ def _patch_model_forward(logger) -> None:
         pixel_values=None,
         image_grid_thw=None,
         latent_ground_truth=None,
+        latent_ground_truth_paths=None,
+        latent_ground_truth_packed=None,
         latent_supervision=None,
+        latent_supervision_paths=None,
         latent_positions=None,
         thinking_loss_weight=None,
         **kwargs
@@ -1322,6 +1559,47 @@ def _patch_model_forward(logger) -> None:
         # Check if VAE is in loss spec
         loss_spec = _get_loss_spec()
 
+        # Materialize latent tensors on the training process to avoid large IPC payloads
+        # from dataloader workers.
+        latent_ground_truth = _materialize_latent_batch(
+            latent_batch=latent_ground_truth,
+            latent_paths_batch=latent_ground_truth_paths,
+            strict=True,
+        )
+        latent_supervision = _materialize_latent_batch(
+            latent_batch=latent_supervision,
+            latent_paths_batch=latent_supervision_paths,
+            strict=False,
+        )
+
+        # Invariant: when latent positions exist, path-based payloads must be
+        # materialized into real tensors before loss computation.
+        if latent_positions is not None and isinstance(latent_positions, torch.Tensor):
+            sample_has_latent = latent_positions.any(dim=1).tolist() if latent_positions.ndim >= 2 else [bool(latent_positions.any().item())]
+            gt_tensor_counts = [
+                sum(1 for x in sample if isinstance(x, torch.Tensor))
+                for sample in (latent_ground_truth or [])
+            ]
+            if any(sample_has_latent):
+                for i, has_lat in enumerate(sample_has_latent):
+                    if not has_lat:
+                        continue
+                    gt_cnt = gt_tensor_counts[i] if i < len(gt_tensor_counts) else 0
+                    if gt_cnt == 0:
+                        msg = (
+                            f"[Qwen3VL Latent] sample {i} has latent_positions but no materialized "
+                            "latent_ground_truth tensors after loading."
+                        )
+                        logger.warning(msg)
+
+        if latent_ground_truth_packed is None and latent_ground_truth:
+            packed_chunks = []
+            for sample_gt in latent_ground_truth:
+                if sample_gt:
+                    packed_chunks.append(torch.cat(sample_gt, dim=0))
+            if packed_chunks:
+                latent_ground_truth_packed = torch.cat(packed_chunks, dim=0)
+
         # DEBUG: Log what's received
         if debug_enabled:
             print(f"[DEBUG] latent_ground_truth={type(latent_ground_truth)}, len={len(latent_ground_truth) if latent_ground_truth else 'None/0'}", flush=True, file=sys.stderr)
@@ -1357,6 +1635,7 @@ def _patch_model_forward(logger) -> None:
                 inputs_embeds=inputs_embeds,
                 latent_supervision=latent_ground_truth,
                 latent_positions=latent_positions,
+                latent_paths=latent_ground_truth_paths,
             )
             if attention_mask is not None and attention_mask.shape[1] != inputs_embeds.shape[1]:
                 raise ValueError("[Qwen3VL Latent] pack-after-injection: attention_mask length mismatch.")
@@ -1371,10 +1650,13 @@ def _patch_model_forward(logger) -> None:
         # Check if we need thinking loss
         has_latent_positions = False
         if latent_positions is not None:
-            try:
+            if isinstance(latent_positions, torch.Tensor):
                 has_latent_positions = bool(latent_positions.any().item())
-            except Exception:
-                has_latent_positions = False
+            else:
+                logger.warning(
+                    "[Qwen3VL Latent] Expected latent_positions tensor, got %s",
+                    type(latent_positions),
+                )
         need_hidden_states = latent_supervision is not None and has_latent_positions
 
         # Debug logging for latent stats
@@ -1383,15 +1665,9 @@ def _patch_model_forward(logger) -> None:
             gt_len = 0
             pos_none = latent_positions is None
             if latent_supervision:
-                try:
-                    sup_len = len(latent_supervision)
-                except:
-                    pass
+                sup_len = len(latent_supervision)
             if latent_ground_truth:
-                try:
-                    gt_len = len(latent_ground_truth)
-                except:
-                    pass
+                gt_len = len(latent_ground_truth)
         if debug_enabled:
             print(f"[LATENT_STATS] gt_len={gt_len}, sup_len={sup_len}, pos_none={pos_none}, has_pos={has_latent_positions}, need_hs={need_hidden_states}", flush=True, file=sys.stderr)
 
@@ -1416,7 +1692,8 @@ def _patch_model_forward(logger) -> None:
                         last_hidden_states = output
 
                 hook_handle = text_model.register_forward_hook(_capture_last_hidden)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"[Qwen3VL Latent] Hidden-state hook registration failed, falling back to output_hidden_states: {e}")
                 use_hook = False
 
         # Cast pixel_values to bfloat16 if present (fix for TransparentEvalCallback dtype mismatch)
@@ -1445,15 +1722,9 @@ def _patch_model_forward(logger) -> None:
         gt_len = 0
         sup_len = 0
         if latent_ground_truth is not None:
-            try:
-                gt_len = len(latent_ground_truth)
-            except:
-                pass
+            gt_len = len(latent_ground_truth)
         if latent_supervision is not None:
-            try:
-                sup_len = len(latent_supervision)
-            except:
-                pass
+            sup_len = len(latent_supervision)
         if gt_len == 0 and sup_len == 0 and debug_enabled:
             print(f"[LATENT_STATS] gt=0, sup=0 - latent data NOT passed to forward!", flush=True, file=sys.stderr)
 
@@ -1542,69 +1813,86 @@ def _patch_model_forward(logger) -> None:
 
         # Compute LatentVAE loss if enabled
         vae_loss = None
+        latent_vae_loss = None  # Initialize to avoid unbound variable
         pred_embed_forward_loss = None  # Initialize for logging
+        sampled_latents = None
+        batch_indices = None
+        seq_indices = None
         if use_latent_vae and need_hidden_states and latent_supervision is not None and last_hidden_states is not None:
-            try:
-                # VAE is already on the correct device as part of FSDP-wrapped model
-                # Don't move it explicitly to avoid FSDP shard issues
-                vae = self.latent_vae
+            # VAE is already on the correct device as part of FSDP-wrapped model
+            # Don't move it explicitly to avoid FSDP shard issues
+            vae = self.latent_vae
 
-                # Get hidden states at latent positions (shifted by 1 for autoregressive)
-                # VAE uses latent_ground_truth (same as pre_think_mse), not latent_supervision (which is for OT)
-                # Also returns sampled_latents for pred_embed_forward (second forward with sampled latents)
-                nll_loss, entropy, last_hidden_states, sampled_latents, batch_indices, seq_indices = _compute_vae_loss(
-                    vae=vae,
-                    hidden_states=last_hidden_states,
-                    latent_supervision=latent_ground_truth,  # Use ground truth for VAE loss
-                    latent_positions=latent_positions,
-                )
-                if nll_loss is not None and entropy is not None:
-                    # Match ReGuLaR: total loss = nll_loss + entropy_weight * entropy
-                    vae_loss_weight = float(os.environ.get("QWEN3VL_THINKING_LOSS_WEIGHT", "1.0"))
-                    entropy_weight = 0.01
-                    vae_loss = nll_loss * vae_loss_weight + entropy_weight * entropy
-                    latent_vae_loss = nll_loss  # For logging
-                    logger.debug(f"[Qwen3VL Latent] VAE loss: nll={nll_loss.item():.4f}, entropy={entropy.item():.4f}")
-
-                # Compute pred_embed_forward_loss (second forward with sampled latents, like ReGuLaR)
-                # Using torch.no_grad to avoid FSDP gradient conflicts
-                pred_embed_forward_loss = None
-                if sampled_latents is not None and inputs_embeds is not None:
-                    try:
-                        with torch.no_grad():
-                            pred_embed_forward_loss = _compute_pred_embed_forward_loss(
-                                model=self.model,
-                                original_inputs_embeds=inputs_embeds,
-                                sampled_latents=sampled_latents,
-                                batch_indices=batch_indices,
-                                seq_indices=seq_indices,
-                                labels=labels,
-                                attention_mask=attention_mask,
-                                pixel_values=pixel_values_to_model if 'pixel_values_to_model' in dir() else pixel_values,
-                                image_grid_thw=image_grid_thw_to_model if 'image_grid_thw_to_model' in dir() else image_grid_thw,
-                            )
-                        if pred_embed_forward_loss is not None:
-                            logger.debug(f"[Qwen3VL Latent] pred_embed_forward loss: {pred_embed_forward_loss.item():.4f}")
-                    except Exception as e:
-                        logger.warning(f"[Qwen3VL Latent] pred_embed_forward failed: {e}")
-                        pred_embed_forward_loss = None
-            except Exception as e:
-                logger.warning(f"[Qwen3VL Latent] VAE loss computation failed: {e}")
+            # Get hidden states at latent positions (shifted by 1 for autoregressive)
+            # VAE uses latent_ground_truth (same as pre_think_mse), not latent_supervision (which is for OT)
+            # Also returns sampled_latents for pred_embed_forward (second forward with sampled latent embeddings,
+            # not sampled CoT token IDs).
+            nll_loss, entropy, last_hidden_states, sampled_latents, batch_indices, seq_indices = _compute_vae_loss(
+                vae=vae,
+                hidden_states=last_hidden_states,
+                latent_positions=latent_positions,
+                latent_supervision_packed=latent_ground_truth_packed,
+            )
+            if nll_loss is not None and entropy is not None:
+                # Match ReGuLaR: total loss = nll_loss + entropy_weight * entropy
+                vae_loss_weight = float(os.environ.get("QWEN3VL_THINKING_LOSS_WEIGHT", "1.0"))
+                entropy_weight = 0.01
+                vae_loss = nll_loss * vae_loss_weight + entropy_weight * entropy
+                latent_vae_loss = nll_loss  # For logging
+                logger.debug(f"[Qwen3VL Latent] VAE loss: nll={nll_loss.item():.4f}, entropy={entropy.item():.4f}")
             else:
                 # Log if VAE loss is None after computation
-                if latent_vae_loss is None:
-                    try:
-                        rank_0 = not dist.is_initialized() or dist.get_rank() == 0
-                    except Exception:
-                        rank_0 = True
-                    if rank_0:
-                        # Check lengths - VAE now uses latent_ground_truth
-                        gt_lens = [len(s) if s else 0 for s in latent_ground_truth] if latent_ground_truth else []
-                        pos_sum = latent_positions.sum().item() if latent_positions is not None else 0
-                        logger.info(f"[Qwen3VL Latent] VAE returned None: gt_lens={gt_lens}, pos_sum={pos_sum}")
+                rank_0 = not dist.is_initialized() or dist.get_rank() == 0
+                if rank_0:
+                    # Check lengths - VAE now uses latent_ground_truth
+                    gt_lens = [len(s) if s else 0 for s in latent_ground_truth] if latent_ground_truth else []
+                    pos_sum = latent_positions.sum().item() if latent_positions is not None else 0
+                    logger.info(f"[Qwen3VL Latent] VAE returned None: gt_lens={gt_lens}, pos_sum={pos_sum}")
+
+        # FSDP safety: if any rank has sampled latents, all ranks must run pred-embed second forward.
+        if use_latent_vae and inputs_embeds is not None and labels is not None:
+            local_pred_ready = (
+                sampled_latents is not None
+                and batch_indices is not None
+                and seq_indices is not None
+                and int(sampled_latents.numel()) > 0
+            )
+            global_pred_ready = local_pred_ready
+            if dist.is_initialized():
+                pred_ready_tensor = torch.tensor(
+                    [1 if local_pred_ready else 0],
+                    device=inputs_embeds.device,
+                    dtype=torch.int32,
+                )
+                dist.all_reduce(pred_ready_tensor, op=dist.ReduceOp.MAX)
+                global_pred_ready = int(pred_ready_tensor.item()) > 0
+
+            if global_pred_ready:
+                if local_pred_ready:
+                    sampled_latents_for_forward = sampled_latents
+                    batch_indices_for_forward = batch_indices
+                    seq_indices_for_forward = seq_indices
+                else:
+                    sampled_latents_for_forward = inputs_embeds.new_empty((0, int(inputs_embeds.shape[-1])))
+                    batch_indices_for_forward = torch.empty(0, dtype=torch.long, device=inputs_embeds.device)
+                    seq_indices_for_forward = torch.empty(0, dtype=torch.long, device=inputs_embeds.device)
+
+                pred_embed_forward_loss = _compute_pred_embed_forward_loss(
+                    model=self.model,
+                    original_inputs_embeds=inputs_embeds,
+                    sampled_latents=sampled_latents_for_forward,
+                    batch_indices=batch_indices_for_forward,
+                    seq_indices=seq_indices_for_forward,
+                    labels=labels,
+                    attention_mask=attention_mask,
+                    # Keep pred-embed forward text-only to avoid rank-dependent vision branches.
+                    pixel_values=None,
+                    image_grid_thw=None,
+                )
 
         # Combine losses (OT is default, CE is optional during eval)
         ce_loss = outputs.loss if hasattr(outputs, 'loss') else None
+        pred_embed_weight = float(os.environ.get("QWEN3VL_PRED_EMBED_FORWARD_WEIGHT", "1.0"))
 
         # Combine CE loss and thinking loss properly
         # Also include VAE loss and pred_embed_forward_loss (like ReGuLaR)
@@ -1615,8 +1903,8 @@ def _patch_model_forward(logger) -> None:
             if vae_loss is not None:
                 loss = loss + vae_loss
             if pred_embed_forward_loss is not None:
-                # Add pred_embed_forward_loss (using base model so no FSDP conflict)
-                loss = loss + pred_embed_forward_loss
+                # Add pred_embed_forward_loss with weight (like ReGuLaR)
+                loss = loss + pred_embed_forward_loss * pred_embed_weight
         elif vae_loss is not None:
             # VAE only mode
             if ce_loss is not None:
@@ -1624,10 +1912,10 @@ def _patch_model_forward(logger) -> None:
             else:
                 loss = vae_loss
             if pred_embed_forward_loss is not None:
-                loss = loss + pred_embed_forward_loss
+                loss = loss + pred_embed_forward_loss * pred_embed_weight
         elif pred_embed_forward_loss is not None:
             # pred_embed_forward only
-            loss = pred_embed_forward_loss
+            loss = pred_embed_forward_loss * pred_embed_weight
         elif ce_loss is not None:
             # Fallback to CE loss only if thinking loss is not available
             loss = ce_loss
@@ -1635,11 +1923,9 @@ def _patch_model_forward(logger) -> None:
             loss = None
 
         # Debug: Log gradient norms on hidden states (only first few times)
-        if os.environ.get("QWEN3VL_LOG_GRADIENTS", "0") == "1" and last_hidden_states is not None and last_hidden_states.requires_grad:
-            try:
-                rank_0 = not dist.is_initialized() or dist.get_rank() == 0
-            except Exception:
-                rank_0 = True
+        grad_debug_enabled = os.environ.get("QWEN3VL_LOG_HIDDEN_STATES_GRADIENT", "0") == "1"
+        if grad_debug_enabled and last_hidden_states is not None and last_hidden_states.requires_grad:
+            rank_0 = _is_rank0()
             if rank_0 and not hasattr(patched_forward, '_grad_log_count'):
                 patched_forward._grad_log_count = 0
             if rank_0 and patched_forward._grad_log_count < 3:
@@ -1668,28 +1954,25 @@ def _patch_model_forward(logger) -> None:
             thinking_val = 0.0
 
         # Log all losses in one line on rank 0
-        try:
-            rank_0 = not dist.is_initialized() or dist.get_rank() == 0
-        except Exception:
-            rank_0 = True
+        rank_0 = _is_rank0()
 
         if rank_0:
             # Stash for TrainerCallback logging.
-            try:
-                setattr(
-                    self,
-                    "_qwen3vl_last_loss_info",
-                    {
-                        "loss_spec": loss_type,
-                        "use_latent_vae": "vae" in loss_type,
-                        "ce": float(ce_val),
-                        "thinking": float(thinking_val) if thinking_loss is not None else None,
-                        "vae": float(vae_loss.item()) if vae_loss is not None else None,
-                        "total": float(loss.item()) if loss is not None else None,
-                    },
-                )
-            except Exception:
-                pass
+            vae_val = float(vae_loss.item()) if vae_loss is not None else None
+            pred_embed_val = float(pred_embed_forward_loss.item()) if pred_embed_forward_loss is not None else None
+            setattr(
+                self,
+                "_qwen3vl_last_loss_info",
+                {
+                    "loss_spec": loss_type,
+                    "use_latent_vae": "vae" in loss_type,
+                    "ce": float(ce_val),
+                    "thinking": float(thinking_val) if thinking_loss is not None else None,
+                    "vae": vae_val,
+                    "pred_embed_ce_loss": pred_embed_val,
+                    "total": float(loss.item()) if loss is not None else None,
+                },
+            )
 
         # Update outputs
         if loss is not None:
@@ -1834,7 +2117,8 @@ def _patch_trainer_callback(logger) -> None:
                 output_dir = getattr(training_args, 'output_dir', '.')
                 vae_callback = VAESaveCallback(output_dir=output_dir, save_steps=save_steps)
                 self.add_callback(vae_callback)
-                logger.info(f"[Qwen3VL Latent] Auto-registered VAESaveCallback (save_steps={save_steps})")
+                if _is_rank0():
+                    logger.info(f"[Qwen3VL Latent] Auto-registered VAESaveCallback (save_steps={save_steps})")
 
         # Log loss spec + loss breakdown at Trainer logging_steps cadence (rank 0 only).
         # This replaces forward() logging to avoid slowing training.
@@ -1859,21 +2143,25 @@ def _patch_trainer_callback(logger) -> None:
                 synced_gpus=True,
             )
             self.add_callback(transparent_callback)
-            logger.info("[Qwen3VL Latent] Auto-registered QwenTransparentEvalCallback")
+            if _is_rank0():
+                logger.info("[Qwen3VL Latent] Auto-registered QwenTransparentEvalCallback")
         elif model is not None and training_args is not None and not getattr(training_args, "do_eval", False):
-            logger.info("[Qwen3VL Latent] Skipping QwenTransparentEvalCallback (do_eval=false)")
+            if _is_rank0():
+                logger.info("[Qwen3VL Latent] Skipping QwenTransparentEvalCallback (do_eval=false)")
 
         # 3) Add CurriculumCallback if enabled
         if os.environ.get("QWEN3VL_CURRICULUM_ENABLE", "0") == "1":
             curriculum_callback = QwenCurriculumCallback()
             self.add_callback(curriculum_callback)
-            logger.info("[Qwen3VL Latent] Auto-registered QwenCurriculumCallback")
+            if _is_rank0():
+                logger.info("[Qwen3VL Latent] Auto-registered QwenCurriculumCallback")
 
         return result
 
     # Apply the patch
     CustomSeq2SeqTrainer.__init__ = patched_init
-    logger.info("[Qwen3VL Latent] Patched CustomSeq2SeqTrainer to auto-add callbacks")
+    if _is_rank0():
+        logger.info("[Qwen3VL Latent] Patched CustomSeq2SeqTrainer to auto-add callbacks")
 
 
 def _generate_with_dynamic_thinking_mode(
@@ -2157,8 +2445,9 @@ def _patch_model_generate(logger) -> None:
     """
     # Note: vLLM environment detected message for info
     if _is_vllm_environment():
-        logger.info("[Qwen3VL Latent] vLLM environment detected")
-        logger.info("[Qwen3VL Latent] For vLLM inference, use ThinkingLLM wrapper: from Qwen.vllm_thinking_mode import ThinkingLLM")
+        if _is_rank0() and os.environ.get("QWEN3VL_LOG_VLLM_HINT", "0") == "1":
+            logger.info("[Qwen3VL Latent] vLLM environment detected")
+            logger.info("[Qwen3VL Latent] For vLLM inference, use ThinkingLLM wrapper: from Qwen.vllm_thinking_mode import ThinkingLLM")
 
     # Store original generate method
     original_generate = Qwen3VLForConditionalGeneration.generate
@@ -2167,7 +2456,14 @@ def _patch_model_generate(logger) -> None:
     def patched_generate(self, input_ids=None, inputs_embeds=None, **kwargs):
         """Enhanced generate with dynamic thinking mode support (ALWAYS ENABLED)."""
         # Remove latent supervision kwargs (only valid for forward())
-        latent_kwargs = {'latent_positions', 'latent_ground_truth', 'latent_supervision'}
+        latent_kwargs = {
+            'latent_positions',
+            'latent_ground_truth',
+            'latent_ground_truth_paths',
+            'latent_ground_truth_packed',
+            'latent_supervision',
+            'latent_supervision_paths',
+        }
         filtered_kwargs = {k: v for k, v in kwargs.items() if k not in latent_kwargs}
 
         # Fix generation config to use max_new_tokens instead of max_length
@@ -2198,8 +2494,8 @@ def _patch_model_generate(logger) -> None:
                     model_path = getattr(self.config, '_name_or_path', None)
                     if model_path:
                         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"[Qwen3VL Latent] Failed to load tokenizer for dynamic thinking mode: {e}")
 
             if tokenizer is not None:
                 # Use dynamic thinking mode (activates when model generates <think>)
@@ -2232,414 +2528,6 @@ def _is_qwen3vl_model(model) -> bool:
         return hasattr(config, 'model_type') and config.model_type in ['qwen3_vl']
     except Exception:
         return False
-
-
-def _expand_labels(
-    labels: torch.Tensor,
-    latent_positions: torch.BoolTensor,
-    latent_supervision: List[List[torch.Tensor]],
-    ignore_index: int = -100,
-    latent_token_id: int = None,
-) -> torch.Tensor:
-    """Expand labels to match injected latent sequences.
-
-    When <latent> tokens are replaced with sequences, the labels need
-    to be expanded. Injected latent tokens get either:
-    - ignore_index labels (no CE loss), OR
-    - latent_token_id as label (CE loss on latent_step) if enabled
-
-    Args:
-        labels: Original labels [batch, seq_len]
-        latent_positions: Boolean mask for <latent> positions [batch, seq_len]
-        latent_supervision: List of latent feature tensors for each sample
-        ignore_index: Value to use for injected tokens (default: -100)
-        latent_token_id: Token ID for latent_step (optional, for CE loss)
-
-    Returns:
-        Expanded labels [batch, new_seq_len]
-    """
-    # Get latent_token_id from env if not provided
-    if latent_token_id is None:
-        latent_token_id = int(os.environ.get("QWEN3VL_LATENT_TOKEN_ID", "151669"))
-
-    # Get label value for latent_step positions (controlled by QWEN3VL_LATENT_STEP_CE_TOKEN)
-    latent_label = _get_latent_step_label(latent_token_id, ignore_index)
-
-    batch_size = labels.shape[0]
-    device = labels.device
-    dtype = labels.dtype
-
-    new_labels_list = []
-
-    for b in range(batch_size):
-        sample_labels = labels[b]  # [seq_len]
-        latent_mask = latent_positions[b]
-
-        if not latent_mask.any():
-            # No latent tokens, keep original labels
-            new_labels_list.append(sample_labels)
-            continue
-
-        # Data is already flattened in _add_latent_supervision_to_batch
-        supervision = latent_supervision[b] if b < len(latent_supervision) else []
-        if len(supervision) == 0:
-            new_labels_list.append(sample_labels)
-            continue
-
-        # Get indices of <latent> tokens
-        latent_indices = latent_mask.nonzero(as_tuple=False).squeeze(dim=-1)
-
-        # Build new labels
-        new_labels = []
-        seq_idx = 0
-
-        for latent_idx in latent_indices:
-            # Add all labels before this <latent>
-            new_labels.append(sample_labels[seq_idx:latent_idx])
-
-            # Get the corresponding latent features
-            sup_idx = len([idx for idx in latent_indices if idx < latent_idx])
-            if sup_idx < len(supervision):
-                feat = supervision[sup_idx]
-
-                # Determine sequence length
-                if isinstance(feat, torch.Tensor):
-                    if feat.dim() == 1:
-                        seq_len = 1
-                    elif feat.dim() == 2:
-                        seq_len = feat.shape[0]
-                    else:
-                        seq_len = 1
-                else:
-                    seq_len = 1
-
-                # Add labels for the latent sequence (using position mask from helper)
-                new_labels.append(torch.full((seq_len,), latent_label, device=device, dtype=dtype))
-
-            # Move seq_idx past this <latent> token
-            seq_idx = latent_idx + 1
-
-        # Add remaining labels
-        new_labels.append(sample_labels[seq_idx:])
-
-        # Concatenate
-        new_labels_concat = torch.cat(new_labels, dim=0)
-        new_labels_list.append(new_labels_concat)
-
-    # Pad to same length
-    max_len = max(label.shape[0] for label in new_labels_list)
-
-    padded_labels = []
-    for label in new_labels_list:
-        if label.shape[0] < max_len:
-            # Pad with ignore_index
-            padding = torch.full((max_len - label.shape[0],), ignore_index, device=device, dtype=dtype)
-            label = torch.cat([label, padding], dim=0)
-        padded_labels.append(label)
-
-    # Stack into batch
-    result = torch.stack(padded_labels, dim=0)  # [batch, max_seq_len]
-    return result
-
-
-def _expand_attention_mask(
-    attention_mask: torch.Tensor,
-    latent_positions: torch.BoolTensor,
-    latent_supervision: List[List[torch.Tensor]],
-) -> torch.Tensor:
-    """Expand attention mask to match injected latent sequences.
-
-    When <latent> tokens are replaced with sequences, the attention mask
-    needs to be expanded to match the new sequence length.
-
-    Args:
-        attention_mask: Original attention mask [batch, seq_len]
-        latent_positions: Boolean mask for <latent> positions [batch, seq_len]
-        latent_supervision: List of latent feature tensors for each sample
-
-    Returns:
-        Expanded attention mask [batch, new_seq_len]
-    """
-    batch_size = attention_mask.shape[0]
-    device = attention_mask.device
-    dtype = attention_mask.dtype
-
-    new_masks_list = []
-
-    for b in range(batch_size):
-        sample_mask = attention_mask[b]  # [seq_len]
-        latent_mask = latent_positions[b]
-
-        if not latent_mask.any():
-            # No latent tokens, keep original mask
-            new_masks_list.append(sample_mask)
-            continue
-
-        # Data is already flattened in _add_latent_supervision_to_batch
-        supervision = latent_supervision[b] if b < len(latent_supervision) else []
-        if len(supervision) == 0:
-            new_masks_list.append(sample_mask)
-            continue
-
-        # Get indices of <latent> tokens
-        latent_indices = latent_mask.nonzero(as_tuple=False).squeeze(dim=-1)
-
-        # Build new attention mask
-        new_mask = []
-        seq_idx = 0
-
-        for i, latent_idx in enumerate(latent_indices):
-            # Add all mask values before this <latent>
-            new_mask.append(sample_mask[seq_idx:latent_idx])
-
-            # Get the corresponding latent feature index
-            sup_idx = i
-            if sup_idx < len(supervision):
-                feat = supervision[sup_idx]
-
-                # Determine sequence length
-                if isinstance(feat, torch.Tensor):
-                    if feat.dim() == 1:
-                        seq_len = 1
-                    elif feat.dim() == 2:
-                        seq_len = feat.shape[0]
-                    else:
-                        seq_len = 1
-                else:
-                    seq_len = 1
-
-                # Add attention mask for the latent sequence (all 1s = attend to all)
-                new_mask.append(torch.ones(seq_len, device=device, dtype=dtype))
-
-            # Move seq_idx past this <latent> token
-            seq_idx = latent_idx + 1
-
-        # Add remaining mask values
-        new_mask.append(sample_mask[seq_idx:])
-
-        # Concatenate
-        new_mask_concat = torch.cat(new_mask, dim=0)
-        new_masks_list.append(new_mask_concat)
-
-    # Pad to same length
-    max_len = max(mask.shape[0] for mask in new_masks_list)
-
-    padded_masks = []
-    for mask in new_masks_list:
-        if mask.shape[0] < max_len:
-            # Pad with 1s (attend to padding tokens)
-            padding = torch.ones(max_len - mask.shape[0], device=device, dtype=dtype)
-            mask = torch.cat([mask, padding], dim=0)
-        padded_masks.append(mask)
-
-    # Stack into batch
-    result = torch.stack(padded_masks, dim=0)  # [batch, max_seq_len]
-    return result
-
-
-def _expand_latent_positions(
-    latent_positions: torch.BoolTensor,
-    latent_supervision: List[List[torch.Tensor]],
-) -> torch.BoolTensor:
-    """Expand latent_positions to match injected latent sequences.
-
-    When <latent> tokens are replaced with sequences, the latent mask
-    must expand so it aligns with the new hidden_states length.
-
-    Args:
-        latent_positions: Original mask [batch, seq_len]
-        latent_supervision: List of latent feature tensors for each sample
-
-    Returns:
-        Expanded latent mask [batch, new_seq_len]
-    """
-    batch_size = latent_positions.shape[0]
-    device = latent_positions.device
-
-    new_masks_list = []
-
-    for b in range(batch_size):
-        latent_mask = latent_positions[b]
-
-        if not latent_mask.any():
-            new_masks_list.append(latent_mask)
-            continue
-
-        # Data is already flattened in _add_latent_supervision_to_batch
-        supervision = latent_supervision[b] if b < len(latent_supervision) else []
-        if len(supervision) == 0:
-            new_masks_list.append(latent_mask)
-            continue
-
-        latent_indices = latent_mask.nonzero(as_tuple=False).squeeze(dim=-1)
-
-        new_mask = []
-        seq_idx = 0
-
-        for latent_idx in latent_indices:
-            # Add mask values before this <latent>
-            new_mask.append(latent_mask[seq_idx:latent_idx])
-
-            # Determine sequence length for this latent injection
-            sup_idx = len([idx for idx in latent_indices if idx < latent_idx])
-            if sup_idx < len(supervision):
-                feat = supervision[sup_idx]
-                if isinstance(feat, torch.Tensor):
-                    if feat.dim() == 1:
-                        seq_len = 1
-                    elif feat.dim() == 2:
-                        seq_len = feat.shape[0]
-                    else:
-                        seq_len = 1
-                else:
-                    seq_len = 1
-
-                # Mark injected latent tokens as True
-                new_mask.append(torch.ones(seq_len, device=device, dtype=torch.bool))
-
-            # Move seq_idx past this <latent> token
-            seq_idx = latent_idx + 1
-
-        # Add remaining mask values
-        new_mask.append(latent_mask[seq_idx:])
-
-        new_mask_concat = torch.cat(new_mask, dim=0)
-        new_masks_list.append(new_mask_concat)
-
-    max_len = max(mask.shape[0] for mask in new_masks_list)
-
-    padded_masks = []
-    for mask in new_masks_list:
-        if mask.shape[0] < max_len:
-            padding = torch.zeros(max_len - mask.shape[0], device=device, dtype=torch.bool)
-            mask = torch.cat([mask, padding], dim=0)
-        padded_masks.append(mask)
-
-    result = torch.stack(padded_masks, dim=0)
-    return result
-
-
-def _expand_position_ids(
-    position_ids: torch.Tensor,
-    latent_positions: torch.BoolTensor,
-    latent_supervision: List[List[torch.Tensor]],
-) -> torch.Tensor:
-    """Expand position_ids to match injected latent sequences.
-
-    For Qwen3VL, position_ids are in 3D format [3, batch, seq] where:
-    - Dimension 0: [temporal, height, width] for MRoPE
-    - Text tokens: all three have same value [pos, pos, pos]
-    - Vision tokens: have different values from grid [t, h, w]
-
-    Latent tokens are treated as TEXT (not vision), so they get
-    sequential 1D positions replicated to all three: [pos, pos, pos].
-
-    Args:
-        position_ids: Original position IDs [3, batch, seq_len]
-        latent_positions: Boolean mask for <latent> positions [batch, seq_len]
-        latent_supervision: List of latent feature tensors for each sample
-
-    Returns:
-        Expanded position IDs [3, batch, new_seq_len]
-    """
-    # For Qwen3VL, position_ids is always [3, batch, seq]
-    # We use dimension 0 (temporal) as reference for text positions
-    if position_ids.dim() != 3:
-        raise ValueError(f"Expected 3D position_ids [3, batch, seq], got {position_ids.dim()}D")
-
-    batch_size = position_ids.shape[1]
-    device = position_ids.device
-    dtype = position_ids.dtype
-
-    # Use temporal dimension as reference for text positions
-    pos_ref = position_ids[0]  # [batch, seq]
-
-    new_position_ids_list = []
-
-    for b in range(batch_size):
-        sample_pos_ids = pos_ref[b]  # [seq_len]
-        latent_mask = latent_positions[b]
-
-        if not latent_mask.any():
-            # No latent tokens, keep original position_ids
-            new_position_ids_list.append(sample_pos_ids)
-            continue
-
-        # Data is already flattened in _add_latent_supervision_to_batch
-        supervision = latent_supervision[b] if b < len(latent_supervision) else []
-        if len(supervision) == 0:
-            new_position_ids_list.append(sample_pos_ids)
-            continue
-
-        # Get indices of <latent> tokens
-        latent_indices = latent_mask.nonzero(as_tuple=False).squeeze(dim=-1)
-
-        # Build new position_ids (sequential like text)
-        new_pos_ids = []
-        seq_idx = 0
-        current_pos = 0
-
-        # Get the maximum position from original for continuation
-        if len(sample_pos_ids) > 0:
-            current_pos = int(sample_pos_ids.max()) + 1
-
-        for i, latent_idx in enumerate(latent_indices):
-            # Add position_ids before this <latent>
-            while seq_idx < latent_idx:
-                new_pos_ids.append(sample_pos_ids[seq_idx].item())
-                seq_idx += 1
-
-            # Get the corresponding latent feature index (use enumerate instead of O(n²) list comprehension)
-            sup_idx = i
-            if sup_idx < len(supervision):
-                feat = supervision[sup_idx]
-
-                # Determine sequence length from latent features
-                if isinstance(feat, torch.Tensor):
-                    if feat.dim() == 1:
-                        seq_len = 1
-                    elif feat.dim() == 2:
-                        seq_len = feat.shape[0]
-                    else:
-                        seq_len = 1
-                else:
-                    seq_len = 1
-
-                # Add position_ids for the latent sequence (sequential like text)
-                for _ in range(seq_len):
-                    new_pos_ids.append(current_pos)
-                    current_pos += 1
-
-            # Move seq_idx past this <latent> token
-            seq_idx = latent_idx + 1
-
-        # Add remaining position_ids
-        while seq_idx < len(sample_pos_ids):
-            new_pos_ids.append(sample_pos_ids[seq_idx].item())
-            seq_idx += 1
-
-        # Convert to tensor
-        new_position_ids_list.append(torch.tensor(new_pos_ids, device=device, dtype=dtype))
-
-    # Pad to same length
-    max_len = max(pos.shape[0] for pos in new_position_ids_list)
-
-    padded_pos_ids = []
-    for pos in new_position_ids_list:
-        if pos.shape[0] < max_len:
-            # Pad with the last position (common practice)
-            padding_val = pos[-1].item() if len(pos) > 0 else 0
-            padding = torch.full((max_len - pos.shape[0],), padding_val, device=device, dtype=dtype)
-            pos = torch.cat([pos, padding], dim=0)
-        padded_pos_ids.append(pos)
-
-    # Stack: [batch, new_seq_len]
-    result_2d = torch.stack(padded_pos_ids, dim=0)
-
-    # Expand to 3D: replicate [pos, pos, pos] like text tokens
-    result_3d = result_2d.unsqueeze(0).expand(3, -1, -1).contiguous()  # [3, batch, new_seq]
-
-    return result_3d
 
 
 def _inject_latent_features(
@@ -2771,6 +2659,7 @@ def _inject_latent_features_inplace(
     inputs_embeds: torch.Tensor,
     latent_supervision: List[List[torch.Tensor]],
     latent_positions: torch.BoolTensor,
+    latent_paths: Optional[List[List[str]]] = None,
 ) -> torch.Tensor:
     """Inject latent features in-place when sequences are pre-expanded.
 
@@ -2821,14 +2710,18 @@ def _inject_latent_features_inplace(
         flat_tokens = torch.cat(flat_feats, dim=0)  # [total_latent_len, hidden_dim]
         latent_indices = latent_mask.nonzero(as_tuple=False).squeeze(dim=-1)
 
-        # SKIP on mismatch: flat_tokens length must exactly match latent_positions count
+        # STRICT invariant: expanded latent positions must equal materialized latent tokens.
+        # If mismatch, skip this sample's latent injection (logs warning once).
         if flat_tokens.shape[0] != latent_indices.shape[0]:
-            logger.warning(
-                f"[Qwen3VL Latent] Skipping injection for sample {b}: "
-                f"latent_positions={latent_indices.shape[0]} vs latent_tokens={flat_tokens.shape[0]}. "
-                "Expanded positions must exactly match total ground truth tokens."
-            )
-            continue  # Skip this sample in the batch
+            if not hasattr(_inject_latent_features_inplace, '_logged_mismatch'):
+                logger.warning(
+                    f"[Qwen3VL Latent] STRICT mismatch at injection: sample={b}, "
+                    f"latent_positions={int(latent_indices.shape[0])}, latent_tokens={int(flat_tokens.shape[0])}. "
+                    f"Skipping latent injection for this sample."
+                )
+                _inject_latent_features_inplace._logged_mismatch = True
+            # Skip this sample - keep original embeddings
+            continue
 
         inputs_embeds[b, latent_indices] = flat_tokens
 
@@ -3013,15 +2906,12 @@ def _compute_thinking_loss(
 
     # Debug logging (first call only)
     if not hasattr(_compute_thinking_loss, '_logged'):
-        try:
-            if not dist.is_initialized() or dist.get_rank() == 0:
-                logger.debug(f"[Qwen3VL Latent] Computing thinking loss with spec: {loss_spec}, configs: {loss_configs}")
-                logger.debug(f"[Qwen3VL Latent] hidden_states shape: {hidden_states.shape}")
-                logger.debug(f"[Qwen3VL Latent] latent_ground_truth length: {len(latent_ground_truth) if latent_ground_truth else 0}")
-                logger.debug(f"[Qwen3VL Latent] latent_supervision length: {len(latent_supervision) if latent_supervision else 0}")
-                logger.debug(f"[Qwen3VL Latent] latent_positions shape: {latent_positions.shape}, any: {latent_positions.any().item()}")
-        except Exception:
-            pass
+        if _is_rank0():
+            logger.debug(f"[Qwen3VL Latent] Computing thinking loss with spec: {loss_spec}, configs: {loss_configs}")
+            logger.debug(f"[Qwen3VL Latent] hidden_states shape: {hidden_states.shape}")
+            logger.debug(f"[Qwen3VL Latent] latent_ground_truth length: {len(latent_ground_truth) if latent_ground_truth else 0}")
+            logger.debug(f"[Qwen3VL Latent] latent_supervision length: {len(latent_supervision) if latent_supervision else 0}")
+            logger.debug(f"[Qwen3VL Latent] latent_positions shape: {latent_positions.shape}, any: {latent_positions.any().item()}")
         _compute_thinking_loss._logged = True
 
     # Debug flag for detailed logging
@@ -3029,10 +2919,7 @@ def _compute_thinking_loss(
 
     # Debug: Log latent data details
     if debug_enabled:
-        try:
-            rank_0 = not dist.is_initialized() or dist.get_rank() == 0
-        except Exception:
-            rank_0 = True
+        rank_0 = _is_rank0()
         if rank_0:
             for i, (gt, sup) in enumerate(zip(latent_ground_truth, latent_supervision)):
                 gt_len = len(gt) if gt else 0
@@ -3071,11 +2958,8 @@ def _compute_thinking_loss(
 
         # Debug logging (first call only)
         if not hasattr(_compute_thinking_loss, '_logged_loss'):
-            try:
-                if not dist.is_initialized() or dist.get_rank() == 0:
-                    logger.debug(f"[Qwen3VL Latent] {loss_name} loss result: {loss}, weight: {weight}")
-            except Exception:
-                pass
+            if _is_rank0():
+                logger.debug(f"[Qwen3VL Latent] {loss_name} loss result: {loss}, weight: {weight}")
             _compute_thinking_loss._logged_loss = True
 
         if loss is not None:
@@ -3395,13 +3279,10 @@ def _compute_ot_loss(
 
     # Debug logging (first call only)
     if not hasattr(_compute_ot_loss, '_logged'):
-        try:
-            if not dist.is_initialized() or dist.get_rank() == 0:
-                logger.debug(f"[Qwen3VL Latent] _compute_ot_loss: hidden_states shape={hidden_states.shape}")
-                logger.debug(f"[Qwen3VL Latent] _compute_ot_loss: latent_supervision length={len(latent_supervision)}")
-                logger.debug(f"[Qwen3VL Latent] _compute_ot_loss: latent_positions shape={latent_positions.shape}, any={latent_positions.any()}")
-        except Exception:
-            pass
+        if _is_rank0():
+            logger.debug(f"[Qwen3VL Latent] _compute_ot_loss: hidden_states shape={hidden_states.shape}")
+            logger.debug(f"[Qwen3VL Latent] _compute_ot_loss: latent_supervision length={len(latent_supervision)}")
+            logger.debug(f"[Qwen3VL Latent] _compute_ot_loss: latent_positions shape={latent_positions.shape}, any={latent_positions.any()}")
         _compute_ot_loss._logged = True
 
     # Compute OT loss per-sample and average
@@ -3420,11 +3301,8 @@ def _compute_ot_loss(
         if not latent_mask.any():
             # Debug: log skipped samples
             if not hasattr(_compute_ot_loss, '_logged_skip'):
-                try:
-                    if not dist.is_initialized() or dist.get_rank() == 0:
-                        logger.debug(f"[Qwen3VL Latent] _compute_ot_loss: skipping batch {b}, no latent positions")
-                except Exception:
-                    pass
+                if _is_rank0():
+                    logger.debug(f"[Qwen3VL Latent] _compute_ot_loss: skipping batch {b}, no latent positions")
                 _compute_ot_loss._logged_skip = True
             continue
 
@@ -3445,11 +3323,8 @@ def _compute_ot_loss(
         if len(supervision) == 0:
             # Debug: log missing supervision
             if not hasattr(_compute_ot_loss, '_logged_no_supervision'):
-                try:
-                    if not dist.is_initialized() or dist.get_rank() == 0:
-                        logger.debug(f"[Qwen3VL Latent] _compute_ot_loss: batch {b} has no supervision targets (len={len(supervision)})")
-                except Exception:
-                    pass
+                if _is_rank0():
+                    logger.debug(f"[Qwen3VL Latent] _compute_ot_loss: batch {b} has no supervision targets (len={len(supervision)})")
                 _compute_ot_loss._logged_no_supervision = True
             continue
 
@@ -3463,11 +3338,8 @@ def _compute_ot_loss(
 
         if len(supervision_latents) == 0:
             if not hasattr(_compute_ot_loss, '_logged_no_tensors'):
-                try:
-                    if not dist.is_initialized() or dist.get_rank() == 0:
-                        logger.debug(f"[Qwen3VL Latent] _compute_ot_loss: batch {b} has no valid supervision tensors")
-                except Exception:
-                    pass
+                if _is_rank0():
+                    logger.debug(f"[Qwen3VL Latent] _compute_ot_loss: batch {b} has no valid supervision tensors")
                 _compute_ot_loss._logged_no_tensors = True
             continue
 
@@ -3550,11 +3422,8 @@ def _compute_ot_loss(
 
     # Debug: log final result
     if not hasattr(_compute_ot_loss, '_logged_result'):
-        try:
-            if not dist.is_initialized() or dist.get_rank() == 0:
-                logger.debug(f"[Qwen3VL Latent] _compute_ot_loss: ot_losses length={len(ot_losses)}, returning={ot_losses is not None and len(ot_losses) > 0}")
-        except Exception:
-            pass
+        if _is_rank0():
+            logger.debug(f"[Qwen3VL Latent] _compute_ot_loss: ot_losses length={len(ot_losses)}, returning={ot_losses is not None and len(ot_losses) > 0}")
         _compute_ot_loss._logged_result = True
 
     if ot_losses:
@@ -3712,10 +3581,7 @@ def _add_latent_supervision_to_batch(
 
     # Debug: Log token IDs on first call (rank 0 only to avoid spam in distributed)
     if not hasattr(_add_latent_supervision_to_batch, '_logged_ids'):
-        try:
-            if not dist.is_initialized() or dist.get_rank() == 0:
-                logger.debug(f"[Qwen3VL Latent] Token IDs: latent={latent_token_id}, think_start={thinking_start_id}, think_end={thinking_end_id}")
-        except Exception:
+        if _is_rank0():
             logger.debug(f"[Qwen3VL Latent] Token IDs: latent={latent_token_id}, think_start={thinking_start_id}, think_end={thinking_end_id}")
         _add_latent_supervision_to_batch._logged_ids = True
 
@@ -3732,10 +3598,7 @@ def _add_latent_supervision_to_batch(
 
     # Debug: Log batch and latent_positions info
     if debug_enabled:
-        try:
-            rank_0 = not dist.is_initialized() or dist.get_rank() == 0
-        except Exception:
-            rank_0 = True
+        rank_0 = _is_rank0()
         if rank_0 and debug_enabled:
             print(f"[COLLATOR_DEBUG] latent_positions.shape={latent_positions.shape if latent_positions is not None else 'None'}, batch_len={len(batch)}", flush=True, file=sys.stderr)
             for i, item in enumerate(batch):
@@ -3745,42 +3608,51 @@ def _add_latent_supervision_to_batch(
                         v = item.get(k)
                         print(f"[COLLATOR_DEBUG] batch[{i}][{k}]={type(v)}, bool={bool(v) if v is not None else 'None'}, len={len(v) if isinstance(v, (list, tuple)) else 'N/A'}", flush=True, file=sys.stderr)
 
-    # Handle latents (only load if this sample has latent positions)
+    # Handle latents (only attach metadata if this sample has latent positions).
+    # Keep path lists in collated output; materialize tensors in main process forward.
     latent_ground_truth = []
     latent_supervision = []
+    latent_ground_truth_paths = []
+    latent_supervision_paths = []
 
     for idx, item in enumerate(batch):
         has_positions = False
         if latent_positions is not None and idx < latent_positions.shape[0]:
-            try:
+            if isinstance(latent_positions, torch.Tensor):
                 has_positions = bool(latent_positions[idx].any().item())
-            except Exception:
-                has_positions = False
 
         if not has_positions:
             latent_ground_truth.append([])
             latent_supervision.append([])
+            latent_ground_truth_paths.append([])
+            latent_supervision_paths.append([])
             continue
 
-        # Tensors are already loaded in _pack_features_after_injection
-        # Flatten ONCE here: [[tensor]] -> [tensor]
-        if 'latent_ground_truth' in item and item['latent_ground_truth']:
-            # item['latent_ground_truth'] is already List[Tensor], not file paths
-            # Flatten the triple-nested structure to single level
-            flat_gt = _flatten_latent_tensors(item['latent_ground_truth'])
-            latent_ground_truth.append(flat_gt)
-        else:
-            latent_ground_truth.append([])
+        gt_values = _flatten_latent_values(item.get("latent_ground_truth"))
+        sup_values = _flatten_latent_values(item.get("latent_supervision"))
 
-        if 'latent_supervision' in item and item['latent_supervision']:
-            # item['latent_supervision'] is already List[Tensor], not file paths
-            flat_sup = _flatten_latent_tensors(item['latent_supervision'])
-            latent_supervision.append(flat_sup)
-        else:
-            latent_supervision.append([])
+        gt_tensors = [x for x in gt_values if isinstance(x, torch.Tensor)]
+        gt_paths = [x for x in gt_values if isinstance(x, str)]
+        sup_tensors = [x for x in sup_values if isinstance(x, torch.Tensor)]
+        sup_paths = [x for x in sup_values if isinstance(x, str)]
+
+        latent_ground_truth.append(gt_tensors)
+        latent_supervision.append(sup_tensors)
+        latent_ground_truth_paths.append(gt_paths)
+        latent_supervision_paths.append(sup_paths)
 
     collated['latent_ground_truth'] = latent_ground_truth
     collated['latent_supervision'] = latent_supervision
+    collated['latent_ground_truth_paths'] = latent_ground_truth_paths
+    collated['latent_supervision_paths'] = latent_supervision_paths
+
+    # Pre-pack latent ground truth for VAE path to avoid per-step Python loops in forward.
+    packed_ground_truth_chunks: list[torch.Tensor] = []
+    for sample_gt in latent_ground_truth:
+        if sample_gt and all(isinstance(t, torch.Tensor) for t in sample_gt):
+            packed_ground_truth_chunks.append(torch.cat(sample_gt, dim=0))
+    if packed_ground_truth_chunks:
+        collated['latent_ground_truth_packed'] = torch.cat(packed_ground_truth_chunks, dim=0)
 
     # NOTE: All sequence-related tensors are already correctly expanded:
     # - input_ids: expanded in _expand_sample_for_latent_injection (pack)
@@ -3796,9 +3668,16 @@ def _add_latent_supervision_to_batch(
 def _compute_vae_loss(
     vae: LatentVAE,
     hidden_states: torch.Tensor,
-    latent_supervision: List[List[torch.Tensor]],
     latent_positions: torch.BoolTensor,
-) -> tuple[Optional[torch.Tensor], torch.Tensor]:
+    latent_supervision_packed: Optional[torch.Tensor],
+) -> tuple[
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
     """Compute VAE loss for latent generation (vectorized, following ReGuLaR).
 
     This function:
@@ -3809,13 +3688,12 @@ def _compute_vae_loss(
     Args:
         vae: LatentVAE module
         hidden_states: LLM hidden states [batch, seq_len, hidden_dim]
-        latent_supervision: Target embeddings for each sample
         latent_positions: Boolean mask for latent positions
+        latent_supervision_packed: Flattened latent targets from collator
 
     Returns:
-        Tuple of (vae_loss, last_hidden_states)
+        (nll_loss, entropy, hidden_states, sampled_latents, batch_indices, seq_indices_original)
     """
-    batch_size, seq_len, hidden_dim = hidden_states.shape
     device = hidden_states.device
 
     # Vectorized extraction: shift positions by 1 for autoregressive
@@ -3832,7 +3710,7 @@ def _compute_vae_loss(
     latent_indices = latent_positions.nonzero(as_tuple=False)  # [N, 2] (batch_idx, seq_idx)
 
     if latent_indices.shape[0] == 0:
-        return None, hidden_states
+        return None, None, hidden_states, None, None, None
 
     # Get hidden states at shifted latent positions (for autoregressive prediction)
     batch_indices = latent_indices[:, 0]
@@ -3844,28 +3722,22 @@ def _compute_vae_loss(
 
     pred_hidden = hidden_states[batch_indices, seq_indices_shifted, :]  # [N, hidden_dim]
 
-    # Flatten all target latents into single tensor
-    all_targets = []
-    for b in range(batch_size):
-        sample_latent = latent_supervision[b] if b < len(latent_supervision) else []
-        if sample_latent and all(isinstance(t, torch.Tensor) for t in sample_latent):
-            target = torch.cat(sample_latent, dim=0).to(device=device, dtype=hidden_states.dtype)
-            all_targets.append(target)
+    if latent_supervision_packed is None or not isinstance(latent_supervision_packed, torch.Tensor) or latent_supervision_packed.numel() == 0:
+        return None, None, hidden_states, None, None, None
 
-    if len(all_targets) == 0:
-        return None, hidden_states
-
-    target_latent = torch.cat(all_targets, dim=0)  # [total_target_tokens, hidden_dim]
+    target_latent = latent_supervision_packed.to(device=device, dtype=hidden_states.dtype)
 
     # Match lengths (in case of mismatch)
     n_pred = pred_hidden.shape[0]
     n_target = target_latent.shape[0]
 
     if n_target == 0:
-        return None, hidden_states
+        return None, None, hidden_states, None, None, None
 
     if n_pred > n_target:
         pred_hidden = pred_hidden[:n_target, :]
+        batch_indices = batch_indices[:n_target]
+        seq_indices_original = seq_indices_original[:n_target]
     elif n_pred < n_target:
         target_latent = target_latent[:n_pred, :]
 
@@ -3879,7 +3751,8 @@ def _compute_vae_loss(
     # Entropy regularization (like ReGuLaR) to prevent std from growing unbounded
     entropy = vae_dist.entropy().mean()
 
-    # Sample latents for second forward (pred_embed_forward, like ReGuLaR)
+    # Sample continuous latent embeddings for second forward (pred_embed_forward, like ReGuLaR).
+    # This is separate from sampled CoT token IDs used by latent-step CE labeling.
     sampled_latents = vae_dist.rsample()
 
     return nll_loss, entropy, hidden_states, sampled_latents, batch_indices, seq_indices_original
@@ -3899,168 +3772,132 @@ def _compute_pred_embed_forward_loss(
     """Compute pred_embed_forward_loss (ReGuLaR style).
 
     This runs a second forward pass with sampled latents instead of ground truth,
-    and computes CE loss on answer tokens only (not on thinking tokens).
+    and reuses the same CE supervision mask/targets as the primary forward.
 
     Following ReGuLaR's approach:
-    - Input: [question, ###, sampled_latents[1:], answer]
-    - Labels: only on answer portion (thinking tokens set to -100)
+    - Input: original sequence with sampled latent embeddings injected at latent positions
+    - Labels: identical to the first forward, including structural-token CE behavior
+      controlled by the existing label rewrite / latent-step CE settings
     """
-    if sampled_latents is None or original_inputs_embeds is None:
+    if model is None or original_inputs_embeds is None or labels is None:
         return None
 
+    local_assign_count = 0
+    if sampled_latents is not None and batch_indices is not None and seq_indices is not None:
+        local_assign_count = min(
+            int(sampled_latents.shape[0]),
+            int(batch_indices.shape[0]),
+            int(seq_indices.shape[0]),
+        )
+    local_has_work = local_assign_count > 0
+
+    # FSDP safety: if any rank has work, all ranks run the second forward path.
+    if dist.is_initialized():
+        has_work = torch.tensor(
+            [1 if local_has_work else 0],
+            device=original_inputs_embeds.device,
+            dtype=torch.int32,
+        )
+        dist.all_reduce(has_work, op=dist.ReduceOp.MAX)
+        if int(has_work.item()) == 0:
+            return None
+    elif not local_has_work:
+        return None
+
+    # Detach inputs to prevent gradient interference.
+    inputs_embeds_sampled = original_inputs_embeds.detach().clone()
+    inputs_embeds_with_sampled = inputs_embeds_sampled.clone()
+    if local_has_work:
+        if (
+            local_assign_count != int(sampled_latents.shape[0])
+            or local_assign_count != int(batch_indices.shape[0])
+            or local_assign_count != int(seq_indices.shape[0])
+        ):
+            logger.warning(
+                "[Qwen3VL Latent] pred_embed_forward size mismatch: sampled=%s batch_idx=%s seq_idx=%s using=%s",
+                int(sampled_latents.shape[0]),
+                int(batch_indices.shape[0]),
+                int(seq_indices.shape[0]),
+                local_assign_count,
+            )
+
+        # Vectorized latent injection: no per-sample Python loop.
+        b_idx = batch_indices[:local_assign_count]
+        s_idx = seq_indices[:local_assign_count]
+        sampled_cast = sampled_latents[:local_assign_count].to(dtype=inputs_embeds_sampled.dtype)
+        inputs_embeds_with_sampled[b_idx, s_idx] = sampled_cast
+
+    # Keep the same supervision mask/targets as first forward.
+    # Note: labels already encode QWEN3VL_LATENT_STEP_CE_LOSS /
+    # QWEN3VL_LATENT_STEP_CE_TOKEN behavior in _expand_sample_for_latent_injection().
+    # This guarantees pred_embed_forward and main CE optimize the same token sequence
+    # under the same env-var controls.
+    labels_sampled = labels.detach().clone()
+
+    # Build shifted labels first, then keep the suffix that starts at the earliest
+    # supervised position on any rank. Counting supervised tokens is insufficient
+    # because latent positions stay masked inside the thinking span.
+    shift_labels = F.pad(labels_sampled, (0, 1), value=-100)[..., 1:].contiguous()
+    if shift_labels.numel() > 0:
+        valid_mask = shift_labels != -100
+        seq_len = int(shift_labels.shape[1])
+        supervised_any = valid_mask.any(dim=1)
+        first_valid = torch.where(
+            supervised_any,
+            valid_mask.float().argmax(dim=1),
+            torch.full((shift_labels.shape[0],), seq_len, device=shift_labels.device, dtype=torch.long),
+        )
+        local_keep = int((seq_len - first_valid).max().item())
+    else:
+        local_keep = 0
+    if dist.is_initialized():
+        keep_tensor = torch.tensor([local_keep], device=labels_sampled.device, dtype=torch.int32)
+        dist.all_reduce(keep_tensor, op=dist.ReduceOp.MAX)
+        global_keep = int(keep_tensor.item())
+    else:
+        global_keep = local_keep
+    if global_keep <= 0:
+        return None
+
+    target = shift_labels[:, -global_keep:].contiguous()
     try:
-        # Get base model (unwrapped) - similar to ReGuLaR using self.llm
-        # In PEFT, we access the base model to avoid FSDP gradient conflicts
-        if hasattr(model, 'base_model'):
-            base_model = model.base_model
-            if hasattr(base_model, 'model'):
-                base_model = base_model.model  # PEFT structure
-        elif hasattr(model, 'model'):
-            base_model = model.model
-        else:
-            base_model = model
-
-        batch_size = original_inputs_embeds.shape[0]
-        device = original_inputs_embeds.device
-
-        # Detach inputs to prevent gradient interference
-        # The second forward should be independent of the first
-        inputs_embeds_sampled = original_inputs_embeds.detach().clone()
-
-        # Also detach sampled latents
-        sampled_latents = sampled_latents.detach()
-
-        # Create a mapping from (batch, seq) to sampled latent index
-        # We need to map each batch to its corresponding sampled latent positions
-        sampled_inputs_list = []
-
-        # Use running offset since sampled_latents is flattened in order
-        offset = 0
-        for b in range(batch_size):
-            batch_mask = batch_indices == b
-            n_latents = batch_mask.sum().item()
-            if n_latents == 0:
-                # No latent positions for this batch
-                sampled_inputs_list.append(None)
-                continue
-
-            b_seq_indices = seq_indices[batch_mask]
-            # Get the next n_latents sampled latents
-            b_sampled = sampled_latents[offset:offset + n_latents]
-            offset += n_latents
-
-            # Get the original input embeddings and replace at latent positions
-            b_inputs = inputs_embeds_sampled[b].clone()
-            b_inputs[b_seq_indices] = b_sampled.to(dtype=b_inputs.dtype)
-            sampled_inputs_list.append(b_inputs)
-
-        # Find where answer starts (first position after latent tokens)
-        # In our setup, answer starts after all latent positions
-        latent_token_id = int(os.environ.get("QWEN3VL_LATENT_TOKEN_ID", "151669"))
-
-        # Create labels for second forward: only keep answer tokens, mask thinking to -100
-        # We need to identify which tokens are answer vs thinking
-        # Looking at our setup: [question, <latent> x N, answer]
-        # The latent positions are marked in latent_positions
-
-        # For simplicity, use the same labels but set latent positions to -100
-        # This way CE loss is only on the non-latent (answer) tokens
-        labels_sampled = labels.detach().clone()
-
-        # Find latent positions and set their labels to -100 (ignore in CE)
-        # We can infer latent positions from the difference between original and sampled
-        # Or we can use the fact that after latent injection, all latent positions are consecutive
-
-        # Actually, let's create a simpler approach: use the original labels but
-        # we need to know where answer starts
-
-        # Get the model forward with sampled inputs
-        # Only compute loss on answer portion - need to identify where answer starts
-
-        # Run second forward with sampled latents using base model (like ReGuLaR using self.llm)
-        second_outputs = base_model(
+        second_outputs = model(
             input_ids=None,
-            inputs_embeds=inputs_embeds_sampled,
+            inputs_embeds=inputs_embeds_with_sampled,
             attention_mask=attention_mask,
-            labels=labels_sampled,
+            labels=None,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            logits_to_keep=global_keep,
         )
-
-        if hasattr(second_outputs, 'loss') and second_outputs.loss is not None:
-            return second_outputs.loss
-
-        return None
-
+        logits = second_outputs.logits
+        loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)).float(),
+            target.view(-1),
+            ignore_index=-100,
+            reduction="mean",
+        )
+        if dist.is_initialized() and not local_has_work:
+            return loss * 0.0
+        return loss
     except Exception as e:
-        logger.warning(f"[Qwen3VL Latent] pred_embed_forward loss failed: {e}")
-        return None
+        if dist.is_initialized():
+            raise
+        logger.warning(f"[Qwen3VL Latent] pred_embed_forward unavailable: {type(model).__name__} forward failed: {e}")
+    return None
 
 
 # Module-level cache for latent tensors (to avoid reference issues after function wrapping)
 # Using OrderedDict for O(1) LRU operations
 from collections import OrderedDict
 _LATENT_TENSOR_CACHE: OrderedDict = OrderedDict()
-_LATENT_TENSOR_MAX_CACHE_SIZE = int(os.environ.get("QWEN3VL_LATENT_CACHE_SIZE", "20000"))
-
-
-def _load_latent_from_image_path(image_path: str) -> dict:
-    """Load latent fields from image path.
-
-    Given an image path like 'chart2text_0ad96bff.png', construct the latent file paths:
-    - latent_ground_truth: .feature_cache/chart2text_0ad96bff_thinking_0.pt
-    - latent_supervision: .feature_cache/chart2text_0ad96bff_main.pt
-
-    Handles image paths with _main suffix like 'chart2text_0ad96bff_main.png':
-    - latent_ground_truth: .feature_cache/chart2text_0ad96bff_thinking_0.pt
-    - latent_supervision: .feature_cache/chart2text_0ad96bff_main.pt
-
-    Returns dict with 'latent_ground_truth' and 'latent_supervision' keys.
-    """
-
-    result = {'latent_ground_truth': [], 'latent_supervision': []}
-
-    # Extract base name from image path
-    # image_path could be: 'chart2text_0ad96bff.png' or '/full/path/to/chart2text_0ad96bff.png'
-    # or with _main suffix: 'chart2text_0ad96bff_main.png'
-    image_name = os.path.basename(image_path)
-    base_name = pathlib.Path(image_name).stem  # Remove extension (e.g., 'chart2text_0ad96bff_main')
-
-    # Handle _main suffix in image filename - remove it to get the base identifier
-    # e.g., 'chart2text_0ad96bff_main' -> 'chart2text_0ad96bff'
-    if base_name.endswith('_main'):
-        base_name = base_name[:-5]  # Remove '_main' suffix
-
-    # Construct the feature cache directory path
-    # Assuming images are in r1_onevision_images/ and cache is in .feature_cache/
-    image_dir = os.path.dirname(image_path)
-    if not image_dir:
-        # Image path is just filename, assume standard location
-        cache_dir = "/share/project/xiyan/sources/DeepSeek-OCR/Qwen/data/r1_onevision_images/.feature_cache"
-    else:
-        # Construct cache dir from image dir
-        cache_dir = os.path.join(image_dir, ".feature_cache")
-
-    # Construct latent file paths - load ALL thinking files (thinking_0, thinking_1, etc.)
-    result['latent_ground_truth'] = []
-    result['latent_supervision'] = []
-
-    # Find all thinking latent files (thinking_0, thinking_1, thinking_2, etc.)
-    latent_idx = 0
-    while True:
-        latent_gt_path = os.path.join(cache_dir, f"{base_name}_thinking_{latent_idx}.pt")
-        if os.path.exists(latent_gt_path):
-            result['latent_ground_truth'].append(latent_gt_path)
-            latent_idx += 1
-        else:
-            break
-
-    # Load main supervision (only one file)
-    latent_sup_path = os.path.join(cache_dir, f"{base_name}_main.pt")
-    if os.path.exists(latent_sup_path):
-        result['latent_supervision'] = [latent_sup_path]
-
-    return result
+# Centralized user-facing knob:
+# - Tensor cache size = QWEN3VL_LATENT_CACHE_SIZE
+# - Length cache size = auto-scaled multiple of tensor cache (tiny entries).
+_LATENT_CACHE_SIZE = int(os.environ.get("QWEN3VL_LATENT_CACHE_SIZE", "20000"))
+_LATENT_TENSOR_MAX_CACHE_SIZE = _LATENT_CACHE_SIZE
+_LATENT_SEQ_LEN_CACHE: OrderedDict = OrderedDict()
+_LATENT_SEQ_LEN_MAX_CACHE_SIZE = max(_LATENT_CACHE_SIZE * 5, 50000)
 
 
 def _load_latent_tensors(paths: List[str]) -> List[torch.Tensor]:
@@ -4069,10 +3906,10 @@ def _load_latent_tensors(paths: List[str]) -> List[torch.Tensor]:
     Caches loaded tensors to avoid repeated disk I/O.
     Ensures tensors are cloned to avoid memory-mapping issues.
 
-    Handles three formats:
+    Handles tensor payloads saved in the supported cache formats:
     1. Dict with 'l_features' key (from feature cache): {'l_features': Tensor, 'grid_thw': Tensor}
     2. Dict with 'latent' key (from adaptive renderer cache): {'latent': Tensor, 'grid_thw': Tensor}
-    3. Direct tensor (legacy format)
+    3. Direct tensor payload
     """
     # Check cache first - use module-level cache variable
     cache = _LATENT_TENSOR_CACHE
@@ -4089,6 +3926,10 @@ def _load_latent_tensors(paths: List[str]) -> List[torch.Tensor]:
     # Thread pool helps with NFS I/O latency (I/O bound, not CPU bound)
     # Use same number of workers as dataloader (default: 4, matches config)
     num_io_workers = getattr(_load_latent_tensors, '_io_workers', 4)
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is not None:
+        # Avoid nested parallelism in dataloader workers.
+        num_io_workers = 1
 
     def load_single_tensor(path: str):
         """Load a single tensor from file."""
@@ -4150,14 +3991,121 @@ def _load_latent_tensors(paths: List[str]) -> List[torch.Tensor]:
                 except Exception as e:
                     logger.warning(f"[Qwen3VL Latent] Failed to load {path}: {e}")
 
-    # Build result in original order using dict (avoids sorting)
-    result_dict = {}
+    # Build result aligned to input order.
+    # Keep strict index alignment here to avoid implicit re-indexing drift between:
+    # - pack-after-injection length expansion (worker-side)
+    # - forward-time latent materialization (main process)
+    ordered: list[Optional[torch.Tensor]] = [None] * len(paths)
     for i, tensor in cached_tensors:
-        result_dict[i] = tensor
+        if 0 <= i < len(ordered):
+            ordered[i] = tensor
     for i, tensor in new_tensors:
-        result_dict[i] = tensor
+        if 0 <= i < len(ordered):
+            ordered[i] = tensor
 
-    return [result_dict[i] for i in range(len(result_dict))]
+    missing = [i for i, t in enumerate(ordered) if t is None]
+    if missing:
+        preview = [paths[i] for i in missing[:3] if i < len(paths)]
+        logger.warning(
+            "[Qwen3VL Latent] Missing %s/%s latent tensors during load (examples: %s). "
+            "This can cause latent_positions/latent_tokens drift.",
+            len(missing),
+            len(paths),
+            preview,
+        )
+
+    # Return only successfully loaded tensors while preserving relative order.
+    return [t for t in ordered if isinstance(t, torch.Tensor)]
+
+
+def _load_latent_seq_lens(paths: List[str]) -> List[int]:
+    """Load only latent sequence lengths from file paths with a lightweight cache.
+
+    This avoids materializing large latent tensors inside dataloader workers.
+    """
+    lens_cache = _LATENT_SEQ_LEN_CACHE
+    result: dict[int, int] = {}
+    uncached: List[tuple[int, str]] = []
+
+    for idx, path in enumerate(paths):
+        if isinstance(path, str) and path in lens_cache:
+            result[idx] = int(lens_cache[path])
+        else:
+            uncached.append((idx, path))
+
+    if uncached:
+        for idx, path in uncached:
+            try:
+                latent = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
+            except Exception:
+                latent = torch.load(path, map_location="cpu", mmap=True)
+
+            tensor: Optional[torch.Tensor] = None
+            if isinstance(latent, dict):
+                if "l_features" in latent:
+                    tensor = latent["l_features"]
+                elif "latent" in latent:
+                    tensor = latent["latent"]
+            elif isinstance(latent, torch.Tensor):
+                tensor = latent
+
+            seq_len = int(_latent_seq_len(tensor)) if tensor is not None else 0
+            if isinstance(path, str):
+                lens_cache[path] = seq_len
+                if len(lens_cache) > _LATENT_SEQ_LEN_MAX_CACHE_SIZE:
+                    lens_cache.popitem(last=False)
+            result[idx] = seq_len
+            del latent
+
+    # Preserve one-to-one alignment with input paths, including zero lengths.
+    return [int(result.get(i, 0)) for i in range(len(paths))]
+
+
+def _materialize_latent_batch(
+    latent_batch: Optional[List[Any]],
+    latent_paths_batch: Optional[List[Any]],
+    strict: bool = False,
+) -> Optional[List[List[torch.Tensor]]]:
+    """Materialize latent tensors on the training process from optional path lists."""
+    if latent_batch is None and latent_paths_batch is None:
+        return None
+
+    num_samples = max(len(latent_batch or []), len(latent_paths_batch or []))
+    materialized: List[List[torch.Tensor]] = []
+    for idx in range(num_samples):
+        batch_values = _flatten_latent_values(
+            latent_batch[idx] if latent_batch is not None and idx < len(latent_batch) else None
+        )
+        path_values = _flatten_latent_values(
+            latent_paths_batch[idx]
+            if latent_paths_batch is not None and idx < len(latent_paths_batch)
+            else None
+        )
+
+        sample_tensors = [x for x in batch_values if isinstance(x, torch.Tensor)]
+        sample_paths = [x for x in batch_values if isinstance(x, str)]
+        sample_paths.extend(x for x in path_values if isinstance(x, str))
+
+        if sample_tensors:
+            materialized.append(sample_tensors)
+            continue
+        if sample_paths:
+            loaded = _load_latent_tensors(sample_paths)
+            if len(loaded) != len(sample_paths):
+                msg = (
+                    f"[Qwen3VL Latent] Materialize mismatch on sample {idx}: "
+                    f"paths={len(sample_paths)} loaded={len(loaded)}. "
+                    f"path_preview={sample_paths[:3]}"
+                )
+                if strict:
+                    raise ValueError(msg)
+                logger.warning(msg)
+            materialized.append(loaded)
+            continue
+
+        materialized.append([])
+
+    return materialized
 
 
 # Initialize cache with LRU eviction
@@ -4239,10 +4187,7 @@ def _find_latent_positions(
 
     # Debug: Log if any latent positions found (first call only, rank 0 only)
     if not hasattr(_find_latent_positions, '_logged_found') and latent_mask.any():
-        try:
-            should_log = not dist.is_initialized() or dist.get_rank() == 0
-        except Exception:
-            should_log = True
+        should_log = _is_rank0()
 
         if should_log:
             num_found = latent_mask.sum().item()
