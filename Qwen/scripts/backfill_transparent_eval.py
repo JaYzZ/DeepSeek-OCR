@@ -19,8 +19,15 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
-# Enable thinking plugin before importing vLLM so worker processes also load it.
-os.environ.setdefault("VLLM_THINKING", "1")
+from Qwen.scripts.vllm_utils import (
+    apply_runtime_env_for_thinking,
+    infer_tensor_parallel_size,
+    normalize_checkpoint_name,
+    parse_cuda_visible_devices,
+)
+
+# Load runtime env before enabling plugins so YAML/shell control VLLM_THINKING.
+apply_runtime_env_for_thinking(repo_root=_REPO_ROOT)
 existing_plugins = [p.strip() for p in os.environ.get("VLLM_PLUGINS", "").split(",") if p.strip()]
 if "vllm_thinking" not in existing_plugins:
     existing_plugins.append("vllm_thinking")
@@ -30,18 +37,13 @@ from PIL import Image, ImageFont, ImageDraw
 from tokenizers import AddedToken
 from transformers import AutoProcessor, AutoTokenizer
 
-from vllm_thinking.runner_patch import apply_thinking_mode_patch
 from vllm import LLM, SamplingParams
 from vllm.v1.engine import LoRARequest
+from vllm_thinking.runner_patch import apply_thinking_mode_patch
 
-from Qwen.scripts.vllm_utils import (
-    apply_runtime_env_for_thinking,
-    infer_tensor_parallel_size,
-    normalize_checkpoint_name,
-    parse_cuda_visible_devices,
-)
 
-apply_thinking_mode_patch()
+if os.environ.get("VLLM_THINKING", "0").strip().lower() in {"1", "true", "yes", "on"}:
+    apply_thinking_mode_patch()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -195,7 +197,7 @@ def find_latest_checkpoint(checkpoint_dir: Path) -> Path:
 def load_model_vllm(checkpoint_path: Path, tensor_parallel_size: int = 1, gpu_memory_utilization: float = 0.8):
     """Load model with vLLM - handles LoRA detection and setup."""
 
-    # Official base model path - LoRA trained on Linear is transferable to official model
+    # Fallback base model path if adapter metadata is missing.
     OFFICIAL_BASE_MODEL = "/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking"
 
     # Check for LoRA adapter
@@ -206,10 +208,9 @@ def load_model_vllm(checkpoint_path: Path, tensor_parallel_size: int = 1, gpu_me
     if adapter_config_path.exists():
         with open(adapter_config_path) as f:
             adapter_config = json.load(f)
-        # Use official base model (LoRA is transferable)
-        base_model_path = OFFICIAL_BASE_MODEL
+        base_model_path = adapter_config.get("base_model_name_or_path") or OFFICIAL_BASE_MODEL
         lora_path = str(checkpoint_path)
-        logger.info(f"Detected LoRA adapter. Using official base model: {base_model_path}")
+        logger.info(f"Detected LoRA adapter. Using base model: {base_model_path}")
         logger.info(f"LoRA path: {lora_path}")
     else:
         base_model_path = str(checkpoint_path)
@@ -218,9 +219,6 @@ def load_model_vllm(checkpoint_path: Path, tensor_parallel_size: int = 1, gpu_me
     # ============================================================================
     # CRITICAL: Add special tokens for latent thinking BEFORE loading vLLM
     # ============================================================================
-
-    # Enable thinking plugin in all vLLM processes.
-    os.environ["VLLM_THINKING"] = "1"
 
     # Load tokenizer and add special tokens
     tokenizer_with_special_tokens = AutoTokenizer.from_pretrained(
@@ -266,6 +264,7 @@ def load_model_vllm(checkpoint_path: Path, tensor_parallel_size: int = 1, gpu_me
         "gpu_memory_utilization": gpu_memory_utilization,
         "trust_remote_code": True,
         "enforce_eager": os.environ.get("VLLM_ENFORCE_EAGER", "0") == "1",
+        "disable_custom_all_reduce": True, # Key to the distributed inference with mode change
         "disable_log_stats": True,
     }
 

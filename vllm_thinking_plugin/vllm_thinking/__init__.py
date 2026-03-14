@@ -37,6 +37,16 @@ def vllm_thinking_plugin():
     This function is called by vLLM in all processes during initialization.
     It applies the thinking mode patch to GPUModelRunner.
     """
+    try:
+        from vllm_thinking.qwen3vl_patch_embed_patch import (
+            apply_qwen3vl_linear_patch_embed_patch,
+        )
+
+        apply_qwen3vl_linear_patch_embed_patch()
+    except Exception as e:
+        logger.error(f"[vLLM Thinking Plugin] Failed to apply Qwen3-VL patch-embed patch: {e}")
+        raise
+
     # Canonical enable flag.
     enabled = _env_flag("VLLM_THINKING", default=False)
     if "VLLM_THINKING_MODE_ENABLED" in os.environ and "VLLM_THINKING" not in os.environ:

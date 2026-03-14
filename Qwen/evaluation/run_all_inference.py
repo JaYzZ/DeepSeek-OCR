@@ -15,6 +15,12 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
+_SCRIPT_DIR = Path(__file__).parent
+_REPO_ROOT = _SCRIPT_DIR.parent.parent
+sys.path.insert(0, str(_REPO_ROOT))
+
+from Qwen.scripts.vllm_utils import apply_runtime_env_for_thinking
+
 def run_vllm_inference(
     model_path: str,
     lora_path: str,
@@ -99,9 +105,6 @@ def run_vllm_inference(
 
         env = os.environ.copy()
 
-        # Enable thinking mode for continuous latent AR (if not already set)
-        env.setdefault("VLLM_THINKING", "1")
-
         # Set LoRA checkpoint path for VAE loading (if provided)
         if lora_path:
             env["VLLM_LORA_CHECKPOINT_PATH"] = lora_path
@@ -177,6 +180,7 @@ def main():
     parser.add_argument("--lora-name", type=str, default="default", help="Name for LoRA adapter")
 
     args = parser.parse_args()
+    apply_runtime_env_for_thinking(repo_root=_REPO_ROOT)
 
     # Parse benchmarks
     benchmarks = [b.strip() for b in args.benchmarks.split(',')]

@@ -91,8 +91,8 @@ Total loss is a combination of:
 2) **Thinking losses on hidden states at latent positions** (configurable by `QWEN3VL_LOSS_TYPE`)
 
 Supported terms:
-- `pre_think_mse`: MSE between **shifted** hidden states (position p-1) and the injected `latent_ground_truth` targets.
-- `ot`, `mse`, `repa`, `nce`: compare hidden states at latent positions to `latent_supervision` targets (usually the main image feature), using `QWEN3VL_MATCH_STRATEGY` to match lengths.
+- `mse`: MSE between **shifted** hidden states (position p-1) and the injected `latent_ground_truth` targets.
+- `ot`, `repa`, `nce`: compare **shifted** hidden states (position p-1) to `latent_supervision` targets (usually the main image feature), using `QWEN3VL_MATCH_STRATEGY` where applicable.
 
 3) **VAE loss (optional, when `vae` is included in `QWEN3VL_LOSS_TYPE`)**
 - Adds a `latent_vae` module to map shifted hidden states -> latent distribution.

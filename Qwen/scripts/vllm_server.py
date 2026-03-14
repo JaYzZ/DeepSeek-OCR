@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import errno
+import json
 import os
 import socket
 import sys
@@ -43,8 +44,8 @@ from Qwen.scripts.vllm_utils import (
 # Set vLLM multiprocessing method BEFORE importing vLLM
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 
-# Enable thinking mode with VAE
-os.environ.setdefault("VLLM_THINKING", "1")
+# Load runtime env before enabling plugins so YAML can control VLLM_THINKING.
+apply_runtime_env_for_thinking(repo_root=_REPO_ROOT)
 existing_plugins = [p.strip() for p in os.environ.get("VLLM_PLUGINS", "").split(",") if p.strip()]
 if "vllm_thinking" not in existing_plugins:
     existing_plugins.append("vllm_thinking")
@@ -250,6 +251,26 @@ def prepare_inputs_for_vllm(messages, processor):
         return text
 
 
+def resolve_model_path(model_path: str, lora_path: str | None) -> str:
+    """Mirror backfill behavior: prefer adapter-declared base model for LoRA checkpoints."""
+    if not lora_path:
+        return model_path
+
+    adapter_config_path = Path(lora_path) / "adapter_config.json"
+    if not adapter_config_path.exists():
+        return model_path
+
+    try:
+        with open(adapter_config_path, "r", encoding="utf-8") as f:
+            adapter_config = json.load(f)
+        resolved = adapter_config.get("base_model_name_or_path") or model_path
+        print(f"Detected LoRA adapter. Using base model: {resolved}")
+        return resolved
+    except Exception as exc:
+        print(f"Warning: failed to read {adapter_config_path}: {exc}")
+        return model_path
+
+
 def load_model(
     model_path: str,
     tensor_parallel_size: int = 1,
@@ -259,11 +280,12 @@ def load_model(
 ):
     """Load vLLM model."""
     global llm, processor, lora_request, config
+    resolved_model_path = resolve_model_path(model_path, lora_path)
 
     print(f"\n{'='*80}")
     print(f"Loading vLLM model...")
     print(f"{'='*80}")
-    print(f"Model: {model_path}")
+    print(f"Model: {resolved_model_path}")
     print(f"Tensor parallel: {tensor_parallel_size}")
     print(f"GPU memory: {gpu_memory_utilization}")
     if lora_path:
@@ -279,7 +301,7 @@ def load_model(
 
     # Load tokenizer and add special tokens
     tokenizer_with_special_tokens = AutoTokenizer.from_pretrained(
-        model_path, trust_remote_code=True
+        resolved_model_path, trust_remote_code=True
     )
 
     # Ensure <latent>/<think_sep> are single tokens for inference.
@@ -314,24 +336,26 @@ def load_model(
         elif token == "<think_sep>":
             os.environ["QWEN3VL_THINKING_SEP_ID"] = str(token_id)
 
-    # Apply thinking mode patch BEFORE loading vLLM (patches GPUModelRunner class)
-    apply_thinking_mode_patch()
+    # Apply thinking mode patch only when explicitly enabled.
+    if os.environ.get("VLLM_THINKING", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        apply_thinking_mode_patch()
 
     # Load processor
     processor = AutoProcessor.from_pretrained(
-        model_path,
+        resolved_model_path,
         trust_remote_code=True
     )
 
     # Build kwargs
     llm_kwargs = {
-        "model": model_path,
+        "model": resolved_model_path,
         "tensor_parallel_size": tensor_parallel_size,
         "gpu_memory_utilization": gpu_memory_utilization,
         "trust_remote_code": True,
         "max_model_len": 128000,
         "limit_mm_per_prompt": {"image": 10},
         "enforce_eager": os.environ.get("VLLM_ENFORCE_EAGER", "0") == "1",
+        "disable_custom_all_reduce": True, # Key to the distributed inference with mode change
     }
 
     # Add LoRA config if path provided
@@ -359,7 +383,8 @@ def load_model(
 
     # Store config
     config = {
-        "model_path": model_path,
+        "model_path": resolved_model_path,
+        "requested_model_path": model_path,
         "lora_path": lora_path,
         "tensor_parallel_size": tensor_parallel_size,
         "gpu_memory_utilization": gpu_memory_utilization,
@@ -382,7 +407,6 @@ def main():
     parser.add_argument("--lora-name", type=str, default="default", help="LoRA adapter name")
 
     args = parser.parse_args()
-    apply_runtime_env_for_thinking(repo_root=_REPO_ROOT)
 
     visible_gpus = parse_cuda_visible_devices(os.environ.get("CUDA_VISIBLE_DEVICES"))
     resolved_tp = (

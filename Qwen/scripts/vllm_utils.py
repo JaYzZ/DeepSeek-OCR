@@ -71,6 +71,11 @@ def apply_runtime_env_for_thinking(
             os.environ["VLLM_FORCE_THINK"] = "1" if str(val).strip().lower() in {"1", "true", "yes", "on"} else "0"
             loaded.append(f"VLLM_FORCE_THINK={os.environ['VLLM_FORCE_THINK']}")
 
+        if not os.environ.get("VLLM_THINKING"):
+            val = cfg.get("vllm_thinking", 1)
+            os.environ["VLLM_THINKING"] = "1" if str(val).strip().lower() in {"1", "true", "yes", "on"} else "0"
+            loaded.append(f"VLLM_THINKING={os.environ['VLLM_THINKING']}")
+
         if not os.environ.get("VLLM_ENFORCE_EAGER"):
             val = cfg.get("vllm_enforce_eager", 0)
             os.environ["VLLM_ENFORCE_EAGER"] = "1" if str(val).strip().lower() in {"1", "true", "yes", "on"} else "0"
@@ -80,11 +85,13 @@ def apply_runtime_env_for_thinking(
             _emit_info(f"{', '.join(loaded)} (from {cfg_path})")
     except Exception as e:
         os.environ.setdefault("MIN_CONTINUOUS_STEPS", "0")
+        os.environ.setdefault("VLLM_THINKING", "1")
         os.environ.setdefault("VLLM_FORCE_THINK", "0")
         os.environ.setdefault("VLLM_ENFORCE_EAGER", "0")
         _emit_warn(
             f"failed to load vLLM thinking runtime env from {cfg_path} ({e}); "
             f"fallback MIN_CONTINUOUS_STEPS={os.environ['MIN_CONTINUOUS_STEPS']}, "
+            f"VLLM_THINKING={os.environ['VLLM_THINKING']}, "
             f"VLLM_FORCE_THINK={os.environ['VLLM_FORCE_THINK']}, "
             f"VLLM_ENFORCE_EAGER={os.environ['VLLM_ENFORCE_EAGER']}"
         )

@@ -32,9 +32,28 @@ from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
 from transformers import AutoProcessor
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent))
+# Add repo/evaluation directories to path for imports
+_EVAL_DIR = Path(__file__).parent
+_REPO_ROOT = _EVAL_DIR.parent.parent
+sys.path.insert(0, str(_REPO_ROOT))
+sys.path.insert(0, str(_EVAL_DIR))
 from config import get_data_path, QWEN3_VL_2B_THINKING
+from Qwen.scripts.vllm_utils import apply_runtime_env_for_thinking
+
+
+def _get_runtime_yaml_value(key: str, default):
+    cfg_path = os.environ.get(
+        "QWEN3VL_RUNTIME_ENV_CONFIG",
+        str(_REPO_ROOT / "Qwen/configs/qwen3vl_runtime_env.yaml"),
+    )
+    try:
+        import yaml
+
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        return cfg.get(key, default)
+    except Exception:
+        return default
 
 
 class BenchmarkLogger:
@@ -81,7 +100,7 @@ class BenchmarkLogger:
             self.log(f"  {k}={v}")
 
 
-def get_free_gpus(num_gpus: int = 4, min_free_mb: int = 10000) -> List[int]:
+def get_free_gpus(num_gpus: int = 8, min_free_mb: int = 10000) -> List[int]:
     """
     Select GPUs with the most free memory.
 
@@ -100,7 +119,7 @@ def get_free_gpus(num_gpus: int = 4, min_free_mb: int = 10000) -> List[int]:
         )
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         print(f"Warning: Could not query GPU status: {e}")
-        print("Falling back to GPUs 0,1,2,3")
+        print("Falling back to GPUs 0-7")
         return list(range(num_gpus))
 
     gpu_info = []
@@ -123,8 +142,8 @@ def get_free_gpus(num_gpus: int = 4, min_free_mb: int = 10000) -> List[int]:
         print(f"Warning: Only found {len(selected_gpus)} GPUs with >= {min_free_mb}MB free memory")
         # If we don't have enough, just take what we have
         if len(selected_gpus) == 0:
-            print("No suitable GPUs found, falling back to 0,1,2,3")
-            return list(range(min(4, len(gpu_info))))
+            print("No suitable GPUs found, falling back to 0-7")
+            return list(range(min(num_gpus, len(gpu_info))))
 
     print(f"Selected GPUs: {selected_gpus}")
     for gpu_id in selected_gpus:
@@ -195,9 +214,6 @@ def run_unified_inference(
     # Set GPU environment
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
-
-    # Enable thinking mode for continuous latent AR
-    env["VLLM_THINKING"] = "1"
 
     # Set LoRA checkpoint path for VAE loading
     if lora_path:
@@ -299,6 +315,7 @@ def run_server_inference(
     num_samples: int,
     server_url: str,
     gpus: List[int],
+    max_tokens: int,
     concurrency: int = 1,
     logger: "BenchmarkLogger" = None
 ) -> Dict[str, str]:
@@ -321,6 +338,7 @@ def run_server_inference(
         logger.log(f"Server URL: {server_url}")
         logger.log(f"Benchmarks: {', '.join(benchmarks)}")
         logger.log(f"Num samples: {num_samples}")
+        logger.log(f"Max tokens: {max_tokens}")
         logger.log(f"Concurrency: {concurrency}")
 
     # Check server health
@@ -498,7 +516,7 @@ def run_server_inference(
 
                 payload = {
                     "messages": api_messages,
-                    "max_tokens": 8192,
+                    "max_tokens": max_tokens,
                     "temperature": 0.0,
                 }
                 request_tasks.append((idx, row, messages, payload))
@@ -1198,7 +1216,6 @@ def start_vllm_server(
     # Set environment - CRITICAL: pass GPU IDs to server
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
-    env["VLLM_THINKING"] = "1"
     if lora_path:
         env["VLLM_LORA_CHECKPOINT_PATH"] = lora_path
 
@@ -1385,11 +1402,14 @@ Examples:
     parser.add_argument(
         "--server-concurrency",
         type=int,
-        default=16,
+        default=None,
         help="Number of concurrent in-flight requests to the vLLM server (default: 16)"
     )
 
     args = parser.parse_args()
+    apply_runtime_env_for_thinking(repo_root=Path(__file__).resolve().parents[2])
+    if args.server_concurrency is None:
+        args.server_concurrency = int(_get_runtime_yaml_value("benchmark_server_concurrency", 16))
 
     # Derive enable_lora from lora_path (if lora_path is provided, use LoRA)
     args.enable_lora = bool(args.lora_path)
@@ -1405,7 +1425,7 @@ Examples:
         gpus = [int(x.strip()) for x in args.gpus.split(',')]
         print(f"Using manually specified GPUs: {gpus}")
     else:
-        gpus = get_free_gpus(num_gpus=4)
+        gpus = get_free_gpus(num_gpus=8)
 
     if len(gpus) == 0:
         print("Error: No GPUs available")
@@ -1414,6 +1434,7 @@ Examples:
     # Create run directory
     if args.run_dir:
         run_dir = args.run_dir
+        Path(run_dir).mkdir(parents=True, exist_ok=True)
         print(f"Using existing run directory: {run_dir}")
     else:
         base_results_path = Path(__file__).parent / "results"
@@ -1472,6 +1493,7 @@ Examples:
             "benchmarks": ",".join(benchmarks),
             "skip_infer": args.skip_infer,
             "skip_eval": args.skip_eval,
+            "server_concurrency": args.server_concurrency,
         })
 
         try:
@@ -1500,12 +1522,19 @@ Examples:
 
                 # Use server mode if server-url is provided
                 if args.server_url:
+                    server_max_tokens = int(
+                        os.environ.get(
+                            "QWEN3VL_TRANSPARENT_EVAL_MAX_NEW_TOKENS",
+                            _get_runtime_yaml_value("eval_max_new_tokens", 8192),
+                        )
+                    )
                     inference_files = run_server_inference(
                         benchmarks=benchmarks,
                         run_dir=run_dir,
                         num_samples=args.num_samples,
                         server_url=args.server_url,
                         gpus=gpus,
+                        max_tokens=server_max_tokens,
                         concurrency=args.server_concurrency,
                         logger=logger
                     )

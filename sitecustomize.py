@@ -21,24 +21,17 @@ mp.set_sharing_strategy("file_system")
 if os.environ.get("LOCAL_RANK", "0") == "0":
     logging.warning("[sitecustomize] Set torch multiprocessing sharing strategy to 'file_system' to avoid FD limits")
 
-# Import Qwen patches (for Qwen3VL training)
-try:
-    from Qwen.llamafactory import integration as qwen_integration
-except ImportError:
-    qwen_integration = None
 
-# Import OCRVL patches (for OCRVL models)
-try:
-    from OCRVL.llamafactory import integration as ocrvl_integration
-except ImportError:
-    ocrvl_integration = None
+def _qwen_patches_enabled() -> bool:
+    """Whether Qwen LlamaFactory patches should be applied in this process."""
+    return os.environ.get("QWEN3VL_LATENT_SUPERVISION", "0") == "1"
 
 
 def _ocrvl_patches_enabled() -> bool:
     """Whether OCRVL sitecustomize patches should be applied in this process."""
     flag = os.environ.get("OCRVL_APPLY_PATCHES")
     if flag is None:
-        return True
+        return False
     return flag.strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -47,20 +40,28 @@ def _patch_once() -> None:
     logger = logging.getLogger(__name__)
 
     # Apply Qwen patches (latent supervision, callbacks, tokenizer, etc.)
-    if qwen_integration is not None:
+    if _qwen_patches_enabled():
         try:
+            from Qwen.llamafactory import integration as qwen_integration
+
             if hasattr(qwen_integration, 'apply_qwen_patches'):
                 qwen_integration.apply_qwen_patches(logger)
             elif hasattr(qwen_integration, '_patch_once'):
                 qwen_integration._patch_once()
+        except ImportError as e:
+            logger.warning(f"[sitecustomize] Failed to import Qwen patches: {e}")
         except Exception as e:
             logger.warning(f"[sitecustomize] Failed to apply Qwen patches: {e}")
 
     # Apply OCRVL patches (OCRVL model support)
-    if ocrvl_integration is not None and _ocrvl_patches_enabled():
+    if _ocrvl_patches_enabled():
         try:
+            from OCRVL.llamafactory import integration as ocrvl_integration
+
             if hasattr(ocrvl_integration, 'apply_ocrvl_patches'):
                 ocrvl_integration.apply_ocrvl_patches(logger)
+        except ImportError as e:
+            logger.warning(f"[sitecustomize] Failed to import OCRVL patches: {e}")
         except Exception as e:
             logger.warning(f"[sitecustomize] Failed to apply OCRVL patches: {e}")
 

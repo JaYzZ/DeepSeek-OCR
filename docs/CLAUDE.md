@@ -9,6 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 4. DO NOT do this: `torch_dtype` is deprecated! Use `dtype` instead!
 5. **DO NOT use git commands that modify files** - `git checkout`, `git reset`, `git revert` without explicit approval
 6. **Import rules**: Always use absolute imports (e.g., `from vllm_thinking.runner_patch import ...`) NOT relative imports. Place all imports at the top of the file, never use inline/wild imports inside functions.
+7. **FIRST PRINCIPAL**: Do not assume the user knows hidden context, defaults, or implied steps. State concrete assumptions, exact data flow, and why a conclusion follows from the code or logs.
 
 ## System Dependencies
 

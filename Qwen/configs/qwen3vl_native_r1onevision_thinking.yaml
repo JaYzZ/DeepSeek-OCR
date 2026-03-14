@@ -20,8 +20,8 @@
 #    - `latent_step_ce_token=1` forces `<latent>` labels on those positions.
 #
 # Hidden-state losses:
-# - `pre_think_mse` compares shifted hidden states against `latent_ground_truth`.
-# - `ot/mse/repa/nce` compare latent positions to `latent_supervision`.
+# - `mse` compares shifted hidden states against `latent_ground_truth`.
+# - `ot/repa/nce` compare shifted hidden states to `latent_supervision`.
 # - `vae` enables the latent VAE and an auxiliary `pred_embed_forward` CE pass
 #   that reuses the same supervision region/targets as the main CE path.
 #
@@ -67,7 +67,7 @@ streaming: false
 packing: false
 preprocessing_num_workers: 8
 dataloader_num_workers: 8
-dataloader_prefetch_factor: 4
+dataloader_prefetch_factor: 8
 
 ### eval
 # eval_dataset: qwen3vl_transparent_eval
