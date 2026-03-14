@@ -34,7 +34,6 @@ from dataclasses import dataclass
 from safetensors import safe_open
 
 from OCRInfer.utils.model_paths import resolve_model_path
-from sys_path import _add_sys_path
 import sys
 
 logger = logging.getLogger(__name__)

@@ -10,13 +10,18 @@ visual-token-first inputs. It currently provides:
 """
 
 import os
-from sys_path import _add_sys_path
+import sys
 
-# Ensure the sibling LLaVA repo is importable (../LLaVA)
-_HERE = os.path.dirname(__file__)
-_SOURCES_DIR = os.path.dirname(os.path.dirname(_HERE))  # .../sources
-_LLAVA_DIR = os.path.join(_SOURCES_DIR, 'LLaVA')
-_add_sys_path(_LLAVA_DIR)
+def _ensure_llava_on_path() -> None:
+    """Make the sibling LLaVA checkout importable for OCR-LLaVA adapters."""
+    here = os.path.dirname(__file__)
+    sources_dir = os.path.dirname(os.path.dirname(here))  # .../sources
+    llava_dir = os.path.join(sources_dir, "LLaVA")
+    if os.path.isdir(llava_dir) and llava_dir not in sys.path:
+        sys.path.append(llava_dir)
+
+
+_ensure_llava_on_path()
 
 # Re-export the most common entry points
 from .model.language_model.ocr_llava_llama import OCRLlavaLlamaForCausalLM  # noqa: E402,F401

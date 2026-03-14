@@ -20,8 +20,8 @@
 #    - `latent_step_ce_token=1` forces `<latent>` labels on those positions.
 #
 # Hidden-state losses:
-# - `mse` compares shifted hidden states against `latent_ground_truth`.
-# - `ot/repa/nce` compare shifted hidden states to `latent_supervision`.
+# - `mse/repa` compare shifted hidden states against `latent_ground_truth`.
+# - `ot/nce` compare shifted hidden states to `latent_supervision`.
 # - `vae` enables the latent VAE and an auxiliary `pred_embed_forward` CE pass
 #   that reuses the same supervision region/targets as the main CE path.
 #

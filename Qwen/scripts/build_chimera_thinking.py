@@ -41,6 +41,37 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_PATH = "/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking"
 
+
+def load_cached_latent_seq_len(cache_path: str, seq_len_cache: dict[str, int]) -> int:
+    cached = seq_len_cache.get(cache_path)
+    if cached is not None:
+        return cached
+    latent = torch.load(cache_path, map_location="cpu", mmap=True, weights_only=False)
+    tensor = None
+    if isinstance(latent, dict):
+        if "l_features" in latent:
+            tensor = latent["l_features"]
+        elif "latent" in latent:
+            tensor = latent["latent"]
+    elif isinstance(latent, torch.Tensor):
+        tensor = latent
+    if tensor is None:
+        raise ValueError(f"Unable to resolve latent tensor from cache: {cache_path}")
+    seq_len = int(tensor.shape[0]) if tensor.dim() >= 2 else 1
+    seq_len_cache[cache_path] = seq_len
+    return seq_len
+
+
+def build_cot_chunk_token_ids(tokenizer, thinking_chunks: List[str]) -> List[List[int]]:
+    token_ids: List[List[int]] = []
+    for chunk in thinking_chunks or []:
+        text = str(chunk or "")
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        if len(ids) == 0:
+            ids = tokenizer.encode(" ", add_special_tokens=False)
+        token_ids.append(ids)
+    return token_ids
+
 IMAGE_PROMPT_POOL = [
     "Solve this {topic} question in the image.",
     "Answer this {topic} problem from the image.",
@@ -200,7 +231,12 @@ def _load_metadata(metadata_path: Path) -> List[Dict[str, Any]]:
     return items
 
 
-def _encode_missing_features(encoder: Qwen3VLEncoder, image_paths: List[str], cache_dir: Path, batch_size: int):
+def _encode_missing_features(
+    encoder: Qwen3VLEncoder,
+    image_paths: List[str],
+    cache_dir: Path,
+    batch_size: int,
+) -> dict[str, int]:
     to_encode: List[str] = []
     for p in image_paths:
         stem = Path(p).stem
@@ -209,6 +245,7 @@ def _encode_missing_features(encoder: Qwen3VLEncoder, image_paths: List[str], ca
             to_encode.append(p)
 
     logger.info(f"Encoding missing features: {len(to_encode)}/{len(image_paths)}")
+    seq_len_cache: dict[str, int] = {}
     for i in range(0, len(to_encode), batch_size):
         batch_paths = to_encode[i : i + batch_size]
         batch_images = [Image.open(p).convert("RGB") for p in batch_paths]
@@ -220,9 +257,11 @@ def _encode_missing_features(encoder: Qwen3VLEncoder, image_paths: List[str], ca
             stem = Path(p).stem
             cp = cache_dir / f"{stem}.pt"
             torch.save({"latent": feat.cpu(), "grid_thw": grid.cpu()}, cp)
+            seq_len_cache[str(cp)] = int(feat.shape[0]) if feat.dim() >= 2 else 1
 
         if (i // batch_size) % 10 == 0:
             logger.info(f"Encode progress: {min(i + batch_size, len(to_encode))}/{len(to_encode)}")
+    return seq_len_cache
 
 
 def _get_distributed_info() -> tuple[int, int]:
@@ -297,7 +336,7 @@ def main_encode_only(args):
     else:
         rank_paths = all_paths_sorted
 
-    _encode_missing_features(encoder, rank_paths, cache_dir, args.batch_size)
+    seq_len_cache = _encode_missing_features(encoder, rank_paths, cache_dir, args.batch_size)
 
     # Wait until all ranks finish cache generation before rank 0 writes JSONL.
     if world_size > 1 and dist.is_initialized():
@@ -325,6 +364,22 @@ def main_encode_only(args):
             question_text = s["question"]
 
             num_latent_steps = len(solution_cache_paths)
+            latent_seq_lens = [
+                load_cached_latent_seq_len(cache_path, seq_len_cache)
+                for cache_path in solution_cache_paths
+            ]
+            cot_chunk_token_ids = build_cot_chunk_token_ids(
+                tokenizer,
+                s.get("solution_chunks") or [],
+            )
+            if len(cot_chunk_token_ids) != num_latent_steps:
+                logger.warning(
+                    "Skipping %s: chunk/token count mismatch (%s vs %s)",
+                    s.get("sample_id", "unknown"),
+                    len(cot_chunk_token_ids),
+                    num_latent_steps,
+                )
+                continue
             latent_placeholders = "<think_sep>".join(["<latent>"] * num_latent_steps)
             assistant_content = f"<think>{latent_placeholders}</think>{s['answer']}"
 
@@ -334,7 +389,8 @@ def main_encode_only(args):
                 "latent_supervision": [supervision_cache_path],
                 "num_latent_steps": num_latent_steps,
                 "cot": cot,
-                "cot_token_ids": tokenizer.encode(cot, add_special_tokens=False),
+                "latent_seq_lens": latent_seq_lens,
+                "cot_chunk_token_ids": cot_chunk_token_ids,
             }
 
             # Variant 1: question provided via image input.

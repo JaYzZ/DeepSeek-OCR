@@ -214,6 +214,14 @@ fi
 
 # Setup logging
 mkdir -p "$OUTPUT_DIR"
+RERUN_EVALS_SH="$OUTPUT_DIR/rerun_evals.sh"
+cat > "$RERUN_EVALS_SH" <<EOF
+#!/bin/bash
+set -euo pipefail
+CUDA_VISIBLE_DEVICES=\${BACKFILL_CUDA_VISIBLE_DEVICES:-0} $PYTHON_BIN Qwen/scripts/backfill_transparent_eval.py --checkpoint_dir "$OUTPUT_DIR" --checkpoint checkpoint_latest --gpu_memory_utilization \${GPU_MEMORY_UTILIZATION:-0.9} 2>&1 | tee \${BACKFILL_LOG:-/tmp/backfill_thinking_debug.log}
+VLLM_FORCE_THINK=$VLLM_FORCE_THINK CUDA_VISIBLE_DEVICES=\${BENCH_CUDA_VISIBLE_DEVICES:-\${CUDA_VISIBLE_DEVICES:-0}} $PYTHON_BIN Qwen/evaluation/run_all_benchmarks.py --start-server --benchmarks \${BENCHMARKS:-MathVision,RealWorldQA} --lora-path "$OUTPUT_DIR/checkpoint_latest"
+EOF
+chmod +x "$RERUN_EVALS_SH"
 LOG_FILE="$OUTPUT_DIR/training.log"
 
 echo "Logging to: $LOG_FILE"

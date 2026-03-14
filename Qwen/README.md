@@ -54,7 +54,7 @@ Dataset is ShareGPT-style (for LlamaFactory) with extra latent fields:
 Notes:
 - If `num_latent_steps == 1`, assistant content is typically `<think><latent></think>{answer}` (no `<think_sep>`).
 - `latent_ground_truth` is **one entry per thinking chunk** (question_text image is excluded).
-- `latent_supervision` is usually a **single** entry: the main question image feature (used as target for OT/MSE/REPA/NCE losses).
+- `latent_supervision` is usually a **single** entry: the main question image feature (used as target for OT/NCE losses).
 
 ## Training Structure (Sequence, Expansion, Injection)
 
@@ -92,7 +92,8 @@ Total loss is a combination of:
 
 Supported terms:
 - `mse`: MSE between **shifted** hidden states (position p-1) and the injected `latent_ground_truth` targets.
-- `ot`, `repa`, `nce`: compare **shifted** hidden states (position p-1) to `latent_supervision` targets (usually the main image feature), using `QWEN3VL_MATCH_STRATEGY` where applicable.
+- `repa`: cosine alignment between **shifted** hidden states (position p-1) and `latent_ground_truth`.
+- `ot`, `nce`: compare **shifted** hidden states (position p-1) to `latent_supervision` targets (usually the main image feature), using `QWEN3VL_MATCH_STRATEGY` where applicable.
 
 3) **VAE loss (optional, when `vae` is included in `QWEN3VL_LOSS_TYPE`)**
 - Adds a `latent_vae` module to map shifted hidden states -> latent distribution.

@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import importlib.util
 from typing import Any, Iterable, List, Optional, Sequence, Union
 
 import torch
@@ -65,7 +66,6 @@ from transformers.utils import is_torchdynamo_compiling
 
 from OCRInfer.encoder.dpsk_ocr_encoder import DPSKOCREncoder
 from OCRInfer.utils.model_paths import resolve_model_path
-from sys_path import _add_sys_path
 from OCRVL.model.latent_injection import inject_latent_features
 
 
@@ -178,17 +178,22 @@ class DPSKVisionTowerAdapter(nn.Module):
 
         return last_hidden_state, pooler_output, deepstack_outputs
 
-# Try to import the text renderer from the local DeepSeek-OCR vLLM server utilities.
-_THIS_DIR = os.path.dirname(__file__)
-_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_THIS_DIR)))  # .../DeepSeek-OCR
-_DS_OCR_SERVER = os.path.join(_ROOT, "DeepSeek-OCR-master", "DeepSeek-OCR-vllm", "server")
-_add_sys_path(_DS_OCR_SERVER)
+def _load_text_renderer():
+    """Load text_renderer.py directly from the vendored DeepSeek-OCR server tree."""
+    this_dir = os.path.dirname(__file__)
+    root = os.path.dirname(os.path.dirname(os.path.dirname(this_dir)))  # .../DeepSeek-OCR
+    module_path = os.path.join(root, "DeepSeek-OCR-master", "DeepSeek-OCR-vllm", "server", "text_renderer.py")
+    if not os.path.isfile(module_path):
+        return None, None
+    spec = importlib.util.spec_from_file_location("deepseek_ocr_text_renderer", module_path)
+    if spec is None or spec.loader is None:
+        return None, None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return getattr(module, "chunk_text_by_tokens", None), getattr(module, "render_text_to_image", None)
 
-try:
-    from text_renderer import chunk_text_by_tokens, render_text_to_image
-except Exception:  # pragma: no cover
-    chunk_text_by_tokens = None
-    render_text_to_image = None
+
+chunk_text_by_tokens, render_text_to_image = _load_text_renderer()
 
 try:
     from Renderer import VelloRenderer  # type: ignore

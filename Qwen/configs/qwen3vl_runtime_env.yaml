@@ -23,7 +23,7 @@ thinking_end_id: 151668
 thinking_sep_id: 151670
 
 ### latent objective runtime
-loss_type: vae+ot+mse
+loss_type: vae+mse
 match_strategy: truncate
 thinking_loss_weight: 1.0
 pred_embed_forward_weight: 1.0
@@ -34,10 +34,10 @@ vae_intermediate_size: 512
 ### curriculum
 curriculum_enable: 1
 curriculum_epochs: 0,1,2
-curriculum_loss_types: vae+ot+mse,vae+ot+mse,vae+ot+mse
+curriculum_loss_types: vae+mse,vae+mse,vae+mse+ot
 curriculum_weights: 1.0,1.0,1.0
 curriculum_latent_step_ce: 1,1,1
-latent_step_ce_loss: 1
+latent_step_ce_loss: 0
 latent_step_ce_token: 0
 # 0 => use sampled CoT token IDs at latent-step CE positions (default)
 # 1 => force <latent> token ID at latent-step CE positions

@@ -2860,7 +2860,7 @@ def _compute_thinking_loss(
     - Custom weights: "ot:0.7+mse:0.3", "repa:0.5+nce:0.3+ot:0.2"
 
     Available loss types:
-    - 'repa': Negative cosine similarity on shifted hidden states vs latent_supervision
+    - 'repa': Negative cosine similarity on shifted hidden states vs latent_ground_truth
     - 'nce': InfoNCE contrastive loss on shifted hidden states vs latent_supervision
     - 'ot': EMO optimal transport on shifted hidden states vs latent_supervision
     - 'mse': Mean squared error on shifted hidden states vs latent_ground_truth
@@ -2907,7 +2907,7 @@ def _compute_thinking_loss(
             # Curriculum warmup: skip latent supervision loss
             continue
         elif loss_name == "repa":
-            loss = _compute_repa_loss(hidden_states, latent_supervision, latent_positions)
+            loss = _compute_repa_loss(hidden_states, latent_ground_truth, latent_positions)
         elif loss_name == "nce":
             loss = _compute_contrastive_loss(hidden_states, latent_supervision, latent_positions)
         elif loss_name == "ot":
@@ -3005,12 +3005,12 @@ def _parse_loss_spec(loss_spec: str) -> List[tuple]:
 
 def _compute_repa_loss(
     hidden_states: torch.Tensor,
-    latent_supervision: List[List[torch.Tensor]],
+    latent_ground_truth: List[List[torch.Tensor]],
     latent_positions: torch.BoolTensor,
 ) -> Optional[torch.Tensor]:
     """Compute REPA loss on shifted autoregressive hidden states.
 
-    Use this when you have ground truth supervision targets.
+    Uses the same latent target stream as MSE: latent_ground_truth.
 
     Sequence matching: Uses QWEN3VL_MATCH_STRATEGY env var (default: truncate)
     - 'truncate': Truncate both to min length
@@ -3032,7 +3032,7 @@ def _compute_repa_loss(
         sample_hidden = hidden_states[b][pred_indices]
 
         supervision_tensor = _concat_supervision_tensors(
-            latent_supervision[b] if b < len(latent_supervision) else [],
+            latent_ground_truth[b] if b < len(latent_ground_truth) else [],
             device=sample_hidden.device,
             dtype=sample_hidden.dtype,
         )

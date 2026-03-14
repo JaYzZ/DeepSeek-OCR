@@ -578,6 +578,7 @@ def main_encode_only(args, encoder):
             if local_rank == 0:
                 logger.info(f"  Encoding {len(images_to_encode)}/{len(all_image_paths)} images (rest cached)...")
 
+            seq_len_cache: dict[str, int] = {}
             if not images_to_encode:
                 if local_rank == 0:
                     logger.info(f"  ✓ All features already cached!")
@@ -600,6 +601,7 @@ def main_encode_only(args, encoder):
                             'latent': l_feat.cpu(),  # [actual_tokens, 2048] - no padding!
                             'grid_thw': grid.cpu(),   # [3]
                         }, cache_path)
+                        seq_len_cache[str(cache_path)] = int(l_feat.shape[0]) if l_feat.dim() >= 2 else 1
                         stats['features_cached'] += 1
 
                     if local_rank == 0 and (i + batch_size) % (batch_size * 10) == 0:
@@ -611,7 +613,6 @@ def main_encode_only(args, encoder):
             # Phase 2d: Process each sample using cached features (NO encoding!)
             if local_rank == 0:
                 logger.info(f"  Combining cached features...")
-            seq_len_cache: dict[str, int] = {}
             with open(output_jsonl, file_mode) as f_out:
                 for sample in samples_to_encode:
                     try:
@@ -652,7 +653,7 @@ def main_encode_only(args, encoder):
                         # latent_ground_truth: One entry per thinking chunk (for injection at <latent>)
                         latent_ground_truth = thinking_cache_paths
 
-                        # latent_supervision: Main question image feature (used by OT/MSE/REPA/NCE losses)
+                        # latent_supervision: Main question image feature (used by OT/NCE losses)
                         latent_supervision = [query_cache_path]
 
                         # Reconstruct assistant message with thinking tags and latent placeholders

@@ -40,12 +40,10 @@ from pathlib import Path
 from typing import Optional
 import torch
 from OCRInfer.utils.model_paths import resolve_model_path
-from sys_path import _add_sys_path
 
 
 # CRITICAL: Apply embedding patches BEFORE importing vLLM
-_add_sys_path(Path(__file__).parent)
-import embedding_patch  # This patches vLLM to support ImageEmbeddingItems
+from . import embedding_patch  # noqa: F401  # This patches vLLM to support ImageEmbeddingItems
 
 # Import vLLM components
 from vllm import LLM, SamplingParams
@@ -124,9 +122,8 @@ class VLLMEmbeddingDecoder:
         The lightweight encoder outputs [110, 1280], but vLLM expects [111, 1280]
         with view_separator appended for single-tile images.
         """
-        _add_sys_path(Path(__file__).parent)
         try:
-            import transformers_patch
+            from . import transformers_patch  # noqa: F401
         except ImportError:
             pass
 
