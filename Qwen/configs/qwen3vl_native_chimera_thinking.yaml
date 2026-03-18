@@ -11,7 +11,7 @@ flash_attn: fa2
 ### method
 stage: sft
 do_train: true
-do_eval: false
+do_eval: false  # Transparent eval is run later via backfill; no in-trainer eval loop here.
 finetuning_type: lora
 lora_rank: 8
 lora_alpha: 16
@@ -26,13 +26,13 @@ freeze_vision_tower: true
 dataset: qwen3vl_chimera_thinking_image_input,qwen3vl_chimera_thinking_text_input
 dataset_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/data
 template: qwen3vl_latent
-cutoff_len: 40960
+cutoff_len: 8192
 max_samples: null
 streaming: false
 packing: false
-preprocessing_num_workers: 4
-dataloader_num_workers: 4
-dataloader_prefetch_factor: 2
+preprocessing_num_workers: 8
+dataloader_num_workers: 8
+dataloader_prefetch_factor: 4
 
 ### eval
 # eval_dataset: qwen3vl_transparent_eval
@@ -56,8 +56,8 @@ swanlab_mode: cloud
 swanlab_project: qwen3vl-chimera
 
 ### train
-per_device_train_batch_size: 1
-gradient_accumulation_steps: 1
+per_device_train_batch_size: 32
+gradient_accumulation_steps: 2
 dataloader_drop_last: true
 learning_rate: 2.0e-4
 num_train_epochs: 3.0
@@ -69,20 +69,24 @@ gradient_checkpointing: false
 dataloader_pin_memory: true
 dataloader_persistent_workers: true
 
-# FSDP configuration
+# FSDP configuration for LoRA + latent-VAE training.
 fsdp:
   - full_shard
   - auto_wrap
 fsdp_config:
-  fsdp_auto_wrap_policy: SIZE_BASED_WRAP
-  fsdp_min_num_params: 100000
+  activation_checkpointing: true
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  transformer_layer_cls_to_wrap:
+    - "Qwen3VLTextDecoderLayer"
+    - "Qwen3VLVisionBlock"
+    - "Qwen3VLVisionPatchMerger"
+  ignored_modules: "model\\.visual(\\..*)?"
   fsdp_backward_prefetch: BACKWARD_PRE
   fsdp_forward_prefetch: false
-  fsdp_use_orig_params: true
+  fsdp_use_orig_params: true  # Required for summon_full_params with LoRA / extra modules.
   fsdp_cpu_ram_efficient_loading: false
   fsdp_sync_module_states: true
   fsdp_state_dict_type: full_state_dict
-  activation_checkpointing: true 
 
 ddp_find_unused_parameters: false
 ddp_timeout: 180000000

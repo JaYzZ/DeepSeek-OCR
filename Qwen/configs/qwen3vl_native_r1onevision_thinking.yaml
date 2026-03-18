@@ -15,7 +15,8 @@
 #    `<think>`, `</think>`, and `<think_sep>` when present.
 # 4. Optional latent-step CE on the expanded latent region is controlled by the
 #    shared runtime env (`qwen3vl_runtime_env.yaml`, used by train/backfill/server):
-#    - `latent_step_ce_loss=1` enables CE on expanded latent positions.
+#    - latent-step CE on expanded latent positions is controlled by curriculum
+#      in the main process.
 #    - `latent_step_ce_token=0` uses the prebuilt `cot_chunk_token_ids`.
 #    - `latent_step_ce_token=1` forces `<latent>` labels on those positions.
 #
@@ -69,14 +70,6 @@ preprocessing_num_workers: 8
 dataloader_num_workers: 8
 dataloader_prefetch_factor: 8
 
-### eval
-# eval_dataset: qwen3vl_transparent_eval
-# val_size: 0
-# per_device_eval_batch_size: 1
-# eval_strategy: steps
-# eval_steps: 500
-# predict_with_generate: false
-
 ### output
 output_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/qwen3vl-2b/lora/r1_onevision_thinking
 logging_steps: 10
@@ -91,10 +84,6 @@ swanlab_mode: cloud
 swanlab_project: qwen3vl-r1-onevision
 
 ### train
-# FSDP note:
-# - Keep `gradient_checkpointing=false` here.
-# - Use `fsdp_config.activation_checkpointing=true` instead to avoid the redundant
-#   all-gather warning path seen with FSDP + `gradient_checkpointing=true`.
 per_device_train_batch_size: 32
 gradient_accumulation_steps: 2
 dataloader_drop_last: true
@@ -114,8 +103,12 @@ fsdp:
   - auto_wrap
 fsdp_config:
   activation_checkpointing: true
-  fsdp_auto_wrap_policy: SIZE_BASED_WRAP
-  fsdp_min_num_params: 100000
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  transformer_layer_cls_to_wrap:
+    - "Qwen3VLTextDecoderLayer"
+    - "Qwen3VLVisionBlock"
+    - "Qwen3VLVisionPatchMerger"
+  ignored_modules: "model\\.visual(\\..*)?"
   fsdp_backward_prefetch: BACKWARD_PRE
   fsdp_forward_prefetch: false
   fsdp_use_orig_params: true  # Required for summon_full_params with LoRA / extra modules.

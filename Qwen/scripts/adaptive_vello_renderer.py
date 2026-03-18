@@ -6,7 +6,7 @@ Calculates optimal H×W dimensions based on actual text measurement:
 - Uses minimum readable font size
 - Calculates actual space needed with proper line wrapping
 - Supports asymmetric H×W for efficiency
-- Optimized for Qwen3VL's native variable resolution (64-1536)
+- Optimized for Qwen3VL's native variable resolution policy
 """
 
 import math
@@ -14,7 +14,7 @@ import re
 import sys
 import textwrap
 from pathlib import Path
-from typing import Tuple, List, Optional
+from typing import Dict, Tuple, List, Optional
 import numpy as np
 from PIL import Image
 
@@ -22,6 +22,7 @@ from PIL import Image
 repo_root = Path(__file__).parent.parent
 sys.path.insert(0, str(repo_root))
 
+from Renderer.skia_renderer import prepare_text_for_rendering
 from Renderer.vello_renderer_wrapper import VelloRenderer, is_available
 
 
@@ -295,12 +296,12 @@ def calculate_text_layout(
 def calculate_adaptive_dimensions(
     text: str,
     min_font_size: float = 8.0,          # Vello's minimum font size
-    min_size: int = 64,                  # Minimum dimension (Qwen3VL lower bound)
-    max_size: int = 1536,                # Maximum dimension
+    min_size: int = 32,                  # Minimum dimension before processor-side upscaling
+    max_size: int = 4096,                # Maximum dimension
     vit_divisor: int = 32,               # Round to multiple (for Qwen3VL efficiency)
     padding: int = 15,                   # Padding in pixels (small for efficiency)
     safety_multiplier: float = 1.5,      # Safety margin (50% extra to handle Vello auto-sizing)
-    aspect_ratio_constraint: Optional[float] = 4.0,  # max W/H or H/W ratio
+    aspect_ratio_constraint: Optional[float] = 200.0,  # Very loose cap for extreme rectangles
     allow_asymmetric: bool = True,       # if False, force square
 ) -> Tuple[int, int, dict]:
     """
@@ -315,12 +316,12 @@ def calculate_adaptive_dimensions(
     Args:
         text: Text to render
         min_font_size: Vello's minimum font size (used for size calculation)
-        min_size: Minimum dimension for either H or W (Qwen3VL requires 64+)
+        min_size: Minimum dimension for either H or W before processor-side resizing
         max_size: Maximum dimension for either H or W
         vit_divisor: Round dimensions to multiple of this (32 for Qwen3VL)
         padding: Padding around text in pixels
         safety_multiplier: Extra space multiplier (e.g., 1.5 = 50% extra)
-        aspect_ratio_constraint: Maximum aspect ratio (prevents extreme rectangles)
+        aspect_ratio_constraint: Maximum aspect ratio (set high enough to rarely bind)
         allow_asymmetric: If False, returns square dimensions
 
     Returns:
@@ -329,7 +330,8 @@ def calculate_adaptive_dimensions(
     num_chars = len(text)
 
     if num_chars == 0:
-        return (min_size, min_size)
+        empty_layout = analyze_text_layout(text)
+        return min_size, min_size, empty_layout
 
     # Analyze text layout to detect structure
     layout_info = analyze_text_layout(text)
@@ -390,232 +392,356 @@ def reflow_short_newline_text(
     layout_info: dict,
     short_line_threshold: int = 20,
     min_lines_for_reflow: int = 8,
-    target_line_width_chars: int = 80,
 ) -> tuple[str, dict]:
-    """
-    Reflow text when explicit newlines create many very short lines.
+    """Unified newline-aware preprocessing for short, ragged text blocks."""
+    return _pack_text_preserving_layout(
+        text=text,
+        layout_info=layout_info,
+        short_line_threshold=short_line_threshold,
+        min_lines_for_reflow=min_lines_for_reflow,
+    )
 
-    This keeps newlines in the final text, but uses fewer lines by wrapping merged
-    content to a target width.
+
+def _pack_text_preserving_layout(
+    text: str,
+    layout_info: dict,
+    short_line_threshold: int = 20,
+    min_lines_for_reflow: int = 8,
+) -> tuple[str, dict]:
+    """Pack mutable text into even lines while preserving immutable layout.
+
+    Strategy:
+    - Split text into strict immutable and mutable chunks.
+    - Strict immutable chunks preserve exact line layout.
+    - Strict immutable chunks define the minimum packed line width.
+    - Mutable chunks are merged/re-wrapped against that minimum width.
+    - Width is inferred once from aggregate stats, keeping preprocessing O(n).
     """
     if not text or not text.strip():
         return text, layout_info
 
-    if not layout_info.get("preserve_newlines", False):
-        return text, layout_info
+    def normalize_blank_lines(text_value: str) -> str:
+        text_value = text_value.expandtabs(4)
+        normalized_lines: list[str] = []
+        previous_blank = False
+        for raw_line in text_value.split("\n"):
+            is_blank = not raw_line.strip()
+            if is_blank:
+                if previous_blank:
+                    continue
+                normalized_lines.append("")
+                previous_blank = True
+            else:
+                normalized_lines.append(raw_line)
+                previous_blank = False
+        while normalized_lines and normalized_lines[0] == "":
+            normalized_lines.pop(0)
+        while normalized_lines and normalized_lines[-1] == "":
+            normalized_lines.pop()
+        return "\n".join(normalized_lines)
 
-    # Never rewrite layout-sensitive formats where explicit '\n' carries structure.
-    layout_type = layout_info.get("layout_type", "")
-    reflow_allowed_layouts = {"list", "structured", "markdown"}
-    if layout_type not in reflow_allowed_layouts:
+    text = normalize_blank_lines(text)
+    if not text:
         return text, layout_info
 
     lines = text.split("\n")
-    non_empty = [l.strip() for l in lines if l.strip()]
-    if len(non_empty) < min_lines_for_reflow:
+    if len(lines) < 2 and len(text) < short_line_threshold * 2:
         return text, layout_info
 
-    def is_hard_layout_line(line: str) -> bool:
-        s = line.strip()
-        if not s:
-            return False
-        if s.startswith(("```", "#", ">", "|")):
-            return True
-        if len(line) - len(line.lstrip()) >= 4:  # indentation/code
-            return True
-        if any(c in s for c in ("┌", "┐", "└", "┘", "│", "─", "{", "}", ";")):
-            return True
-        # Keep markdown bullets as explicit structure.
-        if s.startswith(("- ", "* ", "+ ")):
-            return True
-        return False
+    list_prefix = re.compile(r"^(\s*(?:[-*+]\s+|\d+\.\s+|[A-Za-z][\.\)]\s+))(.+?)\s*$")
+    quote_prefix = re.compile(r"^(\s*>\s*)(.+?)\s*$")
+    header_prefix = re.compile(r"^(\s*#+\s*)(.+?)\s*$")
+    line_pack_separator = "    "  # Tab-width visual gap between originally separate packed lines.
 
-    number_prefix = re.compile(r"^\s*(\d+)\.\s+")
+    def classify_line(line: str) -> str:
+        stripped = line.strip()
+        if not stripped:
+            return "blank"
+        if stripped.startswith(("```", "~~~")):
+            return "immutable"
+        if stripped.startswith("|"):
+            return "immutable"
+        if any(c in stripped for c in ("┌", "┐", "└", "┘", "│", "─", "├", "┤", "┬", "┴", "┼")):
+            return "immutable"
+        if stripped.count("|") >= 2:
+            return "immutable"
+        if "\t" in line:
+            return "immutable"
+        return "mutable"
 
-    def parse_line_number(line: str) -> Optional[int]:
-        m = number_prefix.match(line)
-        return int(m.group(1)) if m else None
+    def longest_token_len(text_value: str) -> int:
+        tokens = re.split(r"\s+", text_value.strip())
+        return max((len(tok) for tok in tokens if tok), default=1)
 
-    def wrap_with_best_width(text: str, min_width: int = 56) -> List[str]:
-        """Search width candidates and pick the wrap with smallest estimated render cost."""
-        best_wrapped: Optional[List[str]] = None
-        best_score: Optional[float] = None
-        best_max_len: Optional[int] = None
+    def wrap_plain_text(content: str, width: int) -> list[str]:
+        wrapped = textwrap.wrap(
+            content,
+            width=max(1, width),
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        return wrapped or [content.strip()]
 
-        for width in range(min_width, target_line_width_chars + 1, 4):
-            wrapped = textwrap.wrap(
-                text,
-                width=width,
-                break_long_words=False,
-                break_on_hyphens=False,
-            )
-            if not wrapped:
-                continue
-
-            max_len = max(len(x) for x in wrapped)
-            area = max_len * len(wrapped)
-
-            short_thr = max(10, short_line_threshold // 2)
-            very_short_thr = max(6, short_thr // 2)
-            short_lines = sum(1 for x in wrapped if len(x) < short_thr)
-            very_short_lines = sum(1 for x in wrapped if len(x) < very_short_thr)
-            orphan = 1 if len(wrapped[-1]) < short_thr else 0
-
-            score = (
-                area
-                + short_lines * 80
-                + very_short_lines * 160
-                + orphan * 140
-            )
-
-            if (
-                best_score is None
-                or score < best_score
-                or (score == best_score and max_len < (best_max_len or 10**9))
-            ):
-                best_score = score
-                best_wrapped = wrapped
-                best_max_len = max_len
-
-        return best_wrapped if best_wrapped else [text]
-
-    def optimize_numbered_adjacent_lines(lines: List[str]) -> List[str]:
-        """
-        For numbered short lines, search adjacent line-number groups for a compact wrap.
-        Uses local look-ahead and picks the smallest estimated render cost.
-        """
-        out: List[str] = []
-        i = 0
-        n = len(lines)
-        while i < n:
-            best_score: Optional[float] = None
-            best_k = 1
-            best_wrapped: List[str] = [lines[i]]
-
-            max_k = min(6, n - i)
-            for k in range(1, max_k + 1):
-                chunk = lines[i:i + k]
-                nums = [parse_line_number(x) for x in chunk]
-                if any(x is None for x in nums):
-                    if k > 1:
-                        break
-                if k > 1 and all(x is not None for x in nums):
-                    if any(nums[j] != nums[j - 1] + 1 for j in range(1, len(nums))):
-                        break
-
-                merged = " ".join(x.strip() for x in chunk if x.strip())
-                wrapped = wrap_with_best_width(merged, min_width=52)
-                max_len = max(len(x) for x in wrapped) if wrapped else 0
-                score = max_len * len(wrapped)
-                # Mild bias to merge adjacent numbered lines to reduce line count.
-                score -= (k - 1) * 20
-
-                if (
-                    best_score is None
-                    or score < best_score
-                    or (score == best_score and max_len < max(len(x) for x in best_wrapped))
-                ):
-                    best_score = score
-                    best_k = k
-                    best_wrapped = wrapped
-
-            out.extend(best_wrapped)
-            i += best_k
-
+    def wrap_list_item(prefix: str, content: str, width: int) -> list[str]:
+        body_width = max(8, width - len(prefix))
+        wrapped = textwrap.wrap(
+            content,
+            width=body_width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        if not wrapped:
+            return [prefix.rstrip()]
+        out = [prefix + wrapped[0]]
+        continuation = prefix[: len(prefix) - len(prefix.lstrip(" "))]
+        out.extend(continuation + line for line in wrapped[1:])
         return out
 
-    blocks: List[List[str]] = []
-    cur: List[str] = []
-    for line in lines:
-        if line.strip():
-            cur.append(line)
-        else:
-            if cur:
-                blocks.append(cur)
-                cur = []
-            blocks.append([])  # explicit paragraph break
-    if cur:
-        blocks.append(cur)
+    def wrap_prefixed_item(prefix: str, content: str, width: int) -> list[str]:
+        body_width = max(8, width - len(prefix))
+        wrapped = textwrap.wrap(
+            content,
+            width=body_width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        if not wrapped:
+            return [prefix.rstrip()]
+        out = [prefix + wrapped[0]]
+        continuation = " " * len(prefix)
+        out.extend(continuation + line for line in wrapped[1:])
+        return out
 
-    rebuilt: List[str] = []
-    for block in blocks:
-        if not block:
-            rebuilt.append("")
-            continue
-        # Mixed-content block: keep hard lines intact, reflow soft line segments.
-        soft_segment: List[str] = []
+    def render_item_with_width(item: dict, width: int) -> list[str]:
+        if item.get("prepacked"):
+            return [item["content"]]
+        if "prefix" in item:
+            if item.get("prefix_kind") == "list":
+                return wrap_list_item(item["prefix"], item["content"], width)
+            return wrap_prefixed_item(item["prefix"], item["content"], width)
+        return wrap_plain_text(item["content"], width)
 
-        def flush_soft_segment() -> None:
-            nonlocal soft_segment
-            if not soft_segment:
+    def infer_global_width(block_items: list[dict], min_width: int) -> int:
+        total_chars = sum(len(item["content"]) + len(item.get("prefix", "")) for item in block_items)
+        longest_token = max(longest_token_len(item["content"]) for item in block_items)
+        width_floor = max(min_width, longest_token + 2)
+
+        item_count = max(len(block_items), 1)
+        avg_len = max(1, total_chars // item_count)
+        return max(width_floor, avg_len)
+
+    def render_all_with_width(all_items: list[dict], width: int) -> list[str]:
+        rendered: list[str] = []
+        for item in all_items:
+            kind = item["kind"]
+            if kind == "blank":
+                if rendered and rendered[-1] != "":
+                    rendered.append("")
+                elif not rendered:
+                    rendered.append("")
+                continue
+            if kind == "immutable":
+                rendered.append(item["text"])
+                continue
+            rendered.extend(render_item_with_width(item, width))
+        while rendered and rendered[-1] == "":
+            rendered.pop()
+        return rendered
+
+    def build_packed_items(all_items: list[dict], width: int) -> list[dict]:
+        packed_items: list[dict] = []
+        pending_plain_lines: list[str] = []
+        pending_plain_len = 0
+        separator_width = 4
+
+        def flush_pending_plain_lines() -> None:
+            nonlocal pending_plain_len
+            if not pending_plain_lines:
                 return
-            stripped = [s.strip() for s in soft_segment if s.strip()]
-            if not stripped:
-                rebuilt.extend(soft_segment)
-                soft_segment = []
-                return
+            packed_items.append(
+                {
+                    "kind": "mutable",
+                    "content": line_pack_separator.join(pending_plain_lines),
+                    "prepacked": True,
+                }
+            )
+            pending_plain_lines.clear()
+            pending_plain_len = 0
 
-            # Keep semantic paragraph boundaries:
-            # - long lines are wrapped individually (newline preserved),
-            # - consecutive short lines are merged and re-wrapped.
-            runs: List[tuple[bool, List[str]]] = []
-            current_kind = None
-            current_lines: List[str] = []
+        for item in all_items:
+            if item["kind"] != "mutable":
+                flush_pending_plain_lines()
+                packed_items.append(item)
+                continue
+            if "prefix" in item:
+                flush_pending_plain_lines()
+                packed_items.append(item)
+                continue
 
-            for line in stripped:
-                is_short = len(line) < short_line_threshold
-                if current_kind is None or is_short == current_kind:
-                    current_kind = is_short
-                    current_lines.append(line)
-                else:
-                    runs.append((current_kind, current_lines))
-                    current_kind = is_short
-                    current_lines = [line]
-            if current_lines:
-                runs.append((bool(current_kind), current_lines))
+            line_len = len(item["content"])
+            if line_len > width:
+                flush_pending_plain_lines()
+                packed_items.append(item)
+                continue
 
-            for is_short_run, run_lines in runs:
-                avg_len = sum(len(s) for s in run_lines) / len(run_lines)
-                dynamic_width = int(min(100, max(56, avg_len * 2.2)))
-                width = max(56, min(target_line_width_chars, dynamic_width))
+            if not pending_plain_lines:
+                pending_plain_lines.append(item["content"])
+                pending_plain_len = line_len
+                continue
 
-                if is_short_run and len(run_lines) >= 2:
-                    numbered_ratio = sum(1 for x in run_lines if parse_line_number(x) is not None) / len(run_lines)
-                    if numbered_ratio >= 0.6:
-                        rebuilt.extend(optimize_numbered_adjacent_lines(run_lines))
-                    else:
-                        merged = " ".join(run_lines)
-                        rebuilt.extend(wrap_with_best_width(merged, min_width=56))
-                else:
-                    for line in run_lines:
-                        if len(line) > width:
-                            rebuilt.extend(wrap_with_best_width(line, min_width=56))
-                        else:
-                            rebuilt.append(line)
-            soft_segment = []
-
-        for line in block:
-            if is_hard_layout_line(line):
-                flush_soft_segment()
-                rebuilt.append(line)
+            candidate_len = pending_plain_len + separator_width + line_len
+            if candidate_len <= width:
+                pending_plain_lines.append(item["content"])
+                pending_plain_len = candidate_len
             else:
-                soft_segment.append(line)
-        flush_soft_segment()
+                flush_pending_plain_lines()
+                pending_plain_lines.append(item["content"])
+                pending_plain_len = line_len
 
-    # Clean trailing empty lines introduced by block reconstruction.
-    while rebuilt and rebuilt[-1] == "":
-        rebuilt.pop()
+        flush_pending_plain_lines()
+        return packed_items
 
-    if not rebuilt:
+    def score_width(all_items: list[dict], width: int) -> tuple[int, int, int, int]:
+        packed_items = build_packed_items(all_items, width)
+        rendered = render_all_with_width(packed_items, width)
+        visible_lines = [line for line in rendered if line]
+        if not visible_lines:
+            return (0, 0, 0, width)
+
+        max_len = max(len(line) for line in visible_lines)
+        line_count = len(visible_lines)
+        est_width_px = max_len * 3
+        est_height_px = line_count * 12
+        est_area = est_width_px * est_height_px
+        return (est_area, est_height_px, est_width_px, max_len)
+
+    def choose_balanced_width(all_items: list[dict], min_width: int) -> int:
+        mutable_widths = [
+            len(item.get("prefix", "")) + len(item["content"])
+            for item in all_items
+            if item["kind"] == "mutable"
+        ]
+        if not mutable_widths:
+            return min_width
+
+        lower = infer_global_width([item for item in all_items if item["kind"] == "mutable"], min_width)
+        upper = max(lower, max(mutable_widths) // 2)
+        if lower >= upper:
+            return lower
+
+        left = lower
+        right = upper
+        while right - left > 3:
+            mid = (left + right) // 2
+            mid_score = score_width(all_items, mid)
+            next_score = score_width(all_items, mid + 1)
+            if next_score <= mid_score:
+                left = mid + 1
+            else:
+                right = mid
+
+        best_width = left
+        best_score: Optional[tuple[int, int, int, int]] = None
+        for width in range(left, right + 1):
+            score = score_width(all_items, width)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_width = width
+        return best_width
+
+    items: list[dict] = []
+    immutable_width_floor = 0
+    for line in lines:
+        line_class = classify_line(line)
+        if line_class == "blank":
+            items.append({"kind": "blank", "text": ""})
+            continue
+        if line_class == "immutable":
+            items.append({"kind": "immutable", "text": line})
+            immutable_width_floor = max(immutable_width_floor, len(line))
+            continue
+        list_match = list_prefix.match(line)
+        if list_match:
+            prefix, content = list_match.groups()
+            items.append({"kind": "mutable", "prefix": prefix, "prefix_kind": "list", "content": content})
+            immutable_width_floor = max(immutable_width_floor, len(prefix))
+            continue
+        quote_match = quote_prefix.match(line)
+        header_match = header_prefix.match(line)
+        if quote_match:
+            prefix, content = quote_match.groups()
+            items.append({"kind": "mutable", "prefix": prefix, "content": content})
+            immutable_width_floor = max(immutable_width_floor, len(prefix))
+            continue
+        if header_match:
+            prefix, content = header_match.groups()
+            items.append({"kind": "mutable", "prefix": prefix, "content": content})
+            immutable_width_floor = max(immutable_width_floor, len(prefix))
+            continue
+        leading_ws_len = len(line) - len(line.lstrip(" "))
+        if leading_ws_len > 0:
+            prefix = line[:leading_ws_len]
+            items.append({"kind": "mutable", "prefix": prefix, "content": line[leading_ws_len:].strip()})
+            immutable_width_floor = max(immutable_width_floor, len(prefix))
+            continue
+        items.append({"kind": "mutable", "content": line.strip()})
+
+    mutable_items = [item for item in items if item["kind"] == "mutable"]
+    mutable_char_total = sum(
+        len(item["content"]) + len(item.get("prefix", ""))
+        for item in mutable_items
+    )
+
+    if len(mutable_items) < 2 and immutable_width_floor == 0 and mutable_char_total < short_line_threshold * 2:
+        return text, layout_info
+
+    if len(lines) < min_lines_for_reflow and immutable_width_floor == 0 and mutable_char_total < short_line_threshold * min_lines_for_reflow:
+        return text, layout_info
+
+    if not mutable_items:
+        packed_lines = []
+        for item in items:
+            kind = item["kind"]
+            if kind == "blank":
+                if packed_lines and packed_lines[-1] != "":
+                    packed_lines.append("")
+                elif not packed_lines:
+                    packed_lines.append("")
+                continue
+            if kind == "immutable":
+                packed_lines.append(item["text"])
+                continue
+        while packed_lines and packed_lines[-1] == "":
+            packed_lines.pop()
+    else:
+        min_width = max(8, immutable_width_floor)
+        global_width = choose_balanced_width(items, min_width)
+        packed_items = build_packed_items(items, global_width)
+        packed_lines = render_all_with_width(packed_items, global_width)
+
+    if not packed_lines:
         return text, layout_info
 
     updated = dict(layout_info)
     updated["preserve_newlines"] = True
-    updated["layout_type"] = f"{layout_info.get('layout_type', 'unknown')}_shortline_reflow"
-    updated["num_lines"] = len(rebuilt)
-    updated["max_line_chars"] = max(len(w) for w in rebuilt) if rebuilt else 0
+    updated["layout_type"] = f"{layout_info.get('layout_type', 'unknown')}_packed"
+    updated["num_lines"] = len(packed_lines)
+    updated["max_line_chars"] = max((len(line) for line in packed_lines), default=0)
+    return "\n".join(packed_lines), updated
 
-    return "\n".join(rebuilt), updated
+def build_piecewise_bucket_sizes(min_size: int, max_size: int) -> List[int]:
+    """Build canonical dimension buckets for adaptive render snapping."""
+    bucket_values = set()
+    bucket_values.update(range(32, 257, 32))
+    bucket_values.update(range(320, 1025, 64))
+    bucket_values.update(range(1280, 4097, 256))
+
+    sizes = [size for size in sorted(bucket_values) if min_size <= size <= max_size]
+    if min_size not in sizes:
+        sizes.insert(0, min_size)
+    if max_size not in sizes:
+        sizes.append(max_size)
+    return sorted(set(sizes))
 
 
 class AdaptiveVelloRenderer:
@@ -625,8 +751,8 @@ class AdaptiveVelloRenderer:
     Features:
     - Measures actual text space requirements
     - Asymmetric H×W based on content (e.g., 192×256 for tall lists)
-    - Minimum 64×64 (Qwen3VL lower bound)
-    - Maximum 1536×1536
+    - Minimum 32×32 render canvas
+    - Maximum 4096×4096
     - All dimensions divisible by 32
     - GPU-accelerated Vello rendering
     """
@@ -635,20 +761,21 @@ class AdaptiveVelloRenderer:
         self,
         min_vello_font: float = 8.0,     # Vello minimum font size
         max_vello_font: float = 10.0,    # Vello maximum font size
-        min_size: int = 64,
-        max_size: int = 1536,
+        min_size: int = 32,
+        max_size: int = 4096,
         vit_divisor: int = 32,
-        padding: int = 15,               # Small padding for efficiency (reduced from 40)
+        padding: int = 12,               # Small padding for efficiency
         safety_multiplier: float = 1.5,  # 50% extra (increased to handle Vello's auto-sizing)
-        aspect_ratio_constraint: Optional[float] = 4.0,
+        aspect_ratio_constraint: Optional[float] = 200.0,
         allow_asymmetric: bool = True,
         max_retries: int = 3,            # Max attempts to fit text (auto-retry if truncated)
         edge_margin: int = 5,            # Minimum margin from edges (for truncation detection)
-        thinking_padding: int = 9,       # Smaller padding for thinking chunks
+        thinking_padding: int = 8,       # Smaller padding for thinking chunks
         thinking_safety_multiplier: float = 1.25,  # Reduced safety for thinking chunks
         short_line_wrap_threshold: int = 20,       # Reflow if many lines shorter than this
         short_line_min_lines: int = 8,             # Minimum lines to trigger reflow
         short_line_target_width_chars: int = 80,   # Wrapped line width for reflowed content
+        minimize_after_fit: bool = True,           # Shrink each successful render to the smallest fitting bucket
     ):
         """
         Initialize content-based adaptive renderer.
@@ -659,7 +786,7 @@ class AdaptiveVelloRenderer:
         Args:
             min_vello_font: Minimum font size for Vello renderer (used for size calculation)
             max_vello_font: Maximum font size for Vello renderer
-            min_size: Minimum canvas dimension (64 for Qwen3VL)
+            min_size: Minimum canvas dimension
             max_size: Maximum canvas dimension
             vit_divisor: Round dimensions to multiple of this
             padding: Padding around text in pixels
@@ -668,6 +795,7 @@ class AdaptiveVelloRenderer:
             allow_asymmetric: Enable asymmetric H×W rendering
             max_retries: Maximum attempts to fit text (auto-retry with larger size if truncated)
             edge_margin: Minimum margin from edges in pixels (for truncation detection)
+            minimize_after_fit: If True, shrink each successful render to the smallest fitting bucket
         """
         if not is_available():
             raise ImportError("Vello renderer not available!")
@@ -688,6 +816,290 @@ class AdaptiveVelloRenderer:
         self.short_line_wrap_threshold = short_line_wrap_threshold
         self.short_line_min_lines = short_line_min_lines
         self.short_line_target_width_chars = short_line_target_width_chars
+        self.minimize_after_fit = minimize_after_fit
+        self.dimension_buckets = build_piecewise_bucket_sizes(self.min_size, self.max_size)
+        self._renderer_cache: Dict[tuple[int, int, int, bool], VelloRenderer] = {}
+
+    def _get_renderer(
+        self,
+        width: int,
+        height: int,
+        padding: int,
+        preserve_newlines: bool,
+    ) -> VelloRenderer:
+        key = (width, height, padding, preserve_newlines)
+        renderer = self._renderer_cache.get(key)
+        if renderer is None:
+            renderer = VelloRenderer(
+                width=width,
+                height=height,
+                padding=padding,
+                min_font_size=self.min_vello_font,
+                max_font_size=self.max_vello_font,
+                preserve_newlines=preserve_newlines,
+            )
+            self._renderer_cache[key] = renderer
+        return renderer
+
+    def _render_batch_once(
+        self,
+        texts: List[str],
+        width: int,
+        height: int,
+        padding: int,
+        preserve_newlines: bool,
+    ) -> List[np.ndarray]:
+        renderer = self._get_renderer(width, height, padding, preserve_newlines)
+        return renderer.render_batch(texts)
+
+    def _round_up_dim(self, value: int) -> int:
+        value = max(self.min_size, min(self.max_size, value))
+        return ((value + self.vit_divisor - 1) // self.vit_divisor) * self.vit_divisor
+
+    def _snap_dim_up(self, value: int) -> int:
+        rounded = self._round_up_dim(value)
+        for bucket in self.dimension_buckets:
+            if bucket >= rounded:
+                return bucket
+        return self.dimension_buckets[-1]
+
+    def _render_once(
+        self,
+        text: str,
+        width: int,
+        height: int,
+        padding: int,
+        preserve_newlines: bool,
+    ) -> np.ndarray:
+        return self._render_batch_once([text], width, height, padding, preserve_newlines)[0]
+
+    def shutdown(self) -> None:
+        for renderer in self._renderer_cache.values():
+            renderer.shutdown()
+        self._renderer_cache.clear()
+        return None
+
+    def __del__(self):
+        try:
+            self.shutdown()
+        except Exception:
+            pass
+
+    def _shrink_axis(
+        self,
+        text: str,
+        width: int,
+        height: int,
+        padding: int,
+        preserve_newlines: bool,
+        axis: str,
+        best_image: Optional[np.ndarray] = None,
+    ) -> tuple[int, np.ndarray]:
+        current_dim = width if axis == "width" else height
+        candidate_dims = [dim for dim in self.dimension_buckets if dim <= current_dim]
+        if not candidate_dims:
+            candidate_dims = [self.dimension_buckets[0]]
+
+        best_dim = current_dim
+        if best_image is None:
+            best_image = self._render_once(text, width, height, padding, preserve_newlines)
+
+        low = 0
+        high = len(candidate_dims) - 1
+        while low <= high:
+            mid_idx = (low + high) // 2
+            mid = candidate_dims[mid_idx]
+            if mid >= best_dim:
+                high = mid_idx - 1
+                continue
+            test_width = mid if axis == "width" else width
+            test_height = mid if axis == "height" else height
+            image = self._render_once(text, test_width, test_height, padding, preserve_newlines)
+
+            if self._is_truncated(image):
+                low = mid_idx + 1
+            else:
+                best_dim = mid
+                best_image = image
+                high = mid_idx - 1
+
+        return best_dim, best_image
+
+    def _minimize_canvas(
+        self,
+        text: str,
+        width: int,
+        height: int,
+        padding: int,
+        preserve_newlines: bool,
+        best_image: Optional[np.ndarray] = None,
+    ) -> tuple[np.ndarray, int, int]:
+        width, image = self._shrink_axis(
+            text, width, height, padding, preserve_newlines, axis="width", best_image=best_image
+        )
+        height, image = self._shrink_axis(
+            text,
+            width,
+            height,
+            padding,
+            preserve_newlines,
+            axis="height",
+            best_image=image,
+        )
+        return image, width, height
+
+    def _prepare_text(self, text: str) -> tuple[str, dict]:
+        return prepare_text_for_rendering(
+            text=text,
+            short_line_threshold=self.short_line_wrap_threshold,
+            min_lines_for_reflow=self.short_line_min_lines,
+        )
+
+    def _estimate_min_canvas(
+        self,
+        text: str,
+        padding: int,
+        preserve_newlines: bool,
+    ) -> tuple[int, int]:
+        lines = text.split("\n") if preserve_newlines else [text.replace("\n", " ").strip()]
+        non_empty_lines = [line for line in lines if line.strip()]
+        if not non_empty_lines:
+            return self.min_size, self.min_size
+
+        max_line_chars = max(len(line) for line in non_empty_lines)
+        line_count = len(non_empty_lines) if preserve_newlines else 1
+
+        # Fixed visual budgeting for pre-render search.
+        char_width_px = 3.0
+        line_height_px = 12.0
+        min_width = self._snap_dim_up(int(max_line_chars * char_width_px + 2 * padding))
+        min_height = self._snap_dim_up(int(line_count * line_height_px + 2 * padding))
+        return min_width, min_height
+
+    def _iter_canvas_candidates(
+        self,
+        min_width: int,
+        min_height: int,
+    ) -> List[tuple[int, int]]:
+        candidates: list[tuple[int, int]] = []
+        if not self.allow_asymmetric:
+            for size in self.dimension_buckets:
+                if size < max(min_width, min_height):
+                    continue
+                candidates.append((size, size))
+            return candidates
+
+        for width in self.dimension_buckets:
+            for height in self.dimension_buckets:
+                if width < min_width or height < min_height:
+                    continue
+                if self.aspect_ratio_constraint is not None:
+                    ratio = max(width, height) / max(min(width, height), 1)
+                    if ratio > self.aspect_ratio_constraint:
+                        continue
+                candidates.append((width, height))
+
+        candidates.sort(key=lambda dims: (dims[0] * dims[1], max(dims), dims[0], dims[1]))
+        return candidates
+
+    def _render_adaptive_candidate(
+        self,
+        text: str,
+        base_padding: int,
+        base_safety: float,
+        preserve_newlines_override: Optional[bool] = None,
+    ) -> tuple[np.ndarray, int, int, bool]:
+        layout_info = analyze_text_layout(text)
+        preserve_newlines = (
+            preserve_newlines_override
+            if preserve_newlines_override is not None
+            else layout_info["preserve_newlines"]
+        )
+        min_width, min_height = self._estimate_min_canvas(text, base_padding, preserve_newlines)
+        final_image: Optional[np.ndarray] = None
+        final_width = self.min_size
+        final_height = self.min_size
+        final_truncated = True
+
+        for width, height in self._iter_canvas_candidates(min_width, min_height):
+            image = self._render_once(text, width, height, base_padding, preserve_newlines)
+            is_truncated = self._is_truncated(image)
+
+            final_image = image
+            final_width = width
+            final_height = height
+            final_truncated = is_truncated
+
+            if not is_truncated:
+                return image, width, height, False
+
+        assert final_image is not None
+        return final_image, final_width, final_height, final_truncated
+
+    def _render_grouped_candidates(
+        self,
+        candidate_specs: List[Optional[dict]],
+        base_padding: int,
+        base_safety: float,
+    ) -> List[Optional[tuple[np.ndarray, int, int, bool]]]:
+        results: List[Optional[tuple[np.ndarray, int, int, bool]]] = [None] * len(candidate_specs)
+        last_attempts: List[Optional[tuple[np.ndarray, int, int, bool]]] = [None] * len(candidate_specs)
+        pending = [idx for idx, spec in enumerate(candidate_specs) if spec is not None]
+
+        min_requirements: Dict[int, tuple[int, int]] = {}
+        for idx in pending:
+            spec = candidate_specs[idx]
+            assert spec is not None
+            min_requirements[idx] = self._estimate_min_canvas(
+                spec["text"],
+                base_padding,
+                spec["preserve_newlines"],
+            )
+
+        candidate_pool = sorted(
+            {
+                dims
+                for idx in pending
+                for dims in self._iter_canvas_candidates(*min_requirements[idx])
+            },
+            key=lambda dims: (dims[0] * dims[1], max(dims), dims[0], dims[1]),
+        )
+
+        for width, height in candidate_pool:
+            if not pending:
+                break
+            grouped: Dict[tuple[int, int, int, bool], List[int]] = {}
+
+            for idx in pending:
+                spec = candidate_specs[idx]
+                assert spec is not None
+                min_width, min_height = min_requirements[idx]
+                if width < min_width or height < min_height:
+                    continue
+                preserve_newlines = spec["preserve_newlines"]
+                grouped.setdefault((width, height, base_padding, preserve_newlines), []).append(idx)
+
+            next_pending = []
+            for (width, height, padding, preserve_newlines), idxs in grouped.items():
+                texts = [candidate_specs[idx]["text"] for idx in idxs if candidate_specs[idx] is not None]
+                images = self._render_batch_once(texts, width, height, padding, preserve_newlines)
+                for idx, image in zip(idxs, images):
+                    is_truncated = self._is_truncated(image)
+                    last_attempts[idx] = (image, width, height, is_truncated)
+                    if is_truncated:
+                        next_pending.append(idx)
+                        continue
+
+                    final_width = width
+                    final_height = height
+                    results[idx] = (image, final_width, final_height, False)
+
+            pending = next_pending
+
+        for idx in pending:
+            results[idx] = last_attempts[idx]
+
+        return results
 
     def _is_truncated(self, image: np.ndarray) -> bool:
         """
@@ -792,80 +1204,45 @@ class AdaptiveVelloRenderer:
             List of rendered images or (image, dimensions) tuples
         """
         results = []
+        final_results: List[Optional[tuple[np.ndarray, int, int, bool]]] = [None] * len(texts)
 
+        primary_specs: List[Optional[dict]] = []
         for text in texts:
-            # Thinking preset: smaller padding and tighter safety to reduce token inflation.
-            base_padding = self.thinking_padding if thinking_mode else self.padding
-            base_safety = self.thinking_safety_multiplier if thinking_mode else self.safety_multiplier
-
-            # Reflow short newline-heavy content while preserving '\n' in output text.
-            layout_info = analyze_text_layout(text)
-            prepared_text, layout_info = reflow_short_newline_text(
-                text=text,
-                layout_info=layout_info,
-                short_line_threshold=self.short_line_wrap_threshold,
-                min_lines_for_reflow=self.short_line_min_lines,
-                target_line_width_chars=self.short_line_target_width_chars,
+            prepared_text, layout_info = self._prepare_text(text)
+            primary_specs.append(
+                {
+                    "text": prepared_text,
+                    "preserve_newlines": layout_info["preserve_newlines"],
+                }
             )
 
-            # Try rendering with increasing sizes until it fits
-            for attempt in range(self.max_retries):
-                # Calculate optimal dimensions for this text
-                # Use Vello's min font size for calculation
-                # Apply additional multiplier on retries
-                retry_multiplier = 1.0 + (0.2 * attempt)  # 1.0, 1.2, 1.4, ...
-                effective_safety = base_safety * retry_multiplier
+        # Thinking preset: smaller padding and tighter safety to reduce token inflation.
+        base_padding = self.thinking_padding if thinking_mode else self.padding
+        base_safety = self.thinking_safety_multiplier if thinking_mode else self.safety_multiplier
 
-                width, height, layout_info = calculate_adaptive_dimensions(
-                    prepared_text,
-                    min_font_size=self.min_vello_font,
-                    min_size=self.min_size,
-                    max_size=self.max_size,
-                    vit_divisor=self.vit_divisor,
-                    padding=base_padding,
-                    safety_multiplier=effective_safety,
-                    aspect_ratio_constraint=self.aspect_ratio_constraint,
-                    allow_asymmetric=self.allow_asymmetric,
+        grouped_results = self._render_grouped_candidates(primary_specs, base_padding, base_safety)
+        for idx, result in enumerate(grouped_results):
+            final_results[idx] = result
+
+        for idx, result in enumerate(final_results):
+            if result is None:
+                image, width, height, is_truncated = self._render_adaptive_candidate(
+                    primary_specs[idx]["text"],
+                    base_padding=base_padding,
+                    base_safety=base_safety,
+                    preserve_newlines_override=primary_specs[idx]["preserve_newlines"],
                 )
-
-                # Create Vello renderer with these dimensions
-                # Use preserve_newlines based on layout detection
-                renderer = VelloRenderer(
-                    width=width,
-                    height=height,
-                    padding=base_padding,
-                    min_font_size=self.min_vello_font,
-                    max_font_size=self.max_vello_font,
-                    preserve_newlines=layout_info['preserve_newlines'],
+            else:
+                image, width, height, is_truncated = result
+            if is_truncated:
+                print(
+                    f"Warning: Text may be truncated after {self.max_retries} attempts "
+                    f"(final size: {width}×{height})"
                 )
-
-                # Render
-                images = renderer.render_batch([prepared_text])
-                image = images[0]
-
-                # Cleanup
-                renderer.shutdown()
-
-                # Check if text is truncated
-                is_truncated = self._is_truncated(image)
-
-                if not is_truncated:
-                    # Success! Text fits properly
-                    if return_dimensions:
-                        results.append((image, (width, height)))
-                    else:
-                        results.append(image)
-                    break
-                elif attempt == self.max_retries - 1:
-                    # Last attempt, use what we have
-                    print(f"Warning: Text may be truncated after {self.max_retries} attempts (final size: {width}×{height})")
-                    if return_dimensions:
-                        results.append((image, (width, height)))
-                    else:
-                        results.append(image)
-                else:
-                    # Retry with larger size
-                    pass  # Continue to next attempt
+            if return_dimensions:
+                results.append((image, (width, height)))
+            else:
+                results.append(image)
 
         return results
 

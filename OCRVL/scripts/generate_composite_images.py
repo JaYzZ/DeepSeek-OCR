@@ -11,28 +11,73 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 
-def wrap_text(text: str, font, max_width: int) -> list[str]:
-    """Wrap text to fit within max_width."""
-    words = text.split()
-    lines = []
+def extract_display_output(full_output: str) -> str:
+    """Return the final visible answer span after the last thinking marker."""
+    return str(full_output or "").rsplit("</think>", 1)[-1].strip()
+
+
+def text_width(text: str, font) -> int:
+    bbox = font.getbbox(text or " ")
+    return bbox[2] - bbox[0]
+
+
+def line_height(font, extra_spacing: int = 4) -> int:
+    bbox = font.getbbox("Ag")
+    return (bbox[3] - bbox[1]) + extra_spacing
+
+
+def wrap_paragraph(paragraph: str, font, max_width: int) -> list[str]:
+    if not paragraph:
+        return [""]
+
+    words = paragraph.split()
+    if not words:
+        return [""]
+
+    lines: list[str] = []
     current_line = []
 
     for word in words:
         test_line = ' '.join(current_line + [word])
-        bbox = font.getbbox(test_line)
-        width = bbox[2] - bbox[0]
-
-        if width <= max_width:
+        if current_line and text_width(test_line, font) <= max_width:
             current_line.append(word)
-        else:
-            if current_line:
-                lines.append(' '.join(current_line))
+            continue
+        if not current_line and text_width(word, font) <= max_width:
             current_line = [word]
+            continue
+        if current_line:
+            lines.append(' '.join(current_line))
+            current_line = []
+
+        if text_width(word, font) <= max_width:
+            current_line = [word]
+            continue
+
+        chunk = ""
+        for ch in word:
+            candidate = f"{chunk}{ch}"
+            if chunk and text_width(candidate, font) > max_width:
+                lines.append(chunk)
+                chunk = ch
+            else:
+                chunk = candidate
+        current_line = [chunk]
 
     if current_line:
         lines.append(' '.join(current_line))
 
-    return lines
+    return lines or [""]
+
+
+def wrap_text(text: str, font, max_width: int) -> list[str]:
+    """Wrap text to fit within max_width while preserving explicit newlines."""
+    if not text:
+        return []
+
+    lines: list[str] = []
+    for paragraph in str(text).splitlines():
+        lines.extend(wrap_paragraph(paragraph, font, max_width))
+    return lines or [""]
 
 
 def create_composite_image(
@@ -123,30 +168,37 @@ def create_composite_image(
 
     # Get text content
     ground_truth = result.get('ground_truth', '')
-    generated = result.get('generated_answer_display') or result.get('generated_answer', '[EMPTY]')
+    full_output = str(result.get('generated_answer', '') or '')
+    generated = str(
+        result.get('generated_answer_display')
+        or extract_display_output(full_output)
+        or full_output
+        or '[EMPTY]'
+    )
     question_text = result.get('question_text', '')
 
-    # Measure text (no truncation)
+    # Measure text with explicit newline preservation
     text_width = max_img_width
-    _, gt_lines = measure_text_height(ground_truth, text_font, text_width)
-    _, gen_lines = measure_text_height(generated, text_font, text_width)
-    _, q_lines = measure_text_height(question_text, text_font, text_width) if question_text else (0, 0)
+    text_line_height = line_height(text_font, extra_spacing=2)
+    _, gt_lines = measure_text_height(ground_truth, text_font, text_width, text_line_height)
+    _, gen_lines = measure_text_height(generated, text_font, text_width, text_line_height)
+    _, q_lines = measure_text_height(question_text, text_font, text_width, text_line_height) if question_text else (0, 0)
 
     text_area_height = 0
     if instruction:
         text_area_height += 30  # Instruction label
-        _, inst_lines = measure_text_height(instruction, text_font, text_width)
-        text_area_height += inst_lines * (font_size + 2)  # Instruction content
+        _, inst_lines = measure_text_height(instruction, text_font, text_width, text_line_height)
+        text_area_height += inst_lines * text_line_height
         if question_text:
             text_area_height += 5  # Spacing before question
             text_area_height += 30  # Question label
-            text_area_height += q_lines * (font_size + 2)  # Question content
+            text_area_height += q_lines * text_line_height
         text_area_height += 10  # Spacing after instruction/question
     text_area_height += 30  # Ground truth label + content
-    text_area_height += gt_lines * (font_size + 4)
+    text_area_height += gt_lines * text_line_height
     text_area_height += 10  # Spacing after ground truth
     text_area_height += 30  # Generated label + content
-    text_area_height += gen_lines * (font_size + 4)
+    text_area_height += gen_lines * text_line_height
     text_area_height += 60  # Title and spacing
 
     total_height = total_img_height + text_area_height + (len(images) - 1) * spacing + 3 * padding
@@ -185,7 +237,7 @@ def create_composite_image(
         lines = wrap_text(instruction, text_font, text_width)
         for line in lines:
             draw.text((padding, y_offset), line, fill='#333', font=text_font)
-            y_offset += font_size + 2
+            y_offset += text_line_height
 
         # For VQA, also show the actual question text
         question_text = result.get('question_text', '')
@@ -196,7 +248,7 @@ def create_composite_image(
             lines = wrap_text(question_text, text_font, text_width)
             for line in lines:
                 draw.text((padding, y_offset), line, fill='#333', font=text_font)
-                y_offset += font_size + 2
+                y_offset += text_line_height
 
         y_offset += 10
 
@@ -206,43 +258,15 @@ def create_composite_image(
     lines = wrap_text(ground_truth, text_font, text_width)
     for line in lines:
         draw.text((padding, y_offset), line, fill='#333', font=text_font)
-        y_offset += font_size + 2
+        y_offset += text_line_height
     y_offset += 10
 
-    # Draw generated answer - separate thinking from answer if different
-    full_output = result.get('generated_answer', '')
-    display_output = result.get('generated_answer_display', '')
-
-    # Check if there's a difference (thinking vs answer)
-    if display_output and display_output != full_output:
-        # Extract thinking (the part that gets stripped)
-        thinking = full_output.replace(display_output, '', 1).strip()
-
-        # Draw thinking section
-        if thinking:
-            draw.text((padding, y_offset), "Thinking:", fill='#9E9E9E', font=label_font)
-            y_offset += 20
-            lines = wrap_text(thinking, text_font, text_width)
-            for line in lines:
-                draw.text((padding, y_offset), line, fill='#9E9E9E', font=text_font)
-                y_offset += font_size + 2
-            y_offset += 10
-
-        # Draw final answer
-        draw.text((padding, y_offset), "Answer:", fill='#FF9800', font=label_font)
-        y_offset += 20
-        lines = wrap_text(display_output, text_font, text_width)
-        for line in lines:
-            draw.text((padding, y_offset), line, fill='#333', font=text_font)
-            y_offset += font_size + 2
-    else:
-        # No thinking detected, show full output
-        draw.text((padding, y_offset), "Model Output:", fill='#FF9800', font=label_font)
-        y_offset += 20
-        lines = wrap_text(generated, text_font, text_width)
-        for line in lines:
-            draw.text((padding, y_offset), line, fill='#333', font=text_font)
-            y_offset += font_size + 2
+    draw.text((padding, y_offset), "Answer:", fill='#FF9800', font=label_font)
+    y_offset += 20
+    lines = wrap_text(generated, text_font, text_width)
+    for line in lines:
+        draw.text((padding, y_offset), line, fill='#333', font=text_font)
+        y_offset += text_line_height
 
     # Save composite
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -250,11 +274,11 @@ def create_composite_image(
     print(f"✓ {output_path.name}")
 
 
-def measure_text_height(text: str, font, max_width: int) -> tuple[int, int]:
+def measure_text_height(text: str, font, max_width: int, measured_line_height: int | None = None) -> tuple[int, int]:
     """Measure text height and line count."""
     lines = wrap_text(text, font, max_width)
     line_count = len(lines)
-    height = line_count * (font.size + 4)
+    height = line_count * (measured_line_height or line_height(font))
     return height, line_count
 
 

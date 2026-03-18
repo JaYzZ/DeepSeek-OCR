@@ -661,26 +661,68 @@ def run_evaluation(
     return results, debug_samples
 
 
-def wrap_text(text: str, font, max_width: int) -> list:
-    """Wrap text to fit within max_width."""
-    if not text:
-        return []
-    lines = []
-    words = text.split()
+def _text_width(text: str, font) -> int:
+    bbox = font.getbbox(text or " ")
+    return bbox[2] - bbox[0]
+
+
+def _line_height(font, extra_spacing: int = 4) -> int:
+    bbox = font.getbbox("Ag")
+    return (bbox[3] - bbox[1]) + extra_spacing
+
+
+def _wrap_paragraph(paragraph: str, font, max_width: int) -> list[str]:
+    if not paragraph:
+        return [""]
+
+    words = paragraph.split()
+    if not words:
+        return [""]
+
+    lines: list[str] = []
     current_line = ""
+
     for word in words:
-        test_line = current_line + " " + word if current_line else word
-        bbox = font.getbbox(test_line)
-        width = bbox[2] - bbox[0]
-        if width <= max_width:
-            current_line = test_line
-        else:
-            if current_line:
-                lines.append(current_line)
+        candidate = f"{current_line} {word}".strip()
+        if current_line and _text_width(candidate, font) <= max_width:
+            current_line = candidate
+            continue
+        if not current_line and _text_width(word, font) <= max_width:
             current_line = word
+            continue
+        if current_line:
+            lines.append(current_line)
+            current_line = ""
+
+        if _text_width(word, font) <= max_width:
+            current_line = word
+            continue
+
+        chunk = ""
+        for ch in word:
+            candidate = f"{chunk}{ch}"
+            if chunk and _text_width(candidate, font) > max_width:
+                lines.append(chunk)
+                chunk = ch
+            else:
+                chunk = candidate
+        current_line = chunk
+
     if current_line:
         lines.append(current_line)
-    return lines
+
+    return lines or [""]
+
+
+def wrap_text(text: str, font, max_width: int) -> list[str]:
+    """Wrap text to fit within max_width while preserving explicit newlines."""
+    if not text:
+        return []
+
+    wrapped_lines: list[str] = []
+    for paragraph in str(text).splitlines():
+        wrapped_lines.extend(_wrap_paragraph(paragraph, font, max_width))
+    return wrapped_lines or [""]
 
 
 def save_results(
@@ -816,10 +858,35 @@ def save_results(
         # Get text content
         instruction = result.get('instruction', '')
         ground_truth = result.get('ground_truth', '')
-        generated = result.get('generated_answer_display') or result.get('generated_answer', '[EMPTY]')
+        full_output = str(result.get('generated_answer', '') or '')
+        generated = str(
+            result.get('generated_answer_display')
+            or _extract_display_output(full_output)
+            or full_output
+            or '[EMPTY]'
+        )
 
-        # Estimate height
-        text_area_height = 400
+        text_width = img_width - 2 * padding
+        body_line_height = _line_height(text_font, extra_spacing=2)
+        section_gap = 10
+        label_gap = 20
+
+        instruction_lines = wrap_text(instruction, text_font, text_width) if instruction else []
+        gt_lines = wrap_text(ground_truth, text_font, text_width)
+        gen_lines = wrap_text(generated, text_font, text_width)
+
+        text_area_height = 20
+        if instruction_lines:
+            text_area_height += 30
+            text_area_height += len(instruction_lines) * body_line_height
+            text_area_height += section_gap
+        text_area_height += 30
+        text_area_height += len(gt_lines) * body_line_height
+        text_area_height += section_gap
+        text_area_height += 30
+        text_area_height += len(gen_lines) * body_line_height
+        text_area_height += 20
+
         total_img_height = sum(img.height for img in resized_images)
         spacing = 15
         total_height = total_img_height + text_area_height + (len(resized_images) - 1) * spacing + 3 * padding
@@ -846,32 +913,28 @@ def save_results(
         # Draw instruction
         if instruction:
             draw.text((padding, y_offset), "Instruction:", fill='#9C27B0', font=label_font)
-            y_offset += 20
-            # Wrap and draw instruction text
-            instruction_lines = wrap_text(instruction, text_font, img_width - 2 * padding)
+            y_offset += label_gap
             for line in instruction_lines:
                 draw.text((padding, y_offset), line, fill='black', font=text_font)
-                y_offset += 18
+                y_offset += body_line_height
 
-        y_offset += 10
+        y_offset += section_gap
 
         # Draw ground truth
         draw.text((padding, y_offset), "Ground Truth:", fill='#4CAF50', font=label_font)
-        y_offset += 20
-        gt_lines = wrap_text(ground_truth, text_font, img_width - 2 * padding)
+        y_offset += label_gap
         for line in gt_lines:
             draw.text((padding, y_offset), line, fill='black', font=text_font)
-            y_offset += 18
+            y_offset += body_line_height
 
-        y_offset += 10
+        y_offset += section_gap
 
-        # Draw generated answer
-        draw.text((padding, y_offset), "Model Output:", fill='#FF9800', font=label_font)
-        y_offset += 20
-        gen_lines = wrap_text(generated, text_font, img_width - 2 * padding)
+        # Draw answer-only model output
+        draw.text((padding, y_offset), "Answer:", fill='#FF9800', font=label_font)
+        y_offset += label_gap
         for line in gen_lines:
             draw.text((padding, y_offset), line, fill='black', font=text_font)
-            y_offset += 18
+            y_offset += body_line_height
 
         composite.save(output_path, optimize=True, quality=95)
         logger.info(f"Generated composite: {output_path.name}")

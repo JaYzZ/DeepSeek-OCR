@@ -23,24 +23,19 @@ thinking_end_id: 151668
 thinking_sep_id: 151670
 
 ### latent objective runtime
-loss_type: vae+mse
+loss_type: ce+embed_ce+vae+mse+ot
+latent_step_ce_token: 0
+# 0 => use sampled CoT token IDs at latent-step CE positions (default)
+# 1 => force <latent> token ID at latent-step CE positions
 match_strategy: truncate
-thinking_loss_weight: 1.0
-pred_embed_forward_weight: 1.0
-# Align with Qwen3-VL official thinking setting: out_seq_length=40960.
 max_new_tokens: 40960
 vae_intermediate_size: 512
 
 ### curriculum
 curriculum_enable: 1
 curriculum_epochs: 0,1,2
-curriculum_loss_types: vae+mse,vae+mse,vae+mse+ot
-curriculum_weights: 1.0,1.0,1.0
-curriculum_latent_step_ce: 1,1,1
-latent_step_ce_loss: 0
-latent_step_ce_token: 0
-# 0 => use sampled CoT token IDs at latent-step CE positions (default)
-# 1 => force <latent> token ID at latent-step CE positions
+curriculum_loss_types: ce+embed_ce+vae+mse+ot,ce+embed_ce+vae+mse+ot,ce+embed_ce+vae+mse+ot
+curriculum_latent_step_ce: 0,0,0
 
 ### backfill / transparent eval
 # Used by post-training backfill and transparent eval callbacks.
@@ -50,7 +45,7 @@ backfill_enable: 1
 ### post-training benchmark
 # Used by the training wrappers when they optionally launch benchmark eval.
 benchmark_enable: 1
-benchmark_list: MathVision,RealWorldQA
+benchmark_list: MathVision,MMMU,RealWorldQA
 benchmark_num_samples: 100
 benchmark_server_concurrency: 16
 

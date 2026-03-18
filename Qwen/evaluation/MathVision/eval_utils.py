@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 import time
 import random
@@ -20,6 +21,57 @@ except ImportError:
     latex2sympy = None
 
 FAIL_MSG = 'Failed to obtain answer via API.'
+JUDGE_PREDICTION_MAX_CHARS = int(os.environ.get("JUDGE_PREDICTION_MAX_CHARS", "40960"))
+
+
+def strip_thinking_tokens(prediction):
+    """Remove think/thinking wrapper blocks before sending text to judges."""
+    prediction_str = str(prediction)
+    block_patterns = [
+        r'<think>.*?</think>',
+        r'<thinking>.*?</thinking>',
+        r'<\|thinking\|>.*?<\|/thinking\|>',
+        r'<\|[^|]+\|>.*?<\|/[^|]+\|>',
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for pattern in block_patterns:
+            updated = re.sub(pattern, '', prediction_str, flags=re.DOTALL | re.IGNORECASE)
+            if updated != prediction_str:
+                changed = True
+                prediction_str = updated
+
+    # Clean up malformed or repeated leftover thinking tags without dropping content.
+    prediction_str = re.sub(r'</?think>', '', prediction_str, flags=re.IGNORECASE)
+    prediction_str = re.sub(r'</?thinking>', '', prediction_str, flags=re.IGNORECASE)
+    prediction_str = re.sub(r'<\|/?thinking\|>', '', prediction_str, flags=re.IGNORECASE)
+    return prediction_str.strip()
+
+
+def tail_char_window(text: str, max_chars: int = JUDGE_PREDICTION_MAX_CHARS) -> str:
+    """Keep only the last K characters to stay within judge context limits."""
+    text = strip_thinking_tokens(text)
+    if max_chars <= 0:
+        return text
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
+
+
+def shrink_char_window(current_budget: int) -> int:
+    """Reduce the tail char budget aggressively after a context-limit failure."""
+    if current_budget <= 256:
+        return current_budget
+    if current_budget > 4096:
+        return max(4096, current_budget // 2)
+    if current_budget > 2048:
+        return 2048
+    if current_budget > 1024:
+        return 1024
+    if current_budget > 512:
+        return 512
+    return 256
 
 
 def is_equal(asw: str, gt_asw: str) -> bool:
@@ -100,7 +152,7 @@ Please read the following example.
 Then extract the answer from the model response and type it at the end of the prompt.\n
 """
     question = line['question']
-    prediction = str(line['prediction'])
+    prediction = tail_char_window(line['prediction'])
     prompt = task_description
     examples = get_gpt4_ICE()
     for example in examples:
@@ -322,22 +374,18 @@ class CustomJudgeWrapper:
 
     def judge(self, question, reference, prediction):
         """Send request to custom judge server (text only, no images)."""
-        # Truncate prediction if too long to avoid token limit issues
-        max_chars = 50000
-        prediction_str = str(prediction)
-        if len(prediction_str) > max_chars:
-            prediction_str = prediction_str[-max_chars:]  # Keep the END where final answer is
-
         payload = {
             "question": str(question),
             "reference": str(reference),
-            "prediction": prediction_str
+            "prediction": "",
         }
 
         headers = {'Content-Type': 'application/json'}
+        char_budget = JUDGE_PREDICTION_MAX_CHARS
 
         for i in range(self.retry):
             try:
+                payload["prediction"] = tail_char_window(prediction, char_budget)
                 response = requests.post(
                     f"{self.judge_server_url}/judge",
                     headers=headers,
@@ -358,7 +406,11 @@ class CustomJudgeWrapper:
                             return {'success': False, 'verdict': verdict, 'correct': correct}
                     else:
                         print(f"Judge server error: {resp_json.get('error', 'Unknown error')}")
+                        char_budget = shrink_char_window(char_budget)
                         time.sleep(self.wait)
+                elif response.status_code == 400 and "maximum context length" in response.text.lower():
+                    char_budget = shrink_char_window(char_budget)
+                    print(f"Judge server context overflow, retrying with last {char_budget} chars")
                 else:
                     print(f"Judge server HTTP error: {response.status_code}")
                     time.sleep(self.wait)

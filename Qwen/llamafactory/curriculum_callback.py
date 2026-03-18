@@ -11,13 +11,11 @@ Usage:
     # Default curriculum (3 stages):
     # export QWEN3VL_CURRICULUM_EPOCHS="0,1,2"           # epoch boundaries
     # export QWEN3VL_CURRICULUM_LOSS_TYPES="pre_think_mse,pre_think_mse,ot+pre_think_mse"
-    # export QWEN3VL_CURRICULUM_WEIGHTS="0.1,0.5,1.0"
     # export QWEN3VL_CURRICULUM_LATENT_STEP_CE="0,1,1"   # 0=off, 1=on
 
 Custom example:
     export QWEN3VL_CURRICULUM_EPOCHS="0,2,4"
     export QWEN3VL_CURRICULUM_LOSS_TYPES="pre_think_mse,mse,ot+pre_think_mse"
-    export QWEN3VL_CURRICULUM_WEIGHTS="0.2,0.5,1.0"
     export QWEN3VL_CURRICULUM_LATENT_STEP_CE="0,1,1"
 """
 
@@ -39,7 +37,6 @@ class QwenCurriculumCallback(TrainerCallback):
     Curriculum settings are read from environment variables:
     - QWEN3VL_CURRICULUM_EPOCHS: epoch boundaries (default: "0,1,2")
     - QWEN3VL_CURRICULUM_LOSS_TYPES: loss types per stage (default: "pre_think_mse,pre_think_mse,ot+pre_think_mse")
-    - QWEN3VL_CURRICULUM_WEIGHTS: loss weights per stage (default: "0.1,0.5,1.0")
     - QWEN3VL_CURRICULUM_LATENT_STEP_CE: latent_step CE per stage (default: "0,1,1")
     """
 
@@ -60,21 +57,19 @@ class QwenCurriculumCallback(TrainerCallback):
             "QWEN3VL_CURRICULUM_LOSS_TYPES",
             "pre_think_mse,pre_think_mse,ot+pre_think_mse"
         )
-        weights_str = os.environ.get("QWEN3VL_CURRICULUM_WEIGHTS", "0.1,0.5,1.0")
         latent_step_ce_str = os.environ.get("QWEN3VL_CURRICULUM_LATENT_STEP_CE", "0,1,1")
 
         epochs = [float(x.strip()) for x in epochs_str.split(",")]
         loss_types = [x.strip() for x in loss_types_str.split(",")]
-        weights = [float(x.strip()) for x in weights_str.split(",")]
         latent_step_ce = [x.strip() == "1" for x in latent_step_ce_str.split(",")]
 
         # Validate lengths match
         num_stages = len(epochs)
-        if not (len(loss_types) == len(weights) == len(latent_step_ce) == num_stages):
+        if not (len(loss_types) == len(latent_step_ce) == num_stages):
             raise ValueError(
                 f"[QwenCurriculum] Mismatch in curriculum config: "
                 f"epochs={num_stages}, loss_types={len(loss_types)}, "
-                f"weights={len(weights)}, latent_step_ce={len(latent_step_ce)}"
+                f"latent_step_ce={len(latent_step_ce)}"
             )
 
         # Build stages from env vars
@@ -83,9 +78,8 @@ class QwenCurriculumCallback(TrainerCallback):
             self.stages.append({
                 "epoch": epochs[i],
                 "loss_type": loss_types[i],
-                "loss_weight": weights[i],
                 "latent_step_ce": latent_step_ce[i],
-                "description": f"Stage {i+1}: {loss_types[i]} ({weights[i]})"
+                "description": f"Stage {i+1}: {loss_types[i]}"
             })
 
         self.current_stage = 0
@@ -96,7 +90,7 @@ class QwenCurriculumCallback(TrainerCallback):
             for i, stage in enumerate(self.stages):
                 logger.info(
                     f"  Stage {i+1}: epoch>={stage['epoch']}, loss={stage['loss_type']}, "
-                    f"weight={stage['loss_weight']}, latent_step_ce={stage['latent_step_ce']}"
+                    f"latent_step_ce={stage['latent_step_ce']}"
                 )
 
     def _get_stage_for_epoch(self, epoch: float) -> Dict[str, Any]:
@@ -111,23 +105,21 @@ class QwenCurriculumCallback(TrainerCallback):
     def _apply_stage(self, stage: Dict[str, Any]) -> None:
         """Apply a curriculum stage by setting environment variables."""
         loss_type = stage["loss_type"]
-        loss_weight = stage["loss_weight"]
         latent_step_ce = stage.get("latent_step_ce", False)
 
         # Always enable latent supervision
         os.environ["QWEN3VL_LATENT_SUPERVISION"] = "1"
 
-        # Set loss type and weight
+        # Set loss type; weighting should stay inside loss_type itself.
         os.environ["QWEN3VL_LOSS_TYPE"] = loss_type
-        os.environ["QWEN3VL_THINKING_LOSS_WEIGHT"] = str(loss_weight)
 
-        # Control latent_step CE loss per stage
-        os.environ["QWEN3VL_LATENT_STEP_CE_LOSS"] = "1" if latent_step_ce else "0"
+        # Control latent-step CE masking in the main process.
+        os.environ["QWEN3VL_LATENT_STEP_CE_ACTIVE"] = "1" if latent_step_ce else "0"
 
         if self._is_main:
             logger.info(
                 f"[QwenCurriculum] Applied: loss_type={loss_type}, "
-                f"latent_weight={loss_weight}, latent_step_ce={latent_step_ce}"
+                f"latent_step_ce={latent_step_ce}"
             )
 
     def on_train_begin(
@@ -140,9 +132,8 @@ class QwenCurriculumCallback(TrainerCallback):
         """Apply initial curriculum stage at training start."""
         if not self.enabled:
             return
-        if hasattr(state, "is_world_process_zero") and not state.is_world_process_zero:
-            return
 
+        # Apply on every rank: curriculum settings are process-local env vars.
         # Apply initial stage (epoch 0)
         initial_stage = self._get_stage_for_epoch(0)
         self._apply_stage(initial_stage)
@@ -157,8 +148,6 @@ class QwenCurriculumCallback(TrainerCallback):
     ):
         """Check if we need to transition to next stage at epoch start."""
         if not self.enabled:
-            return
-        if hasattr(state, "is_world_process_zero") and not state.is_world_process_zero:
             return
 
         epoch = state.epoch
@@ -190,7 +179,7 @@ class QwenCurriculumCallback(TrainerCallback):
         if self.last_logged_epoch is None or (epoch - self.last_logged_epoch) >= 0.5:
             stage = self._get_stage_for_epoch(epoch)
             logger.info(f"[QwenCurriculum] Epoch {epoch:.1f}: stage={stage['description']}, "
-                       f"loss_type={stage['loss_type']}, weight={stage['loss_weight']}")
+                       f"loss_type={stage['loss_type']}")
             self.last_logged_epoch = epoch
 
 

@@ -13,8 +13,8 @@
 # Goal: Enhance OCR capabilities on top of general VQA/caption foundation
 #
 # Special thinking tokens (present in base model):
-# - <｜text▁begin▁of▁thinking｜> (151667): Opens thinking/reasoning section
-# - <｜text▁end▁of▁thinking｜> (151668): Closes thinking/reasoning section
+# - <think> (151667): Opens thinking/reasoning section
+# - </think> (151668): Closes thinking/reasoning section
 model_name_or_path: /share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking
 image_max_pixels: 262144
 video_max_pixels: 16384

@@ -36,6 +36,12 @@ repo_root = script_dir.parent.parent
 sys.path.insert(0, str(repo_root))
 
 # Local imports
+from Renderer.skia_renderer import (
+    SkiaRenderer,
+    measure_finalized_text_canvas,
+    prepare_text_for_rendering,
+    snap_canvas_to_grid,
+)
 from Qwen.scripts.adaptive_vello_renderer import AdaptiveVelloRenderer
 from Qwen.scripts.utils import chunk_thinking_text, compress_newlines, format_cot_subsequences
 from OCRVL.encoder.qwen3vl_encoder import Qwen3VLEncoder
@@ -43,6 +49,106 @@ from OCRVL.encoder.qwen3vl_encoder import Qwen3VLEncoder
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
+
+
+class AdaptiveSkiaRenderer:
+    """Skia renderer with the same adaptive text preprocessing interface as Vello."""
+
+    def __init__(self, min_font_size: float = 8.0, max_font_size: float = 10.0):
+        self._layout = AdaptiveVelloRenderer()
+        self.min_font_size = min_font_size
+        self.max_font_size = max_font_size
+        self._renderer_cache: dict[tuple[int, int, int, bool], SkiaRenderer] = {}
+
+    def _get_renderer(self, width: int, height: int, padding: int, preserve_newlines: bool) -> SkiaRenderer:
+        key = (width, height, padding, preserve_newlines)
+        renderer = self._renderer_cache.get(key)
+        if renderer is None:
+            renderer = SkiaRenderer(
+                width=width,
+                height=height,
+                padding=padding,
+                min_font_size=self.min_font_size,
+                max_font_size=self.max_font_size,
+                preserve_newlines=preserve_newlines,
+                strict_fit=True,
+            )
+            self._renderer_cache[key] = renderer
+        return renderer
+
+    def _measure_canvas(self, prepared_text: str, padding: int) -> tuple[int, int]:
+        width, height = measure_finalized_text_canvas(
+            prepared_text,
+            padding=padding,
+            font_size=self.min_font_size,
+        )
+        return snap_canvas_to_grid(
+            width,
+            height,
+            divisor=self._layout.vit_divisor,
+            min_size=self._layout.min_size,
+            max_size=self._layout.max_size,
+        )
+
+    def _render_one(self, text: str, thinking_mode: bool) -> Image.Image:
+        padding = self._layout.thinking_padding if thinking_mode else self._layout.padding
+        prepared_text, layout_info = prepare_text_for_rendering(
+            text,
+            short_line_threshold=self._layout.short_line_wrap_threshold,
+            min_lines_for_reflow=self._layout.short_line_min_lines,
+            max_canvas_size=self._layout.max_size,
+            measurement_padding=padding,
+            measurement_font_size=self.min_font_size,
+            min_canvas_size=self._layout.min_size,
+            measurement_divisor=self._layout.vit_divisor,
+        )
+        width, height = self._measure_canvas(prepared_text, padding)
+        return self._get_renderer(width, height, padding, layout_info["preserve_newlines"]).render_batch([prepared_text])[0]
+
+    def render_batch(self, texts: List[str], thinking_mode: bool = False) -> List[Image.Image]:
+        prepared_specs = []
+        padding = self._layout.thinking_padding if thinking_mode else self._layout.padding
+        for text in texts:
+            prepared_text, layout_info = prepare_text_for_rendering(
+                text,
+                short_line_threshold=self._layout.short_line_wrap_threshold,
+                min_lines_for_reflow=self._layout.short_line_min_lines,
+                max_canvas_size=self._layout.max_size,
+                measurement_padding=padding,
+                measurement_font_size=self.min_font_size,
+                min_canvas_size=self._layout.min_size,
+                measurement_divisor=self._layout.vit_divisor,
+            )
+            prepared_specs.append((prepared_text, layout_info["preserve_newlines"]))
+
+        grouped: dict[tuple[int, int, bool], List[tuple[int, str]]] = {}
+        for idx, (prepared_text, preserve_newlines) in enumerate(prepared_specs):
+            width, height = self._measure_canvas(prepared_text, padding)
+            grouped.setdefault((width, height, preserve_newlines), []).append((idx, prepared_text))
+
+        results: List[Image.Image] = [None] * len(texts)
+        for (width, height, preserve_newlines), items in grouped.items():
+            renderer = self._get_renderer(width, height, padding, preserve_newlines)
+            images = renderer.render_batch([text for _, text in items])
+            for (idx, _), image in zip(items, images):
+                results[idx] = image
+        return results
+
+    def render(self, text: str, output_path: str, thinking_mode: bool = False) -> bool:
+        if not text or not text.strip():
+            return False
+        image = self._render_one(text, thinking_mode)
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = output_path.with_name(f"{output_path.stem}.tmp{output_path.suffix}")
+        Image.fromarray(image).save(tmp_path, format="PNG")
+        tmp_path.replace(output_path)
+        return True
+
+    def shutdown(self) -> None:
+        for renderer in self._renderer_cache.values():
+            renderer.shutdown()
+        self._renderer_cache.clear()
 
 
 def load_cached_latent_seq_len(cache_path: str, seq_len_cache: dict[str, int]) -> int:
@@ -875,7 +981,7 @@ def main():
 
         # Rendering is CPU-bound, no GPU benefit from multi-GPU
         # Use single render path regardless of world_size
-        renderer = AdaptiveVelloRenderer()
+        renderer = AdaptiveSkiaRenderer()
         return main_render_only(args, renderer)
 
     if args.encode_only:

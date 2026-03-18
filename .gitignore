@@ -29,6 +29,7 @@ outputs/
 # Temporary files
 *.tmp
 *.temp
+tmp/*
 .DS_Store
 
 # pip install development mode artifacts

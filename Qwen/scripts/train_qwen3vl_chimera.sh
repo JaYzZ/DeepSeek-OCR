@@ -32,9 +32,9 @@ if [ "${1:-}" != "" ]; then
   shift || true
 fi
 
-RUNTIME_ENV_CONFIG="${QWEN3VL_RUNTIME_ENV_CONFIG:-$DEFAULT_RUNTIME_ENV_CONFIG}"
-if [ ! -f "$RUNTIME_ENV_CONFIG" ]; then
-  echo "❌ Runtime env config not found: $RUNTIME_ENV_CONFIG" >&2
+QWEN3VL_RUNTIME_ENV_CONFIG="${QWEN3VL_RUNTIME_ENV_CONFIG:-$DEFAULT_RUNTIME_ENV_CONFIG}"
+if [ ! -f "$QWEN3VL_RUNTIME_ENV_CONFIG" ]; then
+  echo "❌ Runtime env config not found: $QWEN3VL_RUNTIME_ENV_CONFIG" >&2
   exit 1
 fi
 
@@ -83,7 +83,7 @@ _get_main_config() {
 }
 
 _get_runtime_config() {
-    _get_yaml_value "$RUNTIME_ENV_CONFIG" "$1" "${2:-}"
+    _get_yaml_value "$QWEN3VL_RUNTIME_ENV_CONFIG" "$1" "${2:-}"
 }
 
 _set_env_from_runtime() {
@@ -110,6 +110,50 @@ _set_env_from_main() {
     fi
 }
 
+_resolve_master_port() {
+    "$PYTHON_BIN" - "${MASTER_PORT:-}" <<'PY'
+import socket
+import sys
+
+preferred = sys.argv[1].strip()
+
+def is_free(port: int) -> bool:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+if not preferred:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("", 0))
+    print(sock.getsockname()[1])
+    sock.close()
+    raise SystemExit(0)
+
+port = max(1, min(int(preferred), 65535))
+while port <= 65535:
+    if is_free(port):
+        print(port)
+        raise SystemExit(0)
+    port += 1
+
+raise SystemExit("No available TCP port found.")
+PY
+}
+
+_snapshot_run_configs() {
+    local dest_dir="$1"
+    local config_dest="$dest_dir/$(basename "$CONFIG_PATH")"
+    local runtime_dest="$dest_dir/$(basename "$QWEN3VL_RUNTIME_ENV_CONFIG")"
+
+    cp -f "$CONFIG_PATH" "$config_dest"
+    cp -f "$QWEN3VL_RUNTIME_ENV_CONFIG" "$runtime_dest"
+}
+
 # Export env vars that Python code needs (canonicalized in qwen3vl_runtime_env.yaml)
 _set_env_from_runtime "QWEN3VL_LATENT_SUPERVISION" "latent_supervision" "1"
 _set_env_from_runtime "QWEN3VL_LATENT_TOKEN_ID" "latent_token_id" "151669"
@@ -118,16 +162,12 @@ _set_env_from_runtime "QWEN3VL_THINKING_END_ID" "thinking_end_id" "151668"
 _set_env_from_runtime "QWEN3VL_THINKING_SEP_ID" "thinking_sep_id" "151670"
 _set_env_from_runtime "QWEN3VL_LOSS_TYPE" "loss_type" "vae+ot+mse"
 _set_env_from_runtime "QWEN3VL_MATCH_STRATEGY" "match_strategy" "truncate"
-_set_env_from_runtime "QWEN3VL_THINKING_LOSS_WEIGHT" "thinking_loss_weight" "1.0"
-_set_env_from_runtime "QWEN3VL_PRED_EMBED_FORWARD_WEIGHT" "pred_embed_forward_weight" "1.0"
 _set_env_from_runtime "QWEN3VL_MAX_NEW_TOKENS" "max_new_tokens" "40960"
 _set_env_from_runtime "QWEN3VL_VAE_INTERMEDIATE_SIZE" "vae_intermediate_size" "512"
 _set_env_from_runtime "QWEN3VL_CURRICULUM_ENABLE" "curriculum_enable" "1"
 _set_env_from_runtime "QWEN3VL_CURRICULUM_EPOCHS" "curriculum_epochs" "0,1,2"
 _set_env_from_runtime "QWEN3VL_CURRICULUM_LOSS_TYPES" "curriculum_loss_types" "vae+mse,vae+mse,vae+ot+mse"
-_set_env_from_runtime "QWEN3VL_CURRICULUM_WEIGHTS" "curriculum_weights" "1.0,1.0,1.0"
 _set_env_from_runtime "QWEN3VL_CURRICULUM_LATENT_STEP_CE" "curriculum_latent_step_ce" "1,1,1"
-_set_env_from_runtime "QWEN3VL_LATENT_STEP_CE_LOSS" "latent_step_ce_loss" "1"
 _set_env_from_runtime "QWEN3VL_LATENT_STEP_CE_TOKEN" "latent_step_ce_token" "0"
 _set_env_from_runtime "QWEN3VL_HIDDEN_STATES_HOOK" "hidden_states_hook" "1"
 _set_env_from_main "DATALOADER_NUM_WORKERS" "dataloader_num_workers" "4"
@@ -258,6 +298,17 @@ fi
 
 # Setup logging
 mkdir -p "$OUTPUT_DIR"
+_snapshot_run_configs "$OUTPUT_DIR"
+CONFIG_PATH="$OUTPUT_DIR/$(basename "$CONFIG_PATH")"
+QWEN3VL_RUNTIME_ENV_CONFIG="$OUTPUT_DIR/$(basename "$QWEN3VL_RUNTIME_ENV_CONFIG")"
+RERUN_EVALS_SH="$OUTPUT_DIR/rerun_evals.sh"
+cat > "$RERUN_EVALS_SH" <<EOF
+#!/bin/bash
+set -euo pipefail
+QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" CUDA_VISIBLE_DEVICES=\${BACKFILL_CUDA_VISIBLE_DEVICES:-0} $PYTHON_BIN Qwen/scripts/backfill_transparent_eval.py --checkpoint_dir "$OUTPUT_DIR" --checkpoint checkpoint_latest --gpu_memory_utilization \${GPU_MEMORY_UTILIZATION:-0.9} 2>&1 | tee \${BACKFILL_LOG:-/tmp/backfill_thinking_debug.log}
+QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" VLLM_FORCE_THINK=$VLLM_FORCE_THINK CUDA_VISIBLE_DEVICES=\${BENCH_CUDA_VISIBLE_DEVICES:-\${CUDA_VISIBLE_DEVICES:-0}} $PYTHON_BIN Qwen/evaluation/run_all_benchmarks.py --start-server --benchmarks \${BENCHMARKS:-MathVision,RealWorldQA} --lora-path "$OUTPUT_DIR/checkpoint_latest"
+EOF
+chmod +x "$RERUN_EVALS_SH"
 LOG_FILE="$OUTPUT_DIR/training.log"
 
 echo "Logging to: $LOG_FILE"
@@ -287,16 +338,16 @@ fi
 # Default to 8 GPUs unless user explicitly sets CUDA_VISIBLE_DEVICES
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
-# Enable latent supervision patches
-
-# Set max_new_tokens for generation (prevents max_length crash when input > cutoff_len)
-
 # Reduce CUDA memory fragmentation
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 # Use local /tmp instead of parallel filesystem for PyTorch temp files
 # This avoids "No space left on device" errors when /dev/shm is limited
 export TMPDIR="${TMPDIR:-/tmp}"
+
+if [ "${NNODES:-1}" = "1" ]; then
+    export MASTER_PORT="$(_resolve_master_port)"
+fi
 
 # Detect distributed backend from config (DeepSpeed vs FSDP) for display purposes
 USE_DEEPSPEED=false
@@ -336,8 +387,7 @@ export QWEN3VL_CUTOFF_LEN="${QWEN3VL_CUTOFF_LEN:-$MAIN_CUTOFF_LEN}"
 TRAINING_TYPE="CHIMERA SFT Training (Latent Supervision)"
 
 LOSS_TYPE="$QWEN3VL_LOSS_TYPE"
-LOSS_WEIGHT="$QWEN3VL_THINKING_LOSS_WEIGHT"
-LOSS_TYPE_DISPLAY="$LOSS_TYPE (weight: $LOSS_WEIGHT)"
+LOSS_TYPE_DISPLAY="$LOSS_TYPE"
 
 echo "========================================================================"
 echo "Qwen3VL CHIMERA SFT Training"
@@ -351,7 +401,6 @@ echo ""
 echo "Latent Supervision:"
 echo "  - Enabled: $QWEN3VL_LATENT_SUPERVISION"
 echo "  - Loss type: $LOSS_TYPE_DISPLAY"
-echo "  - Pred-embed forward weight: $QWEN3VL_PRED_EMBED_FORWARD_WEIGHT"
 echo "  - Match strategy: $QWEN3VL_MATCH_STRATEGY"
 echo ""
 echo "Transparent Evaluation:"
@@ -367,7 +416,6 @@ echo "Curriculum Learning:"
 echo "  - Enabled: $QWEN3VL_CURRICULUM_ENABLE"
 echo "  - Epochs: $QWEN3VL_CURRICULUM_EPOCHS"
 echo "  - Loss types: $QWEN3VL_CURRICULUM_LOSS_TYPES"
-echo "  - Weights: $QWEN3VL_CURRICULUM_WEIGHTS"
 echo "  - Latent step CE: $QWEN3VL_CURRICULUM_LATENT_STEP_CE"
 echo ""
 echo "Special Tokens:"
@@ -461,7 +509,7 @@ if [ "$exit_code" -eq 0 ] && [ "$RUN_BACKFILL" = "1" ]; then
                 # Run backfill in background with specific GPU
                 (
                     echo "[$(date '+%F %T')] Start $checkpoint_name on GPU $gpu_id" >> "$OUTPUT_DIR/backfill_all_checkpoints.log"
-                    if CUDA_VISIBLE_DEVICES="$gpu_id" "$PYTHON_BIN" Qwen/scripts/backfill_transparent_eval.py \
+                    if QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" CUDA_VISIBLE_DEVICES="$gpu_id" "$PYTHON_BIN" Qwen/scripts/backfill_transparent_eval.py \
                         --checkpoint_dir "$OUTPUT_DIR" \
                         --checkpoint "$checkpoint_name" \
                         --gpu_memory_utilization 0.9 \
@@ -518,7 +566,7 @@ if [ "$exit_code" -eq 0 ] && [ "$RUN_BENCHMARK" = "1" ]; then
         echo "  - Output dir: $BENCH_DIR"
         echo "========================================================================"
 
-        "$PYTHON_BIN" -u Qwen/evaluation/run_all_benchmarks.py \
+        QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" "$PYTHON_BIN" -u Qwen/evaluation/run_all_benchmarks.py \
             --start-server \
             --benchmarks "$BENCHMARK_LIST" \
             --lora-path "$LATEST_CHECKPOINT" \

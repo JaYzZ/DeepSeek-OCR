@@ -162,6 +162,14 @@ def create_timestamp_dir(base_path: str) -> str:
     return str(run_dir)
 
 
+def normalize_run_path(path: str | Path) -> str:
+    """Resolve run paths relative to repo root so subprocess cwd changes do not break them."""
+    path = Path(path)
+    if not path.is_absolute():
+        path = (_REPO_ROOT / path).resolve()
+    return str(path)
+
+
 def run_unified_inference(
     benchmarks: List[str],
     run_dir: str,
@@ -660,7 +668,7 @@ def run_inference(
 
     config = benchmark_configs[benchmark]
     script_path = Path(__file__).parent / config["script"]
-    output_file = os.path.join(run_dir, config["output"])
+    output_file = normalize_run_path(Path(run_dir) / config["output"])
 
     cmd = [
         sys.executable,
@@ -837,7 +845,8 @@ def run_evaluation(
 
     config = benchmark_configs[benchmark]
     script_path = Path(__file__).parent / config["script"]
-    output_file = os.path.join(run_dir, config["output"])
+    input_file = normalize_run_path(input_file)
+    output_file = normalize_run_path(Path(run_dir) / config["output"])
 
     # Get judge server URL from environment
     judge_url = os.environ.get('JUDGE_SERVER_URL', 'http://47.111.147.142:8600')
@@ -922,7 +931,7 @@ def run_evaluation(
 
         # Return the result file (metrics file)
         if config["result_key"]:
-            result_file = os.path.join(run_dir, config["result_key"])
+            result_file = normalize_run_path(Path(run_dir) / config["result_key"])
         else:
             result_file = output_file
 
@@ -1433,12 +1442,12 @@ Examples:
 
     # Create run directory
     if args.run_dir:
-        run_dir = args.run_dir
+        run_dir = normalize_run_path(args.run_dir)
         Path(run_dir).mkdir(parents=True, exist_ok=True)
         print(f"Using existing run directory: {run_dir}")
     else:
         base_results_path = Path(__file__).parent / "results"
-        run_dir = create_timestamp_dir(str(base_results_path))
+        run_dir = normalize_run_path(create_timestamp_dir(str(base_results_path)))
 
     # Initialize logger
     with BenchmarkLogger(run_dir) as logger:

@@ -85,7 +85,7 @@ Total loss is a combination of:
 1) **CE loss (standard SFT)**
 - Always on normal answer tokens.
 - On expanded `<latent>` positions:
-  - Controlled by `QWEN3VL_LATENT_STEP_CE_LOSS` (set by curriculum), and/or
+  - Controlled by curriculum-driven latent-step CE masking in the main process, and/or
   - If the dataset provides `cot`, code can sample CoT tokens and use them as labels for latent positions.
 
 2) **Thinking losses on hidden states at latent positions** (configurable by `QWEN3VL_LOSS_TYPE`)
@@ -104,7 +104,7 @@ Supported terms:
 
 Curriculum is enabled by default in `Qwen/scripts/train_qwen3vl_r1onevision.sh` via:
 - `QWEN3VL_CURRICULUM_ENABLE=1`
-- `QWEN3VL_CURRICULUM_EPOCHS`, `QWEN3VL_CURRICULUM_LOSS_TYPES`, `QWEN3VL_CURRICULUM_WEIGHTS`
+- `QWEN3VL_CURRICULUM_EPOCHS`, `QWEN3VL_CURRICULUM_LOSS_TYPES`
 - `QWEN3VL_CURRICULUM_LATENT_STEP_CE` (toggles CE on latent positions per stage)
 
 Implementation: `Qwen/llamafactory/curriculum_callback.py` (it updates env vars at epoch boundaries).

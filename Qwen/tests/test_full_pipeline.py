@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from Qwen.llamafactory import integration as lfi
+from Qwen.llamafactory.curriculum_callback import QwenCurriculumCallback
 
 
 THINK_START_ID = 151667
@@ -66,7 +68,7 @@ def latent_env(monkeypatch):
     monkeypatch.setenv("QWEN3VL_THINKING_START_ID", str(THINK_START_ID))
     monkeypatch.setenv("QWEN3VL_THINKING_END_ID", str(THINK_END_ID))
     monkeypatch.setenv("QWEN3VL_CUTOFF_LEN", "64")
-    monkeypatch.setenv("QWEN3VL_LATENT_STEP_CE_LOSS", "1")
+    monkeypatch.setenv("QWEN3VL_LATENT_STEP_CE_ACTIVE", "1")
     monkeypatch.setenv("QWEN3VL_LATENT_STEP_CE_TOKEN", "0")
 
 
@@ -211,3 +213,38 @@ def test_pred_embed_forward_loss_matches_shifted_labels():
         ignore_index=-100,
     )
     assert torch.isclose(loss, expected, atol=1e-5)
+
+
+def test_parse_loss_spec_preserves_explicit_weights():
+    parsed = lfi._parse_loss_spec("mse:0.8+repa:0.2+ot:1.0")
+    assert parsed == [
+        ("mse", pytest.approx(0.8)),
+        ("repa", pytest.approx(0.2)),
+        ("ot", pytest.approx(1.0)),
+    ]
+
+
+def test_parse_loss_spec_defaults_unweighted_terms_to_one():
+    parsed = lfi._parse_loss_spec("vae+mse:0.8+repa:0.2+ot")
+    assert parsed == [
+        ("vae", pytest.approx(1.0)),
+        ("mse", pytest.approx(0.8)),
+        ("repa", pytest.approx(0.2)),
+        ("ot", pytest.approx(1.0)),
+    ]
+
+
+def test_curriculum_applies_on_non_world_zero(monkeypatch):
+    monkeypatch.setenv("QWEN3VL_CURRICULUM_ENABLE", "1")
+    monkeypatch.setenv("QWEN3VL_CURRICULUM_EPOCHS", "0")
+    monkeypatch.setenv("QWEN3VL_CURRICULUM_LOSS_TYPES", "repa")
+    monkeypatch.setenv("QWEN3VL_CURRICULUM_LATENT_STEP_CE", "1")
+    monkeypatch.setenv("QWEN3VL_LOSS_TYPE", "mse")
+    monkeypatch.setenv("QWEN3VL_LATENT_STEP_CE_ACTIVE", "0")
+
+    callback = QwenCurriculumCallback()
+    state = SimpleNamespace(is_world_process_zero=False, epoch=0.0)
+    callback.on_train_begin(args=None, state=state, control=None)
+
+    assert os.environ["QWEN3VL_LOSS_TYPE"] == "repa"
+    assert os.environ["QWEN3VL_LATENT_STEP_CE_ACTIVE"] == "1"

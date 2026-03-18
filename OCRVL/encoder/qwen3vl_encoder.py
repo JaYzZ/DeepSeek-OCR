@@ -194,10 +194,12 @@ class Qwen3VLEncoder:
         # Use processor
         processed = self.processor.image_processor(pil_images, return_tensors='pt')
         pixel_values = processed['pixel_values'].to(device=self.device, dtype=self.dtype)
-        grid_thw = processed['image_grid_thw'].to(device=self.device)
+        grid_thw_cpu = processed['image_grid_thw']
 
         # Run vision encoder.
-        out = self.vision_model(pixel_values, grid_thw)
+        vision_model = self.vision_model
+        grid_thw = grid_thw_cpu if self._out_hidden_size is not None else grid_thw_cpu.to(device=self.device)
+        out = vision_model(pixel_values, grid_thw)
         if self._out_hidden_size is not None:
             # vLLM ViT returns concatenated [main | deepstack...] along last dim.
             chunks = torch.split(out, self._out_hidden_size, dim=1)
@@ -211,13 +213,13 @@ class Qwen3VLEncoder:
 
         # Reshape from flattened batch to proper batch structure
         # Split by grid_thw to get per-image features
-        batch_size = grid_thw.shape[0]
+        batch_size = grid_thw_cpu.shape[0]
         merge_size = 2  # Qwen3-VL uses 2x2 spatial merge
 
         # Calculate tokens per image from grid_thw
         tokens_per_image = []
         for i in range(batch_size):
-            t, h, w = grid_thw[i].tolist()
+            t, h, w = grid_thw_cpu[i].tolist()
             num_tokens = (t * h * w) // (merge_size ** 2)
             tokens_per_image.append(num_tokens)
 
@@ -246,7 +248,7 @@ class Qwen3VLEncoder:
         return Qwen3VLEncoderOutput(
             features=features_list,  # List[Tensor], not batched!
             deepstack_features=deepstack_list,  # List of lists
-            grid_thw=grid_thw
+            grid_thw=grid_thw_cpu
         )
 
 

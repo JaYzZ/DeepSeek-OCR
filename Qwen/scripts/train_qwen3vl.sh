@@ -88,7 +88,6 @@ if [[ "$CONFIG_NAME" == *"thinking"* ]]; then
     export QWEN3VL_LATENT_TOKEN_ID=${QWEN3VL_LATENT_TOKEN_ID:-151670}  # <|latent_step|>
     export QWEN3VL_THINKING_START_ID=${QWEN3VL_THINKING_START_ID:-151667}  # <｜text▁begin▁of▁thinking｜>
     export QWEN3VL_THINKING_END_ID=${QWEN3VL_THINKING_END_ID:-151668}  # <｜text▁end▁of▁thinking｜>
-    export QWEN3VL_THINKING_LOSS_WEIGHT=${QWEN3VL_THINKING_LOSS_WEIGHT:-1.0}
 
     # Loss type configuration
     export QWEN3VL_LOSS_TYPE=${LOSS_TYPE:-ot}
@@ -97,7 +96,6 @@ if [[ "$CONFIG_NAME" == *"thinking"* ]]; then
 
     echo "  QWEN3VL_LATENT_SUPERVISION=1"
     echo "  QWEN3VL_LATENT_DIM=$QWEN3VL_LATENT_DIM (LLM hidden dimension)"
-    echo "  QWEN3VL_THINKING_LOSS_WEIGHT=$QWEN3VL_THINKING_LOSS_WEIGHT"
     echo "  QWEN3VL_LOSS_TYPE=$QWEN3VL_LOSS_TYPE"
 
     # Show additional config based on loss types used
