@@ -20,7 +20,9 @@ lora_target: q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj
 freeze_vision_tower: true
 
 ### dataset
-# CHIMERA has two generated variants:
+# Mixed training set:
+# - r1ov: native image-question reasoning data
+# - chimera image_input: user content includes <image> prompt + question image
 # - image_input: user content includes <image> prompt + question image
 # - text_input: user content is raw question text
 dataset: qwen3vl_chimera_thinking_image_input,qwen3vl_chimera_thinking_text_input
@@ -56,7 +58,7 @@ swanlab_mode: cloud
 swanlab_project: qwen3vl-chimera
 
 ### train
-per_device_train_batch_size: 32
+per_device_train_batch_size: 2
 gradient_accumulation_steps: 2
 dataloader_drop_last: true
 learning_rate: 2.0e-4

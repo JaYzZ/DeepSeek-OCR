@@ -22,12 +22,14 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import torch
 import torch.distributed as dist
-from transformers import AutoTokenizer
+from transformers import AutoProcessor, AutoTokenizer
 from PIL import Image
 
 # Setup path for local imports
@@ -42,7 +44,6 @@ from Renderer.skia_renderer import (
     prepare_text_for_rendering,
     snap_canvas_to_grid,
 )
-from Qwen.scripts.adaptive_vello_renderer import AdaptiveVelloRenderer
 from Qwen.scripts.utils import chunk_thinking_text, compress_newlines, format_cot_subsequences
 from OCRVL.encoder.qwen3vl_encoder import Qwen3VLEncoder
 
@@ -51,17 +52,52 @@ logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_MODEL_PATH = "/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking"
+DEFAULT_TRAIN_CONFIG = repo_root / "Qwen/configs/qwen3vl_native_r1onevision_thinking.yaml"
+
+
+@dataclass(frozen=True)
+class SkiaRenderConfig:
+    min_size: int = 32
+    max_size: int = 4096
+    vit_divisor: int = 32
+    padding: int = 12
+    thinking_padding: int = 8
+    short_line_wrap_threshold: int = 20
+    short_line_min_lines: int = 8
+
+
+def _atomic_save_png(image: Any, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        suffix=output_path.suffix,
+        prefix=f"{output_path.stem}.",
+        dir=output_path.parent,
+        delete=False,
+    ) as tmp_file:
+        tmp_path = Path(tmp_file.name)
+    try:
+        Image.fromarray(image).save(tmp_path, format="PNG")
+        if not tmp_path.exists():
+            raise FileNotFoundError(f"Temporary render output missing after save: {tmp_path}")
+        tmp_path.replace(output_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
 class AdaptiveSkiaRenderer:
     """Skia renderer with the same adaptive text preprocessing interface as Vello."""
 
-    def __init__(self, min_font_size: float = 8.0, max_font_size: float = 10.0):
-        self._layout = AdaptiveVelloRenderer()
+    def __init__(self, min_font_size: float = 10.0, max_font_size: float = 10.0):
+        self._config = SkiaRenderConfig()
         self.min_font_size = min_font_size
         self.max_font_size = max_font_size
-        self._renderer_cache: dict[tuple[int, int, int, bool], SkiaRenderer] = {}
+        self._renderer_cache: Dict[tuple[int, int, int, bool, bool], SkiaRenderer] = {}
 
     def _get_renderer(self, width: int, height: int, padding: int, preserve_newlines: bool) -> SkiaRenderer:
-        key = (width, height, padding, preserve_newlines)
+        key = (width, height, padding, preserve_newlines, False)
         renderer = self._renderer_cache.get(key)
         if renderer is None:
             renderer = SkiaRenderer(
@@ -71,63 +107,65 @@ class AdaptiveSkiaRenderer:
                 min_font_size=self.min_font_size,
                 max_font_size=self.max_font_size,
                 preserve_newlines=preserve_newlines,
-                strict_fit=True,
             )
             self._renderer_cache[key] = renderer
         return renderer
 
-    def _measure_canvas(self, prepared_text: str, padding: int) -> tuple[int, int]:
-        width, height = measure_finalized_text_canvas(
+    def _measure_canvas(self, prepared_text: str, padding: int) -> tuple[int, int, int, int]:
+        raw_width, raw_height = measure_finalized_text_canvas(
             prepared_text,
             padding=padding,
             font_size=self.min_font_size,
+            min_size=self._config.min_size,
         )
-        return snap_canvas_to_grid(
-            width,
-            height,
-            divisor=self._layout.vit_divisor,
-            min_size=self._layout.min_size,
-            max_size=self._layout.max_size,
+        snapped_width, snapped_height = snap_canvas_to_grid(
+            raw_width,
+            raw_height,
+            divisor=self._config.vit_divisor,
+            min_size=self._config.min_size,
+            max_size=self._config.max_size,
         )
+        return raw_width, raw_height, snapped_width, snapped_height
 
-    def _render_one(self, text: str, thinking_mode: bool) -> Image.Image:
-        padding = self._layout.thinking_padding if thinking_mode else self._layout.padding
+    def _prepare_render(self, text: str, thinking_mode: bool) -> tuple[str, dict[str, Any], int]:
+        padding = self._config.thinking_padding if thinking_mode else self._config.padding
         prepared_text, layout_info = prepare_text_for_rendering(
             text,
-            short_line_threshold=self._layout.short_line_wrap_threshold,
-            min_lines_for_reflow=self._layout.short_line_min_lines,
-            max_canvas_size=self._layout.max_size,
+            short_line_threshold=self._config.short_line_wrap_threshold,
+            min_lines_for_reflow=self._config.short_line_min_lines,
+            max_canvas_size=self._config.max_size,
             measurement_padding=padding,
             measurement_font_size=self.min_font_size,
-            min_canvas_size=self._layout.min_size,
-            measurement_divisor=self._layout.vit_divisor,
+            min_canvas_size=self._config.min_size,
+            measurement_divisor=self._config.vit_divisor,
         )
-        width, height = self._measure_canvas(prepared_text, padding)
+        return prepared_text, layout_info, padding
+
+    def measure_text(self, text: str, thinking_mode: bool) -> tuple[int, int, int, int]:
+        prepared_text, _, padding = self._prepare_render(text, thinking_mode)
+        return self._measure_canvas(prepared_text, padding)
+
+    def _render_one(self, text: str, thinking_mode: bool) -> Image.Image:
+        prepared_text, layout_info, padding = self._prepare_render(text, thinking_mode)
+        if not prepared_text or layout_info.get("layout_type") == "failed":
+            logger.warning(f"Render failed: layout_type={layout_info.get('layout_type')}, text_len={len(text)}")
+            return None
+        _, _, width, height = self._measure_canvas(prepared_text, padding)
         return self._get_renderer(width, height, padding, layout_info["preserve_newlines"]).render_batch([prepared_text])[0]
 
     def render_batch(self, texts: List[str], thinking_mode: bool = False) -> List[Image.Image]:
         prepared_specs = []
-        padding = self._layout.thinking_padding if thinking_mode else self._layout.padding
         for text in texts:
-            prepared_text, layout_info = prepare_text_for_rendering(
-                text,
-                short_line_threshold=self._layout.short_line_wrap_threshold,
-                min_lines_for_reflow=self._layout.short_line_min_lines,
-                max_canvas_size=self._layout.max_size,
-                measurement_padding=padding,
-                measurement_font_size=self.min_font_size,
-                min_canvas_size=self._layout.min_size,
-                measurement_divisor=self._layout.vit_divisor,
-            )
-            prepared_specs.append((prepared_text, layout_info["preserve_newlines"]))
+            prepared_text, layout_info, padding = self._prepare_render(text, thinking_mode)
+            prepared_specs.append((prepared_text, padding, layout_info["preserve_newlines"]))
 
-        grouped: dict[tuple[int, int, bool], List[tuple[int, str]]] = {}
-        for idx, (prepared_text, preserve_newlines) in enumerate(prepared_specs):
-            width, height = self._measure_canvas(prepared_text, padding)
-            grouped.setdefault((width, height, preserve_newlines), []).append((idx, prepared_text))
+        grouped: Dict[tuple[int, int, int, bool], List[tuple[int, str]]] = {}
+        for idx, (prepared_text, padding, preserve_newlines) in enumerate(prepared_specs):
+            _, _, width, height = self._measure_canvas(prepared_text, padding)
+            grouped.setdefault((width, height, padding, preserve_newlines), []).append((idx, prepared_text))
 
         results: List[Image.Image] = [None] * len(texts)
-        for (width, height, preserve_newlines), items in grouped.items():
+        for (width, height, padding, preserve_newlines), items in grouped.items():
             renderer = self._get_renderer(width, height, padding, preserve_newlines)
             images = renderer.render_batch([text for _, text in items])
             for (idx, _), image in zip(items, images):
@@ -138,11 +176,10 @@ class AdaptiveSkiaRenderer:
         if not text or not text.strip():
             return False
         image = self._render_one(text, thinking_mode)
+        if image is None:
+            return False
         output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = output_path.with_name(f"{output_path.stem}.tmp{output_path.suffix}")
-        Image.fromarray(image).save(tmp_path, format="PNG")
-        tmp_path.replace(output_path)
+        _atomic_save_png(image, output_path)
         return True
 
     def shutdown(self) -> None:
@@ -246,6 +283,162 @@ def extract_thinking_and_answer(
             return [thinking], answer
 
     return thinking, answer
+
+
+def _load_cutoff_len_from_yaml(config_path: Path) -> Optional[int]:
+    if not config_path.exists():
+        logger.warning(f"Training config not found for cutoff_len lookup: {config_path}")
+        return None
+
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        yaml = None
+
+    text = config_path.read_text(encoding="utf-8")
+    if yaml is not None:
+        data = yaml.safe_load(text) or {}
+        cutoff_len = data.get("cutoff_len")
+        return int(cutoff_len) if cutoff_len is not None else None
+
+    match = re.search(r"(?m)^\s*cutoff_len\s*:\s*(\d+)\s*$", text)
+    return int(match.group(1)) if match else None
+
+
+def _resolve_max_expanded_len(cli_value: Optional[int], train_config: Path) -> int:
+    if cli_value is not None:
+        return int(cli_value)
+
+    cutoff_len = _load_cutoff_len_from_yaml(train_config)
+    if cutoff_len is not None:
+        logger.info(f"Resolved max expanded len from {train_config}: cutoff_len={cutoff_len}")
+        return cutoff_len
+
+    logger.warning("Falling back to max expanded len = 8192 because cutoff_len could not be resolved.")
+    return 8192
+
+
+def _get_qwen3vl_image_token_count(processor, image_path: str, image_token_cache: Dict[str, int]) -> int:
+    cached = image_token_cache.get(image_path)
+    if cached is not None:
+        return cached
+
+    image = Image.open(image_path).convert("RGB")
+    try:
+        mm_inputs = processor.image_processor([image], return_tensors="pt")
+    finally:
+        image.close()
+
+    image_grid_thw = mm_inputs.get("image_grid_thw")
+    if image_grid_thw is None or len(image_grid_thw) == 0:
+        raise ValueError(f"Failed to compute image_grid_thw for: {image_path}")
+
+    merge_size = int(getattr(processor.image_processor, "merge_size", 2))
+    image_token_count = int(image_grid_thw[0].prod().item()) // (merge_size ** 2)
+    image_token_cache[image_path] = image_token_count
+    return image_token_count
+
+
+def _compose_qwen3vl_training_text(user_content: str, assistant_content: str, image_token_count: int = 0) -> str:
+    if image_token_count > 0:
+        vision_tokens = "<|vision_start|>" + ("<|image_pad|>" * image_token_count) + "<|vision_end|>"
+        user_content = user_content.replace("<image>", vision_tokens, 1)
+
+    return (
+        f"<|im_start|>user\n{user_content}<|im_end|>\n"
+        f"<|im_start|>assistant\n{assistant_content}<|im_end|>\n"
+    )
+
+
+def _get_exact_expanded_length(
+    tokenizer,
+    processor,
+    *,
+    user_content: str,
+    assistant_content: str,
+    image_path: Optional[str],
+    latent_seq_lens: List[int],
+    image_token_cache: Dict[str, int],
+) -> int:
+    image_token_count = 0
+    if image_path:
+        image_token_count = _get_qwen3vl_image_token_count(processor, image_path, image_token_cache)
+
+    composed = _compose_qwen3vl_training_text(
+        user_content=user_content,
+        assistant_content=assistant_content,
+        image_token_count=image_token_count,
+    )
+    base_len = len(tokenizer.encode(composed, add_special_tokens=False))
+    num_latent_steps = assistant_content.count("<latent>")
+    return base_len - num_latent_steps + sum(int(x) for x in latent_seq_lens)
+
+
+def _split_text_for_rendering(text: str) -> tuple[str, str]:
+    text = str(text or "").strip()
+    if not text:
+        return "", ""
+
+    lines = text.splitlines()
+    if len(lines) >= 4:
+        midpoint = len(lines) // 2
+        candidates: List[tuple[int, int]] = []
+        for idx in range(1, len(lines)):
+            stripped = lines[idx].strip()
+            prev_stripped = lines[idx - 1].strip()
+            boundary_score = 0
+            if not prev_stripped or not stripped:
+                boundary_score -= 4
+            if re.match(r"^\s*(?:[-*+]\s+|\d+\.\s+|[A-Za-z][\.\)]\s+)", stripped):
+                boundary_score -= 2
+            if re.match(r"^\s*(?:[-*+]\s+|\d+\.\s+|[A-Za-z][\.\)]\s+)", prev_stripped):
+                boundary_score -= 1
+            candidates.append((abs(idx - midpoint) + boundary_score, idx))
+        if candidates:
+            _, split_idx = min(candidates)
+            left = "\n".join(lines[:split_idx]).strip()
+            right = "\n".join(lines[split_idx:]).strip()
+            if left and right:
+                return left, right
+
+    sentence_split = re.split(r"(?<=[.!?])\s+", text)
+    if len(sentence_split) >= 2:
+        midpoint = len(sentence_split) // 2
+        left = " ".join(sentence_split[:midpoint]).strip()
+        right = " ".join(sentence_split[midpoint:]).strip()
+        if left and right:
+            return left, right
+
+    words = text.split()
+    if len(words) >= 2:
+        midpoint = len(words) // 2
+        left = " ".join(words[:midpoint]).strip()
+        right = " ".join(words[midpoint:]).strip()
+        if left and right:
+            return left, right
+
+    midpoint = len(text) // 2
+    return text[:midpoint].strip(), text[midpoint:].strip()
+
+
+def _ensure_thinking_chunks_fit_renderer(renderer: AdaptiveSkiaRenderer, thinking_chunks: List[str]) -> List[str]:
+    queue_chunks = [str(chunk or "").strip() for chunk in thinking_chunks if str(chunk or "").strip()]
+    fitted_chunks: List[str] = []
+
+    while queue_chunks:
+        chunk = queue_chunks.pop(0)
+        raw_width, raw_height, _, _ = renderer.measure_text(chunk, thinking_mode=True)
+        if raw_width <= renderer._config.max_size and raw_height <= renderer._config.max_size:
+            fitted_chunks.append(chunk)
+            continue
+
+        left, right = _split_text_for_rendering(chunk)
+        if not left or not right or left == chunk or right == chunk:
+            fitted_chunks.append(chunk)
+            continue
+        queue_chunks = [left, right, *queue_chunks]
+
+    return fitted_chunks
 
 
 def get_hash_filename(dataset_name: str, sample_id: str, suffix: str = "") -> str:
@@ -382,6 +575,7 @@ def main_render_only(args, renderer):
                         max_chars=args.max_chars_per_chunk,
                         return_chunks=True,
                     )
+                    thinking_chunks = _ensure_thinking_chunks_fit_renderer(renderer, thinking_chunks)
                     if not answer:
                         stats['errors'] += 1
                         continue
@@ -464,7 +658,7 @@ def main_encode_only_ddp(args):
 
     # Initialize encoder (device is handled internally by Qwen3VLEncoder)
     encoder = Qwen3VLEncoder(
-        model_name_or_path="/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking",
+        model_name_or_path=DEFAULT_MODEL_PATH,
         device=device,
         dtype=torch.bfloat16,
         use_vllm_kernels=True,  # Enable optimized vLLM kernels for speed
@@ -492,10 +686,13 @@ def main_encode_only(args, encoder):
     # Initialize tokenizer so encode-only output contains precomputed
     # per-step CoT chunk token ids for training.
     tokenizer = AutoTokenizer.from_pretrained(
-        "/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking",
+        DEFAULT_MODEL_PATH,
         trust_remote_code=True,
         use_fast=True,
     )
+    processor = AutoProcessor.from_pretrained(DEFAULT_MODEL_PATH, trust_remote_code=True)
+    image_token_cache: Dict[str, int] = {}
+    fit_renderer = AdaptiveSkiaRenderer()
 
     # Get DDP parameters
     local_rank = getattr(args, 'local_rank', 0)
@@ -521,6 +718,7 @@ def main_encode_only(args, encoder):
         'features_cached': 0,
         'extracted_features': 0,
         'errors': 0,
+        'dropped_expanded_len': 0,
     }
 
     for dataset_name in datasets:
@@ -537,13 +735,13 @@ def main_encode_only(args, encoder):
         if local_rank == 0:
             logger.info(f"Processing {dataset_name} ({len(parquet_files)} shards)...")
 
-        output_jsonl = output_dir / f"r1_onevision_{dataset_name}_thinking.jsonl"
+        output_jsonl = output_dir / f"r1ov_{dataset_name}_thinking.jsonl"
 
         # Use rank-specific output file for multi-GPU
         if world_size > 1:
-            output_jsonl = output_dir / f"r1_onevision_{dataset_name}_thinking_rank{local_rank}.jsonl"
+            output_jsonl = output_dir / f"r1ov_{dataset_name}_thinking_rank{local_rank}.jsonl"
 
-        stats = {'total_samples': 0, 'features_cached': 0, 'extracted_features': 0, 'errors': 0}
+        stats = {'total_samples': 0, 'features_cached': 0, 'extracted_features': 0, 'errors': 0, 'dropped_expanded_len': 0}
 
         for shard_idx, parquet_path in enumerate(parquet_files):
             if local_rank == 0:
@@ -566,7 +764,6 @@ def main_encode_only(args, encoder):
 
             # Phase 2a: Collect all samples with thinking images
             samples_to_encode = []
-            query_image_paths = []
 
             for idx, row in df.iterrows():
                 try:
@@ -592,6 +789,7 @@ def main_encode_only(args, encoder):
                         max_chars=args.max_chars_per_chunk,
                         return_chunks=True,
                     )
+                    thinking = _ensure_thinking_chunks_fit_renderer(fit_renderer, thinking)
                     if not answer:
                         logger.info(f"    Sample {idx}: SKIP (empty answer after </think>)")
                         continue
@@ -640,7 +838,6 @@ def main_encode_only(args, encoder):
                             'thinking_chunks': thinking,  # Actual thinking text for 'cot' field
                             'thinking_image_paths': thinking_image_paths,  # For encoding (includes question_text + thinking)
                         })
-                        query_image_paths.append(str(query_image_path))
 
                 except Exception as e:
                     stats['errors'] += 1
@@ -792,6 +989,18 @@ def main_encode_only(args, encoder):
                             'cot_chunk_token_ids': cot_chunk_token_ids,
                             'task': 'r1_onevision_thinking',
                         }
+                        expanded_len = _get_exact_expanded_length(
+                            tokenizer,
+                            processor,
+                            user_content=user_content,
+                            assistant_content=thinking_content,
+                            image_path=sample['query_image_path'],
+                            latent_seq_lens=latent_seq_lens,
+                            image_token_cache=image_token_cache,
+                        )
+                        if args.max_expanded_len > 0 and expanded_len > args.max_expanded_len:
+                            stats['dropped_expanded_len'] += 1
+                            continue
 
                         f_out.write(json.dumps(json_entry) + '\n')
                         stats['features_cached'] += 1
@@ -820,8 +1029,8 @@ def main_encode_only(args, encoder):
             logger.info("")
             logger.info("Merging rank files...")
             for dataset_name in datasets:
-                base_jsonl = output_dir / f"r1_onevision_{dataset_name}_thinking.jsonl"
-                rank_files = list(output_dir.glob(f"r1_onevision_{dataset_name}_thinking_rank*.jsonl"))
+                base_jsonl = output_dir / f"r1ov_{dataset_name}_thinking.jsonl"
+                rank_files = list(output_dir.glob(f"r1ov_{dataset_name}_thinking_rank*.jsonl"))
 
                 if rank_files:
                     # Concatenate all rank files
@@ -842,6 +1051,7 @@ def main_encode_only(args, encoder):
         logger.info(f"  Features cached:        {total_stats['features_cached']}")
         logger.info(f"  Extracted features:     {total_stats['extracted_features']}")
         logger.info(f"  Errors:                 {total_stats['errors']}")
+        logger.info(f"  Dropped by expanded len > {args.max_expanded_len}: {total_stats['dropped_expanded_len']}")
         logger.info("=" * 70)
 
     # Merge all dataset JSONL files into one (only on rank 0)
@@ -849,12 +1059,12 @@ def main_encode_only(args, encoder):
         logger.info("")
         logger.info("Merging all datasets into single JSONL...")
 
-        merged_jsonl = output_dir / "r1_onevision_thinking.jsonl"
+        merged_jsonl = output_dir / "r1ov_thinking.jsonl"
         total_samples = 0
 
         with open(merged_jsonl, 'w') as f_out:
             for dataset_name in datasets:
-                dataset_jsonl = output_dir / f"r1_onevision_{dataset_name}_thinking.jsonl"
+                dataset_jsonl = output_dir / f"r1ov_{dataset_name}_thinking.jsonl"
                 if dataset_jsonl.exists():
                     sample_count = 0
                     with open(dataset_jsonl, 'r') as f_in:
@@ -870,7 +1080,7 @@ def main_encode_only(args, encoder):
         logger.info("")
         logger.info("Cleaning up per-dataset JSONLs...")
         for dataset_name in datasets:
-            dataset_jsonl = output_dir / f"r1_onevision_{dataset_name}_thinking.jsonl"
+            dataset_jsonl = output_dir / f"r1ov_{dataset_name}_thinking.jsonl"
             if dataset_jsonl.exists():
                 dataset_jsonl.unlink()
                 logger.info(f"  ✓ Deleted {dataset_jsonl.name}")
@@ -895,10 +1105,15 @@ def main():
                         default='Qwen/data',
                         help='Output directory for JSONL files')
     parser.add_argument('--images-dir',
-                        default='Qwen/data/r1_onevision_images',
+                        default='Qwen/data/r1ov_images',
                         help='Directory for rendered images and latent files')
+    parser.add_argument('--train-config',
+                        default=str(DEFAULT_TRAIN_CONFIG),
+                        help='Training YAML used to derive cutoff_len when --max-expanded-len is not set')
     parser.add_argument('--max-chars-per-chunk', type=int, default=4800,
                         help='Maximum characters per thinking chunk (default: 4800)')
+    parser.add_argument('--max-expanded-len', type=int, default=None,
+                        help='Drop rows whose exact post-expansion training length exceeds this value. Defaults to training YAML cutoff_len.')
     parser.add_argument('--device', default='cuda:0',
                         help='Device for cross-attention encoder')
     parser.add_argument('--batch-size', type=int, default=64,
@@ -915,6 +1130,7 @@ def main():
                         help='World size for DDP (set automatically by torchrun)')
 
     args = parser.parse_args()
+    args.max_expanded_len = _resolve_max_expanded_len(args.max_expanded_len, Path(args.train_config))
 
     # Auto-launch with torchrun if --num-gpus > 1 and not already in torchrun
     if args.num_gpus > 1 and 'LOCAL_RANK' not in os.environ:
@@ -964,6 +1180,8 @@ def main():
     logger.info(f"Images directory: {images_dir}")
     logger.info(f"Max samples:      {args.max_samples or 'All'}")
     logger.info(f"Max chars/chunk:  {args.max_chars_per_chunk}")
+    logger.info(f"Max expanded len: {args.max_expanded_len}")
+    logger.info(f"Train config:     {args.train_config}")
     logger.info(f"Device:           {args.device}")
     logger.info(f"World size:       {world_size}")
     logger.info(f"Render only:      {args.render_only}")
@@ -1006,7 +1224,7 @@ def main():
         else:
             # Single-GPU encode
             encoder = Qwen3VLEncoder(
-                model_name_or_path="/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking",
+                model_name_or_path=DEFAULT_MODEL_PATH,
                 device=args.device,
                 dtype=torch.bfloat16,
                 use_vllm_kernels=True,  # Enable optimized vLLM kernels for speed

@@ -16,6 +16,7 @@ import os
 import sys
 import time
 import traceback
+from collections import defaultdict
 from typing import Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -32,6 +33,7 @@ from peft import PeftModelForCausalLM
 from llamafactory.data import SFTDataCollatorWith4DAttentionMask, loader as loader_module
 from llamafactory.data.converter import SharegptDatasetConverter
 from llamafactory.data.mm_plugin import Qwen3VLPlugin
+from llamafactory.data.processor.processor_utils import greedy_knapsack
 from llamafactory.data.processor.supervised import PackedSupervisedDatasetProcessor, SupervisedDatasetProcessor
 from llamafactory.data.template import (
     FunctionFormatter,
@@ -43,7 +45,6 @@ from llamafactory.data.template import (
 from llamafactory.train.sft.trainer import CustomSeq2SeqTrainer
 from llamafactory.train.callbacks import SaveProcessorCallback
 
-from Qwen.llamafactory.vae_callback import VAESaveCallback
 from Qwen.llamafactory.transparent_eval_callback import QwenTransparentEvalCallback
 from Qwen.llamafactory.curriculum_callback import QwenCurriculumCallback
 
@@ -1346,43 +1347,18 @@ def _pack_features_after_injection(
         stats["last_log"] = stats["total"]
     _pack_features_after_injection._stats = stats
 
-    # OPTIMIZED: First-fit decreasing bin packing (O(n log n) instead of O(n²))
-    # Sort by length decreasing, then assign to bins using first-fit
-    sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i], reverse=True)
+    # Use the upstream LlamaFactory greedy knapsack heuristic for tighter packing.
+    length_to_indexes: dict[int, list[int]] = defaultdict(list)
+    for index, length in enumerate(lengths):
+        length_to_indexes[length].append(index)
 
-    knapsacks = []
-    current_knapsack = []
-    current_sum = 0
-
-    for idx in sorted_indices:
-        length = lengths[idx]
-        if length > cutoff_len:
-            # Drop this sample
-            dropped += 1
-            stats['dropped'] += 1
-            continue
-
-        if current_sum + length <= cutoff_len:
-            # Add to current knapsack
-            current_knapsack.append(idx)
-            current_sum += length
-        else:
-            # Start new knapsack
-            if current_knapsack:
-                knapsacks.append(current_knapsack)
-            current_knapsack = [idx]
-            current_sum = length
-
-    # Don't forget the last knapsack
-    if current_knapsack:
-        knapsacks.append(current_knapsack)
+    knapsacks = greedy_knapsack(lengths[:], cutoff_len)
     packed_features: List[dict] = []
     packed_latent_fields: List[dict] = []
 
     for knapsack in knapsacks:
-        # Pre-compute total lengths for pre-allocation
-        # OPTIMIZED: knapsack contains indices, not lengths
-        total_len = sum(lengths[idx] for idx in knapsack)
+        knapsack_indexes = [length_to_indexes[length].pop() for length in knapsack]
+        total_len = sum(lengths[idx] for idx in knapsack_indexes)
 
         # Use list comprehension for faster initialization
         packed_input_ids: list[int] = [0] * total_len
@@ -1398,10 +1374,8 @@ def _pack_features_after_injection(
         packed_latent_sup: list = []
         packed_num_latent_steps: list = []
 
-        # Track current position for in-place assignment (faster than extend)
         current_pos = 0
-        # OPTIMIZED: knapsack contains indices directly
-        for seg_idx, index in enumerate(knapsack):
+        for seg_idx, index in enumerate(knapsack_indexes):
             feature = expanded_features[index]
             feat_input_ids = feature["input_ids"]
             feat_labels = feature["labels"]
@@ -2230,7 +2204,6 @@ def _patch_trainer_callback(logger) -> None:
     """Patch CustomSeq2SeqTrainer to auto-add callbacks and ensure VAE is trainable.
 
     Adds:
-    - VAESaveCallback: Saves VAE weights separately when QWEN3VL_LOSS_TYPE includes "vae"
     - QwenTransparentEvalCallback: Runs transparent eval during training
     - QwenCurriculumCallback: Handles curriculum learning when QWEN3VL_CURRICULUM_ENABLE=1
 
@@ -2281,6 +2254,21 @@ def _patch_trainer_callback(logger) -> None:
     # Store original __init__ method
     original_init = CustomSeq2SeqTrainer.__init__
 
+    class SaveLatestModelCallback(TrainerCallback):
+        """Save a final trainer-managed latest checkpoint before processor finalization."""
+
+        def __init__(self, trainer: CustomSeq2SeqTrainer) -> None:
+            self._trainer = trainer
+
+        def on_train_end(self, args, state, control, **kwargs):
+            if not args.should_save:
+                return
+
+            try:
+                self._trainer.save_model(output_dir=args.output_dir)
+            except Exception as e:
+                logger.warning(f"[Qwen3VL Latent] Failed to save latest checkpoint at train end: {e}")
+
     @functools.wraps(original_save_model)
     def patched_save_model(self, output_dir=None, *args, **kwargs):
         if output_dir is None:
@@ -2291,7 +2279,17 @@ def _patch_trainer_callback(logger) -> None:
                     output_dir = os.path.join(self.args.output_dir, "checkpoint_latest")
             except Exception:
                 pass
-        return original_save_model(self, output_dir=output_dir, *args, **kwargs)
+        result = original_save_model(self, output_dir=output_dir, *args, **kwargs)
+
+        # Save VAE alongside every trainer-managed checkpoint save, including the final
+        # `save_model(output_dir=self.args.output_dir)` path that is remapped to
+        # `checkpoint_latest`.
+        try:
+            save_vae_checkpoint(self.model, output_dir)
+        except Exception as e:
+            logger.warning(f"[Qwen3VL Latent] Failed to save VAE checkpoint to {output_dir}: {e}")
+
+        return result
 
     @functools.wraps(original_processor_on_train_end)
     def patched_processor_on_train_end(self, args, state, control, **kwargs):
@@ -2317,14 +2315,17 @@ def _patch_trainer_callback(logger) -> None:
         if "vae" in loss_spec:
             _ensure_vae_in_optimizer(self, logger)
 
-            # Add VAE save callback
-            if training_args is not None:
-                save_steps = getattr(training_args, 'save_steps', 500)
-                output_dir = getattr(training_args, 'output_dir', '.')
-                vae_callback = VAESaveCallback(output_dir=output_dir, save_steps=save_steps)
-                self.add_callback(vae_callback)
-                if _is_rank0():
-                    logger.info(f"[Qwen3VL Latent] Auto-registered VAESaveCallback (save_steps={save_steps})")
+            latest_save_callback = SaveLatestModelCallback(self)
+            save_processor_index = None
+            for idx, callback in enumerate(self.callback_handler.callbacks):
+                if isinstance(callback, SaveProcessorCallback):
+                    save_processor_index = idx
+                    break
+
+            if save_processor_index is None:
+                self.add_callback(latest_save_callback)
+            else:
+                self.callback_handler.callbacks.insert(save_processor_index, latest_save_callback)
 
         # Log loss spec + loss breakdown at Trainer logging_steps cadence (rank 0 only).
         # This replaces forward() logging to avoid slowing training.

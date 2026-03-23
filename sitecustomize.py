@@ -35,6 +35,13 @@ def _ocrvl_patches_enabled() -> bool:
     return flag.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _verl_patches_enabled() -> bool:
+    flag = os.environ.get("QWEN3VL_APPLY_VERL_PATCHES")
+    if flag is None:
+        return False
+    return flag.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _patch_once() -> None:
     """Apply all patches."""
     logger = logging.getLogger(__name__)
@@ -64,6 +71,17 @@ def _patch_once() -> None:
             logger.warning(f"[sitecustomize] Failed to import OCRVL patches: {e}")
         except Exception as e:
             logger.warning(f"[sitecustomize] Failed to apply OCRVL patches: {e}")
+
+    if _verl_patches_enabled():
+        try:
+            from verl_compat import apply_runtime_compat_patches
+
+            apply_runtime_compat_patches()
+            import verl_compat.reward_manager  # noqa: F401
+        except ImportError as e:
+            logger.warning(f"[sitecustomize] Failed to import VERL patches: {e}")
+        except Exception as e:
+            logger.warning(f"[sitecustomize] Failed to apply VERL patches: {e}")
 
 
 # Apply patches on import

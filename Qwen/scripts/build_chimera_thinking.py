@@ -22,13 +22,13 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import torch
 import torch.distributed as dist
 from PIL import Image
-from transformers import AutoTokenizer
+from transformers import AutoProcessor, AutoTokenizer
 
 script_dir = Path(__file__).parent
 repo_root = script_dir.parent.parent
@@ -48,6 +48,40 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_MODEL_PATH = "/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking"
+DEFAULT_TRAIN_CONFIG = repo_root / "Qwen/configs/qwen3vl_native_chimera_thinking.yaml"
+
+
+def _load_cutoff_len_from_yaml(config_path: Path) -> Optional[int]:
+    if not config_path.exists():
+        logger.warning(f"Training config not found for cutoff_len lookup: {config_path}")
+        return None
+
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        yaml = None
+
+    text = config_path.read_text(encoding="utf-8")
+    if yaml is not None:
+        data = yaml.safe_load(text) or {}
+        cutoff_len = data.get("cutoff_len")
+        return int(cutoff_len) if cutoff_len is not None else None
+
+    match = re.search(r"(?m)^\s*cutoff_len\s*:\s*(\d+)\s*$", text)
+    return int(match.group(1)) if match else None
+
+
+def _resolve_max_expanded_len(cli_value: Optional[int], train_config: Path) -> int:
+    if cli_value is not None:
+        return int(cli_value)
+
+    cutoff_len = _load_cutoff_len_from_yaml(train_config)
+    if cutoff_len is not None:
+        logger.info(f"Resolved max expanded len from {train_config}: cutoff_len={cutoff_len}")
+        return cutoff_len
+
+    logger.warning("Falling back to max expanded len = 8192 because cutoff_len could not be resolved.")
+    return 8192
 
 
 @dataclass(frozen=True)
@@ -308,6 +342,66 @@ def _build_image_user_prompt(topic: str, row_index: int) -> str:
     return tmpl.format(topic=topic)
 
 
+def _get_qwen3vl_image_token_count(processor, image_path: str, image_token_cache: Dict[str, int]) -> int:
+    cached = image_token_cache.get(image_path)
+    if cached is not None:
+        return cached
+
+    image = Image.open(image_path).convert("RGB")
+    try:
+        mm_inputs = processor.image_processor([image], return_tensors="pt")
+    finally:
+        image.close()
+
+    image_grid_thw = mm_inputs.get("image_grid_thw")
+    if image_grid_thw is None or len(image_grid_thw) == 0:
+        raise ValueError(f"Failed to compute image_grid_thw for: {image_path}")
+
+    merge_size = int(getattr(processor.image_processor, "merge_size", 2))
+    image_token_count = int(image_grid_thw[0].prod().item()) // (merge_size ** 2)
+    image_token_cache[image_path] = image_token_count
+    return image_token_count
+
+
+def _compose_qwen3vl_training_text(
+    user_content: str,
+    assistant_content: str,
+    image_token_count: int = 0,
+) -> str:
+    if image_token_count > 0:
+        vision_tokens = "<|vision_start|>" + ("<|image_pad|>" * image_token_count) + "<|vision_end|>"
+        user_content = user_content.replace("<image>", vision_tokens, 1)
+
+    return (
+        f"<|im_start|>user\n{user_content}<|im_end|>\n"
+        f"<|im_start|>assistant\n{assistant_content}<|im_end|>\n"
+    )
+
+
+def _get_exact_expanded_length(
+    tokenizer,
+    processor,
+    *,
+    user_content: str,
+    assistant_content: str,
+    image_path: Optional[str],
+    latent_seq_lens: List[int],
+    image_token_cache: Dict[str, int],
+) -> int:
+    image_token_count = 0
+    if image_path:
+        image_token_count = _get_qwen3vl_image_token_count(processor, image_path, image_token_cache)
+
+    composed = _compose_qwen3vl_training_text(
+        user_content=user_content,
+        assistant_content=assistant_content,
+        image_token_count=image_token_count,
+    )
+    base_len = len(tokenizer.encode(composed, add_special_tokens=False))
+    num_latent_steps = assistant_content.count("<latent>")
+    return base_len - num_latent_steps + sum(int(x) for x in latent_seq_lens)
+
+
 def _image_file_valid(path: Path) -> bool:
     """Return True if an existing image file can be fully decoded."""
     if not path.exists():
@@ -496,66 +590,32 @@ def main_render_only(args):
     logger.info(f"Total samples to process: {total_rows}")
 
     renderer = AdaptiveSkiaRenderer()
+    batch_size = max(1, int(args.batch_size))
+    rows = df.to_dict(orient="records")
 
     kept = 0
     skipped = 0
 
     with open(metadata_path, "w", encoding="utf-8") as f_meta:
-        for ridx, row in enumerate(df.to_dict(orient="records")):
-            question = str(row.get("question") or "").strip()
-            solution = str(row.get("solution") or "").strip()
-            answer = str(row.get("answer") or "").strip()
-            original_solution = _extract_supervision_thinking(row.get("original_solution") or "")
-            topic = str(row.get("topic") or "").strip()
+        for start in range(0, len(rows), batch_size):
+            row_batch = rows[start:start + batch_size]
+            metadata_batch, plain_texts, plain_paths, thinking_texts, thinking_paths = _build_render_batch(
+                renderer,
+                row_batch,
+                start,
+                images_dir,
+                args.max_chars_per_chunk,
+            )
+            _render_pending_paths(renderer, plain_texts, plain_paths, thinking_mode=False)
+            _render_pending_paths(renderer, thinking_texts, thinking_paths, thinking_mode=True)
 
-            if not question or not solution or not answer or not original_solution:
-                skipped += 1
-                continue
+            for item in metadata_batch:
+                f_meta.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-            sid = _sample_id(row, ridx)
+            kept += len(metadata_batch)
+            skipped += len(row_batch) - len(metadata_batch)
 
-            question_img = images_dir / f"{sid}_question.png"
-            original_solution_img = images_dir / f"{sid}_supervision.png"
-
-            # Render query/question image (unchunked).
-            if not _image_file_valid(question_img):
-                renderer.render(question, str(question_img), thinking_mode=False)
-
-            # Render supervision/original_solution image (unchunked).
-            # Use non-thinking mode for stronger anti-truncation sizing.
-            if not _image_file_valid(original_solution_img):
-                renderer.render(original_solution, str(original_solution_img), thinking_mode=False)
-
-            # Chunk solution only (semantic-aware, same utility as r1-onevision)
-            solution_chunks = chunk_thinking_text(solution, args.max_chars_per_chunk)
-            if not solution_chunks:
-                solution_chunks = [solution]
-            solution_chunks = _ensure_thinking_chunks_fit_renderer(renderer, solution_chunks)
-
-            solution_chunk_images: List[str] = []
-            for cidx, chunk in enumerate(solution_chunks):
-                p = images_dir / f"{sid}_thinking_{cidx}.png"
-                if not _image_file_valid(p):
-                    renderer.render(chunk, str(p), thinking_mode=True)
-                solution_chunk_images.append(str(p))
-
-            user_content = f"<image>\n{_build_image_user_prompt(topic, int(row.get('index', ridx)))}".strip()
-            item = {
-                "sample_id": sid,
-                "index": int(row.get("index", ridx)),
-                "topic": topic,
-                "question": question,
-                "answer": answer,
-                "user_content": user_content,
-                "question_image_path": str(question_img),
-                "original_solution_image_path": str(original_solution_img),
-                "solution_chunks": solution_chunks,
-                "solution_chunk_image_paths": solution_chunk_images,
-            }
-            f_meta.write(json.dumps(item, ensure_ascii=False) + "\n")
-            kept += 1
-
-            if kept % 50 == 0:
+            if kept and kept % 50 == 0:
                 pct = (kept + skipped) / total_rows * 100 if total_rows > 0 else 0
                 logger.info(f"Render progress: {kept + skipped}/{total_rows} ({pct:.1f}%) kept={kept} skipped={skipped}")
 
@@ -707,13 +767,22 @@ def main_encode_only(args):
         logger.info(f"[Rank {rank}/{world_size}] Encode cache complete; rank 0 will write JSONL.")
         return
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        DEFAULT_MODEL_PATH,
-        trust_remote_code=True,
-        use_fast=True,
-    )
+    tokenizer = AutoTokenizer.from_pretrained(DEFAULT_MODEL_PATH, trust_remote_code=True, use_fast=True)
+    processor = AutoProcessor.from_pretrained(DEFAULT_MODEL_PATH, trust_remote_code=True)
+    image_token_cache: Dict[str, int] = {}
+    existing_specials = list(getattr(tokenizer, "additional_special_tokens", []) or [])
+    for token in ["<latent>", "<think_sep>"]:
+        if token not in existing_specials:
+            existing_specials.append(token)
+    if existing_specials:
+        tokenizer.add_special_tokens(
+            {"additional_special_tokens": existing_specials},
+            replace_additional_special_tokens=False,
+        )
 
     kept = 0
+    dropped_image = 0
+    dropped_text = 0
     with open(out_jsonl_image, "w", encoding="utf-8") as f_img, open(out_jsonl_text, "w", encoding="utf-8") as f_txt:
         for s in items:
             solution_cache_paths = [str(cache_dir / f"{Path(p).stem}.pt") for p in s["solution_chunk_image_paths"]]
@@ -764,7 +833,19 @@ def main_encode_only(args):
                 "task": "chimera_thinking_image_input",
                 **common,
             }
-            f_img.write(json.dumps(item_image, ensure_ascii=False) + "\n")
+            image_expanded_len = _get_exact_expanded_length(
+                tokenizer,
+                processor,
+                user_content=s["user_content"],
+                assistant_content=assistant_content,
+                image_path=question_image_path,
+                latent_seq_lens=latent_seq_lens,
+                image_token_cache=image_token_cache,
+            )
+            if args.max_expanded_len <= 0 or image_expanded_len <= args.max_expanded_len:
+                f_img.write(json.dumps(item_image, ensure_ascii=False) + "\n")
+            else:
+                dropped_image += 1
 
             # Variant 2: question provided directly as text input.
             item_text = {
@@ -776,7 +857,19 @@ def main_encode_only(args):
                 "task": "chimera_thinking_text_input",
                 **common,
             }
-            f_txt.write(json.dumps(item_text, ensure_ascii=False) + "\n")
+            text_expanded_len = _get_exact_expanded_length(
+                tokenizer,
+                processor,
+                user_content=question_text,
+                assistant_content=assistant_content,
+                image_path=None,
+                latent_seq_lens=latent_seq_lens,
+                image_token_cache=image_token_cache,
+            )
+            if args.max_expanded_len <= 0 or text_expanded_len <= args.max_expanded_len:
+                f_txt.write(json.dumps(item_text, ensure_ascii=False) + "\n")
+            else:
+                dropped_text += 1
 
             kept += 1
             if kept % 200 == 0:
@@ -788,6 +881,8 @@ def main_encode_only(args):
     logger.info(f"Output JSONL (text input):  {out_jsonl_text}")
     logger.info(f"Cached features dir: {cache_dir}")
     logger.info(f"Kept samples: {kept}")
+    logger.info(f"Dropped image-input samples by expanded len > {args.max_expanded_len}: {dropped_image}")
+    logger.info(f"Dropped text-input samples by expanded len > {args.max_expanded_len}: {dropped_text}")
     logger.info("=" * 70)
 
 
@@ -902,13 +997,22 @@ def main_all(args):
         for item in metadata_items:
             f_meta.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        DEFAULT_MODEL_PATH,
-        trust_remote_code=True,
-        use_fast=True,
-    )
+    tokenizer = AutoTokenizer.from_pretrained(DEFAULT_MODEL_PATH, trust_remote_code=True, use_fast=True)
+    processor = AutoProcessor.from_pretrained(DEFAULT_MODEL_PATH, trust_remote_code=True)
+    image_token_cache: Dict[str, int] = {}
+    existing_specials = list(getattr(tokenizer, "additional_special_tokens", []) or [])
+    for token in ["<latent>", "<think_sep>"]:
+        if token not in existing_specials:
+            existing_specials.append(token)
+    if existing_specials:
+        tokenizer.add_special_tokens(
+            {"additional_special_tokens": existing_specials},
+            replace_additional_special_tokens=False,
+        )
 
     kept = 0
+    dropped_image = 0
+    dropped_text = 0
     with open(out_jsonl_image, "w", encoding="utf-8") as f_img, open(out_jsonl_text, "w", encoding="utf-8") as f_txt:
         for s in metadata_items:
             solution_cache_paths = [str(cache_dir / f"{Path(p).stem}.pt") for p in s["solution_chunk_image_paths"]]
@@ -954,7 +1058,19 @@ def main_all(args):
                 "task": "chimera_thinking_image_input",
                 **common,
             }
-            f_img.write(json.dumps(item_image, ensure_ascii=False) + "\n")
+            image_expanded_len = _get_exact_expanded_length(
+                tokenizer,
+                processor,
+                user_content=s["user_content"],
+                assistant_content=assistant_content,
+                image_path=question_image_path,
+                latent_seq_lens=latent_seq_lens,
+                image_token_cache=image_token_cache,
+            )
+            if args.max_expanded_len <= 0 or image_expanded_len <= args.max_expanded_len:
+                f_img.write(json.dumps(item_image, ensure_ascii=False) + "\n")
+            else:
+                dropped_image += 1
 
             item_text = {
                 "messages": [
@@ -965,7 +1081,19 @@ def main_all(args):
                 "task": "chimera_thinking_text_input",
                 **common,
             }
-            f_txt.write(json.dumps(item_text, ensure_ascii=False) + "\n")
+            text_expanded_len = _get_exact_expanded_length(
+                tokenizer,
+                processor,
+                user_content=question_text,
+                assistant_content=assistant_content,
+                image_path=None,
+                latent_seq_lens=latent_seq_lens,
+                image_token_cache=image_token_cache,
+            )
+            if args.max_expanded_len <= 0 or text_expanded_len <= args.max_expanded_len:
+                f_txt.write(json.dumps(item_text, ensure_ascii=False) + "\n")
+            else:
+                dropped_text += 1
             kept += 1
 
     logger.info("=" * 70)
@@ -975,6 +1103,8 @@ def main_all(args):
     logger.info(f"Output JSONL (text input):  {out_jsonl_text}")
     logger.info(f"Cached features dir: {cache_dir}")
     logger.info(f"Kept samples: {kept}")
+    logger.info(f"Dropped image-input samples by expanded len > {args.max_expanded_len}: {dropped_image}")
+    logger.info(f"Dropped text-input samples by expanded len > {args.max_expanded_len}: {dropped_text}")
     logger.info("=" * 70)
 
 
@@ -984,10 +1114,21 @@ def main():
     parser.add_argument("--data-dir", default="/share/project/xiyan/huggingface/TianHongZXY/CHIMERA/Qwen3.5-397B")
     parser.add_argument("--output-dir", default="Qwen/data")
     parser.add_argument("--images-dir", default="Qwen/data/chimera_images")
+    parser.add_argument(
+        "--train-config",
+        default=str(DEFAULT_TRAIN_CONFIG),
+        help="Training YAML used to derive cutoff_len when --max-expanded-len is not set",
+    )
     parser.add_argument("--metadata-file", default="chimera_qwen35_metadata.jsonl")
     parser.add_argument("--output-jsonl-image", default="chimera_qwen35_thinking_image_input.jsonl")
     parser.add_argument("--output-jsonl-text", default="chimera_qwen35_thinking_text_input.jsonl")
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument(
+        "--max-expanded-len",
+        type=int,
+        default=None,
+        help="Drop JSONL rows whose exact post-expansion training length exceeds this value. Defaults to training YAML cutoff_len. Set <=0 to disable.",
+    )
     parser.add_argument("--max-chars-per-chunk", type=int, default=16384,
                         help="Chunk size for solution only (semantic-aware).")
     parser.add_argument("--batch-size", type=int, default=64)
@@ -997,6 +1138,7 @@ def main():
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--num-gpus", type=int, default=1)
     args = parser.parse_args()
+    args.max_expanded_len = _resolve_max_expanded_len(args.max_expanded_len, Path(args.train_config))
 
     if args.num_gpus > 1 and "LOCAL_RANK" not in os.environ:
         cmd = ["torchrun", f"--nproc_per_node={args.num_gpus}", sys.argv[0]]
@@ -1025,6 +1167,8 @@ def main():
     logger.info(f"Images dir: {args.images_dir}")
     logger.info(f"Output dir: {args.output_dir}")
     logger.info(f"Solution chunk size: {args.max_chars_per_chunk}")
+    logger.info(f"Max expanded len: {args.max_expanded_len}")
+    logger.info(f"Train config: {args.train_config}")
     logger.info(f"Max samples: {args.max_samples or 'All'}")
     logger.info(f"Batch size: {args.batch_size}")
     logger.info(f"Device: {args.device}")

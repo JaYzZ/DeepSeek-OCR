@@ -60,6 +60,7 @@ swanlog/*
 **/data/*.json*
 **/data/**/**.png
 **/data/**/**.jpg
+**/data/**/**.parquet
 **/data/*images/*
 **/data/cache/*
 Qwen/results/*

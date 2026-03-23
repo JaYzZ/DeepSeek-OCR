@@ -185,7 +185,7 @@ _set_env_from_runtime "MIN_CONTINUOUS_STEPS" "min_continuous_steps" "0"
 
 RUN_BACKFILL="$(_get_runtime_config "backfill_enable" "1")"
 RUN_BENCHMARK="$(_get_runtime_config "benchmark_enable" "0")"
-BENCHMARK_LIST="$(_get_runtime_config "benchmark_list" "MathVision,RealWorldQA")"
+BENCHMARK_LIST="$(_get_runtime_config "benchmark_list" "MathVision,MMMU,RealWorldQA")"
 BENCHMARK_NUM_SAMPLES="$(_get_runtime_config "benchmark_num_samples" "100")"
 
 # Resolve requested dataset(s) from config + CLI overrides.
@@ -208,6 +208,9 @@ IFS=',' read -ra DATASET_NAMES <<< "$DATASET_SPEC"
 for dataset_name in "${DATASET_NAMES[@]}"; do
   dataset_name="$(echo "$dataset_name" | xargs)"
   case "$dataset_name" in
+    qwen3vl_r1_onevision_thinking)
+      DATASET_PATHS+=("$REPO_ROOT/Qwen/data/r1ov_thinking.jsonl")
+      ;;
     qwen3vl_chimera_thinking_image_input)
       DATASET_PATHS+=("$REPO_ROOT/Qwen/data/chimera_qwen35_thinking_image_input.jsonl")
       ;;
@@ -216,7 +219,7 @@ for dataset_name in "${DATASET_NAMES[@]}"; do
       ;;
     *)
       echo "❌ Unsupported CHIMERA dataset in dataset=...: $dataset_name" >&2
-      echo "   Supported: qwen3vl_chimera_thinking_text_input, qwen3vl_chimera_thinking_image_input" >&2
+      echo "   Supported: qwen3vl_r1_onevision_thinking, qwen3vl_chimera_thinking_text_input, qwen3vl_chimera_thinking_image_input" >&2
       exit 1
       ;;
   esac
@@ -306,7 +309,7 @@ cat > "$RERUN_EVALS_SH" <<EOF
 #!/bin/bash
 set -euo pipefail
 QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" CUDA_VISIBLE_DEVICES=\${BACKFILL_CUDA_VISIBLE_DEVICES:-0} $PYTHON_BIN Qwen/scripts/backfill_transparent_eval.py --checkpoint_dir "$OUTPUT_DIR" --checkpoint checkpoint_latest --gpu_memory_utilization \${GPU_MEMORY_UTILIZATION:-0.9} 2>&1 | tee \${BACKFILL_LOG:-/tmp/backfill_thinking_debug.log}
-QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" VLLM_FORCE_THINK=$VLLM_FORCE_THINK CUDA_VISIBLE_DEVICES=\${BENCH_CUDA_VISIBLE_DEVICES:-\${CUDA_VISIBLE_DEVICES:-0}} $PYTHON_BIN Qwen/evaluation/run_all_benchmarks.py --start-server --benchmarks \${BENCHMARKS:-MathVision,RealWorldQA} --lora-path "$OUTPUT_DIR/checkpoint_latest"
+QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" VLLM_FORCE_THINK=$VLLM_FORCE_THINK CUDA_VISIBLE_DEVICES=\${BENCH_CUDA_VISIBLE_DEVICES:-\${CUDA_VISIBLE_DEVICES:-0}} $PYTHON_BIN Qwen/evaluation/run_all_benchmarks.py --start-server --benchmarks \${BENCHMARKS:-MathVision,MMMU,RealWorldQA} --lora-path "$OUTPUT_DIR/checkpoint_latest"
 EOF
 chmod +x "$RERUN_EVALS_SH"
 LOG_FILE="$OUTPUT_DIR/training.log"

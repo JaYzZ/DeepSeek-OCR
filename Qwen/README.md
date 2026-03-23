@@ -1,6 +1,9 @@
-# Qwen3VL R1-OneVision Latent Thinking Training
+# Qwen3VL Training
 
-This repo currently maintains **one** training pipeline: Qwen3-VL R1-OneVision SFT with latent injection + latent losses (+ curriculum).
+This repo currently maintains two active Qwen3-VL training paths:
+
+- **R1-OneVision SFT** with latent injection + latent losses (+ curriculum).
+- **DeepVision-103K GSPO** on VERL with vLLM rollout and a repo-local compatibility patch path.
 
 ## Run Training (First Priority Command)
 
@@ -8,16 +11,127 @@ This repo currently maintains **one** training pipeline: Qwen3-VL R1-OneVision S
 tmux new-session -d -s r1_sft 'CUDA_VISIBLE_DEVICES=0,1,2,3 bash Qwen/scripts/train_qwen3vl_r1onevision.sh Qwen/configs/qwen3vl_native_r1onevision_thinking.yaml'
 ```
 
+## DeepVision GSPO (VERL + vLLM)
+
+### 1. Build RL parquet from local DeepVision-103K
+
+The local dataset path used here is:
+
+`/share/project/xiyan/huggingface/skylenage/DeepVision-103K`
+
+Build VERL-ready train/val parquet:
+
+```bash
+/share/project/xiyan/envs/ocrflow/bin/python Qwen/scripts/build_deepvision_verl_dataset.py
+```
+
+Default output:
+
+`Qwen/data/deepvision_103k_verl/train.parquet`
+
+`Qwen/data/deepvision_103k_verl/val.parquet`
+
+Notes:
+- The converter preserves the original multi-message prompt and raw image bytes from DeepVision parquet.
+- The local corpus is the full DeepVision-103K release: `math-77k.parquet` (77,135 rows) + `visual_logic-26k.parquet` (26,368 rows).
+- Reward supervision is taken from `reward_model.ground_truth` plus `equivalent_answers`.
+- Validation is a deterministic per-source split because DeepVision-103K ships as train-only parquet.
+
+### 2. Launch single-node GSPO with vLLM rollout
+
+Default YAML:
+
+- `Qwen/configs/rl/deepvision_gspo.yaml`
+
+Example:
+
+```bash
+tmux new-session -d -s deepvision_gspo 'CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash Qwen/scripts/train_qwen3vl_deepvision_gspo.sh'
+```
+
+What the GSPO launcher does:
+- Runs `Qwen/scripts/run_verl_ppo.py`, which merges VERL's base PPO config with our project YAML.
+- Writes a single authoritative log at `OUTPUT_DIR/training.log`; launcher, Ray, and worker output all stream there.
+- Keeps `algorithm.adv_estimator=grpo`, matching the official DeepVision setup of GSPO policy loss with GRPO advantage estimation.
+- Uses `Qwen/scripts/deepvision_gspo_reward.py` as the reward function.
+- Uses a pure rule-based correctness reward: `+1` for a correct final answer, `0` otherwise.
+- Does not add any format reward or judge reward.
+- Uses a repo-local batched reward manager (`dapo_batch`) so reward scoring stays compatible with DAPO-style bookkeeping while avoiding the slow per-sample decode/score loop.
+- Uses **vLLM** as the rollout backend.
+- Forces rollout through the repo-local plugin + compat path by exporting:
+  - `PYTHONPATH=$REPO_ROOT/vllm_thinking_plugin:$REPO_ROOT`
+  - `VLLM_PLUGINS=vllm_thinking`
+- Injects the local VERL worker patch through Ray runtime env plus `worker_process_setup_hook=verl_compat.worker_setup.apply_worker_compat_patches`.
+- Keeps continuous thinking mode **disabled** by default for the baseline:
+  - `VLLM_THINKING=0`
+- Keeps the base model configurable through `MODEL_PATH`; the rule logic remains DeepVision-style regardless of which supported base you plug in.
+- Starts with LoRA on the language stack and excludes `visual` modules from LoRA.
+- Freezes the vision tower for the initial baseline.
+- Defaults to `FILTER_OVERLONG_PROMPTS_WORKERS=1`; for this stack that has been the fastest setting in practice.
+- Leaves multimodal preprocessor cache enabled by default in rollout; set `ROLLOUT_DISABLE_MM_PREPROCESSOR_CACHE=true` only if host-memory pressure forces it.
+
+### 3. Multi-node compatibility
+
+The script is written to stay compatible with multinode Ray/VERL runs:
+
+```bash
+NNODES=2 \
+RAY_ADDRESS=http://your-ray-head:8265 \
+bash Qwen/scripts/train_qwen3vl_deepvision_gspo.sh
+```
+
+Practical note:
+- The launcher itself does not create a Ray cluster for you.
+- For `NNODES>1`, bring up Ray separately, then pass `RAY_ADDRESS` and the desired trainer overrides.
+
+Initialize RL from an existing SFT LoRA checkpoint:
+
+```bash
+tmux new-session -d -s deepvision_gspo_sft_init 'CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 INIT_LORA_PATH=Qwen/checkpoints/qwen3vl-2b/lora/r1_onevision_thinking/run_current_sota/checkpoint_latest bash Qwen/scripts/train_qwen3vl_deepvision_gspo.sh'
+```
+
+Resume an interrupted VERL run from its own checkpoint:
+
+```bash
+tmux new-session -d -s deepvision_gspo_resume 'CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 RESUME_MODE=resume_path RESUME_FROM_PATH=/abs/path/to/verl_run/global_step_40 bash Qwen/scripts/train_qwen3vl_deepvision_gspo.sh'
+```
+
+Important:
+- `INIT_LORA_PATH` is for bootstrapping RL from a HuggingFace/PEFT LoRA adapter such as `checkpoint_latest`.
+- `RESUME_MODE=resume_path` is only for resuming a previous VERL run, whose checkpoint folder must contain `global_step_*` actor/critic state.
+- If the init LoRA contains visual-module adapters, vLLM will warn that those visual LoRA weights are ignored during rollout. That is expected for the current language-only rollout path.
+
 What the script does (high level):
 - Verifies the OCRFlow python at `../../envs/ocrflow/bin/python`.
-- Requires the dataset file `Qwen/data/r1_onevision_thinking.jsonl` to exist.
-- Exports `QWEN3VL_*` env vars from the YAML (loss spec, token ids, curriculum, etc.).
-- Runs `python -m llamafactory.cli train ...` (FSDP in the provided YAML).
-- After training succeeds, runs **post-training backfill** (`Qwen/scripts/backfill_transparent_eval.py`) for checkpoints.
+- Requires `Qwen/data/deepvision_103k_verl/{train,val}.parquet` to exist.
+- Keeps the base model configurable through `MODEL_PATH`.
+- Enables the repo-local VERL compatibility bootstrap through `sitecustomize.py` and `./verl_compat/`.
+- Loads training-critical RL settings from `Qwen/configs/rl/*.yaml`.
+- Runs VERL PPO with GSPO loss, GRPO advantage estimation, vLLM rollout, LoRA on the language stack, and DeepVision-style rule reward.
+
+### 4. Practical speed knobs for DeepVision-103K
+
+The current training logs show generation time dominates each step, with reward evaluation as the next-largest cost. The safest speed knobs are:
+
+- Keep `FILTER_OVERLONG_PROMPTS_WORKERS=1` unless you have measured a real improvement on your machine.
+- `ROLLOUT_DISABLE_MM_PREPROCESSOR_CACHE=false` to keep image preprocessing cached in rollout.
+- `ROLLOUT_MAX_BATCHED_TOKENS` to tune batching separately from `ROLLOUT_MAX_MODEL_LEN`.
+- `MAX_RESPONSE_LENGTH` to cap runaway long generations if you want faster smoke tests.
+- `ROLLOUT_N` to reduce samples per prompt for quick checks.
+
+Code-path optimizations already wired into this repo:
+
+- DeepVision reward scoring uses a batched reward manager plus cached symbolic parsing instead of VERL's default per-sample DAPO decode loop.
+
+Use more aggressive changes only if you have already confirmed stability on this stack:
+
+- `ROLLOUT_ENFORCE_EAGER=false`
+- `free_cache_engine=false` via an overlay config
+- higher `GPU_MEMORY_UTILIZATION`
 
 ## Build The Dataset
 
-The trainer expects `Qwen/data/r1_onevision_thinking.jsonl`.
+The trainer expects `Qwen/data/r1ov_thinking.jsonl`.
 
 Recommended two-phase build (CPU render -> GPU encode):
 
