@@ -13,12 +13,15 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file
 
+from vllm_thinking.trace_store import record_request_step, reset_request_trace
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
 logger = logging.getLogger(__name__)
 _THINKING_DEBUG = os.environ.get("VLLM_THINKING_DEBUG", "0") == "1"
 _TARGET_PROB_IO_WARNED = False
+_TRACE_SUMMARY_LOGGED = False
+_LATENT_SAMPLE_LOGGED = False
 
 def _debug_log(msg: str):
     """Write debug message to stderr - visible in worker output."""
@@ -42,6 +45,19 @@ def _append_target_prob(record: dict):
         if not _TARGET_PROB_IO_WARNED:
             _TARGET_PROB_IO_WARNED = True
             logger.warning("[Thinking] Failed to write target prob trace to %s", target_prob_path)
+
+
+def _log_trace_summary_once(req_id, state) -> None:
+    global _TRACE_SUMMARY_LOGGED
+    if _TRACE_SUMMARY_LOGGED:
+        return
+    logger.warning(
+        "[Thinking] Continuous trace capture active: req_id=%s mode=%s thinking_length=%s",
+        req_id,
+        state.get("mode"),
+        state.get("thinking_length"),
+    )
+    _TRACE_SUMMARY_LOGGED = True
 
 
 def _get_thinking_token_ids():
@@ -270,6 +286,7 @@ def apply_thinking_mode_patch():
         if hasattr(scheduler_output, 'scheduled_new_reqs') and scheduler_output.scheduled_new_reqs:
             for req in scheduler_output.scheduled_new_reqs:
                 if req.req_id not in self._thinking_state:
+                    reset_request_trace(req.req_id)
                     # Initial mode detection from prompt
                     prompt_ids = req.prompt_token_ids or []
                     mode = _detect_initial_mode_from_prompt(prompt_ids)
@@ -298,6 +315,7 @@ def apply_thinking_mode_patch():
         if hasattr(scheduler_output, 'scheduled_cached_reqs') and scheduler_output.scheduled_cached_reqs:
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
                 if req_id not in self._thinking_state:
+                    reset_request_trace(req_id)
                     self._thinking_state[req_id] = {
                         'mode': 'discrete',
                         'step': 0,
@@ -604,6 +622,8 @@ def apply_thinking_mode_patch():
                     _debug_log(f"[DEBUG] sample_tokens: reset thinking length to {state['thinking_length']} (think_sep)")
 
                 thinking_length = state.get('thinking_length', DEFAULT_THINKING_LENGTH)
+                latent_embedding = None
+                latent_logprob = None
                 if state.get('mode') == 'continuous' and step >= thinking_length:
                     if i < len(sampled_tokens_list) and sampled_tokens_list[i]:
                         sampled_tokens_list[i][0] = _get_token_id('think_end')
@@ -622,11 +642,28 @@ def apply_thinking_mode_patch():
                 else:
                     if state.get('mode') == 'continuous' and last_hidden is not None:
                         if self.latent_vae is not None:
+                            global _LATENT_SAMPLE_LOGGED
                             vae_dist = self.latent_vae.forward(last_hidden, temperature=1.0)
-                            vae_emb = vae_dist.mean
+                            vae_emb = vae_dist.rsample()
+                            latent_embedding = vae_emb
+                            latent_logprob = vae_dist.log_prob(vae_emb).mean(dim=-1)
                             state['embedding'] = vae_emb
+                            if not _LATENT_SAMPLE_LOGGED:
+                                logger.warning("[Thinking] Continuous rollout is using LatentVAE.rsample() with saved latent log_probs.")
+                                _LATENT_SAMPLE_LOGGED = True
                         else:
                             state['embedding'] = last_hidden
+
+                use_continuous_embedding = bool(state.get('mode') == 'continuous' and last_hidden is not None)
+                record_request_step(
+                    req_id,
+                    hidden_state=last_hidden,
+                    latent_embedding=latent_embedding,
+                    latent_logprob=latent_logprob,
+                    use_continuous_embedding=use_continuous_embedding,
+                )
+                if use_continuous_embedding:
+                    _log_trace_summary_once(req_id, state)
 
                 # vLLM's next decode step reads slot `num_computed_tokens`, which
                 # after sampling corresponds to the just-added output token slot:

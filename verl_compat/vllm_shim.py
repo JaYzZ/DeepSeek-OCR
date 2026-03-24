@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import logging
 
@@ -16,6 +17,34 @@ from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager, WorkerLoRAManage
 from verl.third_party.vllm import get_version
 
 logger = logging.getLogger(__name__)
+
+
+class _SuppressMultimodalLoRAWarnings(logging.Filter):
+    """Suppress known vLLM multimodal-LoRA warnings that add log noise."""
+
+    _MATCHES = (
+        "Regarding multimodal models, vLLM currently only supports adding LoRA to language model.",
+        "Regarding multimodal models, vLLM currently only supports adding LoRA to language model,",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not any(text in message for text in self._MATCHES)
+
+
+def _install_multimodal_lora_warning_filters() -> None:
+    filter_obj = _SuppressMultimodalLoRAWarnings()
+    for module_name in (
+        "vllm.lora.models",
+        "vllm.v1.worker.lora_model_runner_mixin",
+    ):
+        module = importlib.import_module(module_name)
+        target_logger = getattr(module, "logger", None)
+        if not isinstance(target_logger, logging.Logger):
+            target_logger = logging.getLogger(module_name)
+
+        if not any(isinstance(existing, _SuppressMultimodalLoRAWarnings) for existing in target_logger.filters):
+            target_logger.addFilter(filter_obj)
 
 
 class TensorLoRARequest(LoRARequest):
@@ -97,6 +126,7 @@ class VLLMHijack:
     @staticmethod
     def hijack() -> None:
         patched = False
+        _install_multimodal_lora_warning_filters()
         original_from_lora_tensors = LoRAModel.from_lora_tensors.__func__
 
         if "embeddings" not in inspect.signature(original_from_lora_tensors).parameters:
