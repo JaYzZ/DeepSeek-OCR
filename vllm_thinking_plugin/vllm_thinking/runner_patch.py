@@ -20,8 +20,8 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 logger = logging.getLogger(__name__)
 _THINKING_DEBUG = os.environ.get("VLLM_THINKING_DEBUG", "0") == "1"
 _TARGET_PROB_IO_WARNED = False
-_TRACE_SUMMARY_LOGGED = False
-_LATENT_SAMPLE_LOGGED = False
+_VLLM_VAE_LOGGED = False
+_CONTINUOUS_AR_CERT_LOGGED = False
 
 def _debug_log(msg: str):
     """Write debug message to stderr - visible in worker output."""
@@ -45,19 +45,6 @@ def _append_target_prob(record: dict):
         if not _TARGET_PROB_IO_WARNED:
             _TARGET_PROB_IO_WARNED = True
             logger.warning("[Thinking] Failed to write target prob trace to %s", target_prob_path)
-
-
-def _log_trace_summary_once(req_id, state) -> None:
-    global _TRACE_SUMMARY_LOGGED
-    if _TRACE_SUMMARY_LOGGED:
-        return
-    logger.warning(
-        "[Thinking] Continuous trace capture active: req_id=%s mode=%s thinking_length=%s",
-        req_id,
-        state.get("mode"),
-        state.get("thinking_length"),
-    )
-    _TRACE_SUMMARY_LOGGED = True
 
 
 def _get_thinking_token_ids():
@@ -167,6 +154,7 @@ def apply_thinking_mode_patch():
 
     # ============== VAE Loading ==============
     def _load_latent_vae_from_checkpoint(self):
+        global _VLLM_VAE_LOGGED
         if hasattr(self, 'latent_vae') and self.latent_vae is not None:
             return
 
@@ -182,7 +170,9 @@ def apply_thinking_mode_patch():
                     self.latent_vae = LatentVAE(hidden_size=hidden_size)
                     self.latent_vae.load_state_dict(vae_state, strict=False)
                     self.latent_vae = self.latent_vae.cuda()
-                    logger.info(f"[Thinking] Loaded VAE from {vae_path}")
+                    if not _VLLM_VAE_LOGGED:
+                        logger.warning("[Thinking] vLLM rollout VAE loaded: path=%s hidden_size=%s", vae_path, hidden_size)
+                        _VLLM_VAE_LOGGED = True
                     return
                 except Exception as e:
                     logger.warning(f"[Thinking] Load VAE failed: {e}")
@@ -196,7 +186,9 @@ def apply_thinking_mode_patch():
                 self.latent_vae = LatentVAE(hidden_size=hidden_size)
                 self.latent_vae.load_state_dict(vae_state, strict=False)
                 self.latent_vae = self.latent_vae.cuda()
-                logger.info(f"[Thinking] Loaded VAE from {vae_path}")
+                if not _VLLM_VAE_LOGGED:
+                    logger.warning("[Thinking] vLLM rollout VAE loaded: path=%s hidden_size=%s", vae_path, hidden_size)
+                    _VLLM_VAE_LOGGED = True
                 return
             except Exception as e:
                 logger.warning(f"[Thinking] Load VAE failed: {e}")
@@ -642,19 +634,25 @@ def apply_thinking_mode_patch():
                 else:
                     if state.get('mode') == 'continuous' and last_hidden is not None:
                         if self.latent_vae is not None:
-                            global _LATENT_SAMPLE_LOGGED
                             vae_dist = self.latent_vae.forward(last_hidden, temperature=1.0)
                             vae_emb = vae_dist.rsample()
                             latent_embedding = vae_emb
                             latent_logprob = vae_dist.log_prob(vae_emb).mean(dim=-1)
                             state['embedding'] = vae_emb
-                            if not _LATENT_SAMPLE_LOGGED:
-                                logger.warning("[Thinking] Continuous rollout is using LatentVAE.rsample() with saved latent log_probs.")
-                                _LATENT_SAMPLE_LOGGED = True
                         else:
                             state['embedding'] = last_hidden
 
                 use_continuous_embedding = bool(state.get('mode') == 'continuous' and last_hidden is not None)
+                global _CONTINUOUS_AR_CERT_LOGGED
+                if use_continuous_embedding and not _CONTINUOUS_AR_CERT_LOGGED:
+                    logger.warning(
+                        "[Thinking] vLLM continuous AR active: req_id=%s source=%s saved_hidden_states=true saved_latent_embeddings=%s saved_latent_log_probs=%s",
+                        req_id,
+                        "latent_vae_rsample" if self.latent_vae is not None else "last_hidden",
+                        bool(latent_embedding is not None),
+                        bool(latent_logprob is not None),
+                    )
+                    _CONTINUOUS_AR_CERT_LOGGED = True
                 record_request_step(
                     req_id,
                     hidden_state=last_hidden,
@@ -662,8 +660,6 @@ def apply_thinking_mode_patch():
                     latent_logprob=latent_logprob,
                     use_continuous_embedding=use_continuous_embedding,
                 )
-                if use_continuous_embedding:
-                    _log_trace_summary_once(req_id, state)
 
                 # vLLM's next decode step reads slot `num_computed_tokens`, which
                 # after sampling corresponds to the just-added output token slot:

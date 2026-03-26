@@ -17,25 +17,25 @@ if curl -s -f "${SERVER_URL}/v1/models" > /dev/null 2>&1; then
 else
     echo "✗ Server is not responding at $SERVER_URL"
     echo "  Make sure your vLLM server is running:"
-    echo "  vllm serve qwen2.5-72b-instruct --port 8000"
+    echo "  python Qwen/evaluation/judge_server.py --model-path /path/to/model --port 8600"
     exit 1
 fi
 
 echo ""
-echo "Test 2: Testing chat completions..."
-response=$(curl -s "${SERVER_URL}/v1/chat/completions" \
+echo "Test 2: Testing /judge..."
+response=$(curl -s "${SERVER_URL}/judge" \
     -H "Content-Type: application/json" \
     -d '{
-        "model": "qwen2.5-72b-instruct",
-        "messages": [{"role": "user", "content": "Say hello"}],
-        "max_tokens": 10
+        "question": "What is 2 + 2?",
+        "reference": "4",
+        "prediction": "The answer is 4."
     }')
 
-if echo "$response" | grep -q "choices"; then
-    echo "✓ Chat completions working"
-    echo "$response" | jq '.choices[0].message.content' 2>/dev/null || echo "$response"
+if echo "$response" | grep -q '"verdict"'; then
+    echo "✓ Judge endpoint working"
+    echo "$response" | jq '.' 2>/dev/null || echo "$response"
 else
-    echo "✗ Chat completions failed"
+    echo "✗ Judge endpoint failed"
     echo "$response"
     exit 1
 fi

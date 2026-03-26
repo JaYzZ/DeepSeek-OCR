@@ -10,10 +10,7 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
-from verl_compat import patch_runtime_env, patch_worker_env_vars
-
-
-WORKER_SETUP_HOOK = "verl_compat.worker_setup.apply_worker_compat_patches"
+from verl_compat import patch_runtime_env
 
 
 def _resolve_verl_ppo_config() -> Path:
@@ -95,7 +92,6 @@ def _check_runtime_env(config) -> int:
     @ray.remote(num_cpus=1, num_gpus=1)
     class RuntimeProbe:
         def inspect(self, actor_model_cfg: dict, actor_cfg: dict):
-            import json
             import sys
 
             import torch
@@ -104,8 +100,7 @@ def _check_runtime_env(config) -> int:
             from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoModelForImageTextToText, AutoModelForVision2Seq
 
             from verl_compat.worker_setup import collect_patch_diagnostics
-            from verl_compat.continuous_replay import LatentVAE, inspect_replay_binding
-            from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager, WorkerLoRAManager
+            from verl_compat.continuous_replay import LatentVAE
             from verl.utils.vllm.utils import VLLMHijack
             from verl.utils.fs import copy_to_local
             from verl.models.transformers.monkey_patch import apply_monkey_patch
@@ -198,17 +193,6 @@ def _check_runtime_env(config) -> int:
                 "cuda_device_count": int(torch.cuda.device_count()),
                 "cuda_current_device": (int(torch.cuda.current_device()) if torch.cuda.is_available() else None),
                 "runtime_device": str(runtime_device),
-                "worker_load_adapter": {
-                    "module": WorkerLoRAManager._load_adapter.__module__,
-                    "name": WorkerLoRAManager._load_adapter.__name__,
-                    "patched": bool(getattr(WorkerLoRAManager._load_adapter, "_qwen3vl_compat_patch", False)),
-                },
-                "lru_load_adapter": {
-                    "module": LRUCacheWorkerLoRAManager._load_adapter.__module__,
-                    "name": LRUCacheWorkerLoRAManager._load_adapter.__name__,
-                    "patched": bool(getattr(LRUCacheWorkerLoRAManager._load_adapter, "_qwen3vl_compat_patch", False)),
-                },
-                "replay_binding": inspect_replay_binding(actor_module),
             }
             hidden_size = getattr(actor_model_config, "hidden_size", None)
             if hidden_size is None:
@@ -230,14 +214,14 @@ def _check_runtime_env(config) -> int:
                     dtype=torch.bfloat16,
                 )
                 replay_hidden_states = torch.randn((2, int(hidden_size)), device=runtime_device, dtype=torch.bfloat16)
+                replay_latent_embeddings = latent_vae.forward(replay_hidden_states, temperature=1.0).rsample()
                 with torch.no_grad():
                     replay_output = actor_module(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         position_ids=position_ids,
                         continuous_replay_row_ids=replay_row_ids,
-                        continuous_replay_hidden_states=replay_hidden_states,
-                        continuous_replay_latent_vae=latent_vae,
+                        continuous_replay_latent_embeddings=replay_latent_embeddings,
                         use_cache=False,
                     )
                 replay_smoke = {
@@ -251,7 +235,6 @@ def _check_runtime_env(config) -> int:
                 }
             payload["replay_forward_smoke"] = replay_smoke
             payload.update(collect_patch_diagnostics())
-            print(f"Runtime preflight worker payload: {json.dumps(payload, sort_keys=True)}", flush=True)
             return payload
 
     probe = RuntimeProbe.options(runtime_env=patch_runtime_env({})).remote()
@@ -270,13 +253,14 @@ def _check_runtime_env(config) -> int:
     print(json.dumps(payload, indent=2, sort_keys=True))
     ray.shutdown()
 
-    checks = [payload["worker_load_adapter"], payload["lru_load_adapter"]]
     ok = (
         payload.get("compat_env_flag") == "1"
         and payload.get("lora_from_tensors_patched") is True
-        and payload.get("replay_binding", {}).get("ok") is True
         and payload.get("replay_forward_smoke", {}).get("ok") is True
-        and all(item["patched"] and item["module"] == "verl_compat.vllm_shim" for item in checks)
+        and payload.get("worker_load_adapter_patched") is True
+        and payload.get("worker_load_adapter_module") == "verl_compat.vllm_shim"
+        and payload.get("lru_load_adapter_patched") is True
+        and payload.get("lru_load_adapter_module") == "verl_compat.vllm_shim"
     )
     return 0 if ok else 1
 

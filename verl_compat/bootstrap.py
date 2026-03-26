@@ -10,10 +10,17 @@ import shutil
 import sys
 from pathlib import Path
 
+import torch.distributed as dist
+from safetensors.torch import save_file
+
+from .continuous_replay import _restore_policy_latent_vae, apply_continuous_replay_patches
+from .vllm_shim import TensorLoRARequest, VLLMHijack, is_version_ge
+
 logger = logging.getLogger(__name__)
 _PATCHED = False
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKER_SETUP_HOOK = "verl_compat.worker_setup.apply_worker_compat_patches"
+_VAE_ARTIFACT_LOGGED = False
 
 
 def build_repo_pythonpath(existing_pythonpath: str) -> str:
@@ -66,8 +73,6 @@ def patch_runtime_env(runtime_env: dict | None) -> dict:
 def _patch_verl_vllm_module() -> None:
     """Patch the active external ``verl.utils.vllm`` module in place."""
 
-    from .vllm_shim import TensorLoRARequest, VLLMHijack, is_version_ge
-
     external_utils = importlib.import_module("verl.utils.vllm.utils")
     external_pkg = importlib.import_module("verl.utils.vllm")
 
@@ -92,13 +97,9 @@ def _patch_verl_vllm_module() -> None:
 
     # Reinstall the actual runtime hooks on vLLM classes.
     VLLMHijack.hijack()
-    logger.warning("Patched external verl.utils.vllm in place with repo-local compatibility shim.")
-
 
 def _patch_imported_runtime_aliases() -> None:
     """Repair stale `from verl.utils.vllm import ...` aliases in already-imported modules."""
-
-    from .vllm_shim import TensorLoRARequest, VLLMHijack, is_version_ge
 
     patched_modules = []
     for module_name in (
@@ -116,10 +117,6 @@ def _patch_imported_runtime_aliases() -> None:
 
     if patched_modules:
         VLLMHijack.hijack()
-        logger.warning(
-            "Patched already-imported VERL runtime aliases in modules: %s",
-            ", ".join(sorted(patched_modules)),
-        )
 
 
 def _patch_ray_actor_runtime_env() -> None:
@@ -140,8 +137,6 @@ def _patch_ray_actor_runtime_env() -> None:
 
     compat_update_options._qwen3vl_compat_patch = True
     ray_class_with_init.update_options = compat_update_options
-    logger.warning("Patched VERL Ray actor runtime env to carry repo-local compat hooks.")
-
 
 def _patch_fsdp_checkpoint_manager() -> None:
     """Guard VERL FSDP checkpoint export from PEFT source-layout issues."""
@@ -168,8 +163,6 @@ def _patch_fsdp_checkpoint_manager() -> None:
 
     compat_custom_object_save._qwen3vl_compat_patch = True
     external_ckpt.custom_object_save = compat_custom_object_save
-    logger.warning("Patched VERL FSDP checkpoint manager custom_object_save guard.")
-
 
 def _resolve_latent_vae_state_dict(model) -> dict | None:
     """Find a latent_vae module through common model wrappers and return a CPU state dict."""
@@ -205,11 +198,7 @@ def _resolve_policy_latent_vae_state_dict(policy) -> dict | None:
 
 
 def _copy_vae_artifact_for_actor(self, local_path: str) -> None:
-    import os
-
-    import torch.distributed as dist
-    from safetensors.torch import save_file
-
+    global _VAE_ARTIFACT_LOGGED
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
     actor_model = getattr(self, "actor_module", None) or getattr(self, "actor_module_fsdp", None)
     vae_state_dict = _resolve_policy_latent_vae_state_dict(getattr(self, "actor", None))
@@ -242,7 +231,9 @@ def _copy_vae_artifact_for_actor(self, local_path: str) -> None:
                 save_file(vae_state_dict, output_path)
             else:
                 shutil.copy2(source_vae_path, output_path)
-        logger.warning("Saved latent VAE artifact(s) to %s", ", ".join(output_paths))
+        if not _VAE_ARTIFACT_LOGGED:
+            logger.warning("Saved latent VAE artifact(s) to %s", ", ".join(output_paths))
+            _VAE_ARTIFACT_LOGGED = True
 
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
@@ -286,8 +277,6 @@ def _patch_actor_checkpoint_save() -> None:
             del_local_after_load=del_local_after_load,
         )
         try:
-            from .continuous_replay import _restore_policy_latent_vae
-
             if getattr(self, "actor", None) is not None:
                 _restore_policy_latent_vae(self.actor, local_path)
             if getattr(self, "ref_policy", None) is not None:
@@ -300,8 +289,6 @@ def _patch_actor_checkpoint_save() -> None:
     compat_load_checkpoint.__dict__.update(original_load_checkpoint.__dict__)
     compat_load_checkpoint._qwen3vl_compat_patch = True
     worker_cls.load_checkpoint = compat_load_checkpoint
-    logger.warning("Patched VERL actor checkpoint save to preserve latent VAE artifacts.")
-
 
 def apply_runtime_compat_patches() -> None:
     """Apply repo-local compatibility patches for the active VERL stack."""
@@ -314,9 +301,7 @@ def apply_runtime_compat_patches() -> None:
     _patch_imported_runtime_aliases()
     _patch_ray_actor_runtime_env()
     _patch_fsdp_checkpoint_manager()
-    from .continuous_replay import apply_continuous_replay_patches
 
     apply_continuous_replay_patches()
     _patch_actor_checkpoint_save()
     _PATCHED = True
-    logger.warning("Applied repo-local VERL compatibility patches.")

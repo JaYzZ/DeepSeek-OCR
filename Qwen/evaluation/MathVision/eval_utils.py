@@ -1,5 +1,4 @@
 import os
-import re
 import requests
 import time
 import random
@@ -10,8 +9,10 @@ from PIL import Image
 from typing import List, Dict, Tuple, Any
 try:
     from .common_utils import encode_image_to_base64
+    from ..utils import normalize_chat_api_url, strip_thinking_tokens
 except ImportError:
     from common_utils import encode_image_to_base64
+    from utils import normalize_chat_api_url, strip_thinking_tokens
 from collections import defaultdict
 
 try:
@@ -23,32 +24,6 @@ except ImportError:
 FAIL_MSG = 'Failed to obtain answer via API.'
 JUDGE_PREDICTION_MAX_CHARS = int(os.environ.get("JUDGE_PREDICTION_MAX_CHARS", "40960"))
 
-
-def strip_thinking_tokens(prediction):
-    """Remove think/thinking wrapper blocks before sending text to judges."""
-    prediction_str = str(prediction)
-    block_patterns = [
-        r'<think>.*?</think>',
-        r'<thinking>.*?</thinking>',
-        r'<\|thinking\|>.*?<\|/thinking\|>',
-        r'<\|[^|]+\|>.*?<\|/[^|]+\|>',
-    ]
-    changed = True
-    while changed:
-        changed = False
-        for pattern in block_patterns:
-            updated = re.sub(pattern, '', prediction_str, flags=re.DOTALL | re.IGNORECASE)
-            if updated != prediction_str:
-                changed = True
-                prediction_str = updated
-
-    # Clean up malformed or repeated leftover thinking tags without dropping content.
-    prediction_str = re.sub(r'</?think>', '', prediction_str, flags=re.IGNORECASE)
-    prediction_str = re.sub(r'</?thinking>', '', prediction_str, flags=re.IGNORECASE)
-    prediction_str = re.sub(r'<\|/?thinking\|>', '', prediction_str, flags=re.IGNORECASE)
-    return prediction_str.strip()
-
-
 def tail_char_window(text: str, max_chars: int = JUDGE_PREDICTION_MAX_CHARS) -> str:
     """Keep only the last K characters to stay within judge context limits."""
     text = strip_thinking_tokens(text)
@@ -57,21 +32,6 @@ def tail_char_window(text: str, max_chars: int = JUDGE_PREDICTION_MAX_CHARS) -> 
     if len(text) <= max_chars:
         return text
     return text[-max_chars:]
-
-
-def shrink_char_window(current_budget: int) -> int:
-    """Reduce the tail char budget aggressively after a context-limit failure."""
-    if current_budget <= 256:
-        return current_budget
-    if current_budget > 4096:
-        return max(4096, current_budget // 2)
-    if current_budget > 2048:
-        return 2048
-    if current_budget > 1024:
-        return 1024
-    if current_budget > 512:
-        return 512
-    return 256
 
 
 def is_equal(asw: str, gt_asw: str) -> bool:
@@ -88,7 +48,7 @@ def is_equal(asw: str, gt_asw: str) -> bool:
         b = eval(asw)
         if abs(a - b) < 1e-6:
             return True
-    except (SyntaxError, NameError, TypeError, ValueError, ZeroDivisionError):
+    except Exception:
         pass
     if latex2sympy is not None:
         try:
@@ -98,7 +58,7 @@ def is_equal(asw: str, gt_asw: str) -> bool:
                 return True
             if abs(a - b) < 1e-6:
                 return True
-        except (SyntaxError, NameError, TypeError, ValueError, ZeroDivisionError):
+        except Exception:
             pass
     return False
 
@@ -235,7 +195,7 @@ def post_check(line, prefetch=False):
     """Check if the prediction matches the answer."""
     res = None
     ans = line['answer']
-    response = line['prediction'] if prefetch else line['res']
+    response = strip_thinking_tokens(line['prediction'] if prefetch else line['res'])
     try:
         if len(eval(line['choices'])) > 0:
             ans = line['answer']
@@ -361,130 +321,19 @@ class DashScopeWrapper:
         return self.fail_msg
 
 
-class CustomJudgeWrapper:
-    """Wrapper for custom judge server with question/reference/prediction format."""
-
-    def __init__(self, judge_server_url, timeout=60, retry=5, wait=5):
-        self.judge_server_url = judge_server_url
-        self.timeout = timeout
-        self.retry = retry
-        self.wait = wait
-        self.fail_msg = FAIL_MSG
-        self.model = 'CustomJudge'
-
-    def judge(self, question, reference, prediction):
-        """Send request to custom judge server (text only, no images)."""
-        payload = {
-            "question": str(question),
-            "reference": str(reference),
-            "prediction": "",
-        }
-
-        headers = {'Content-Type': 'application/json'}
-        char_budget = JUDGE_PREDICTION_MAX_CHARS
-
-        for i in range(self.retry):
-            try:
-                payload["prediction"] = tail_char_window(prediction, char_budget)
-                response = requests.post(
-                    f"{self.judge_server_url}/judge",
-                    headers=headers,
-                    json=payload,
-                    timeout=self.timeout
-                )
-
-                if response.status_code == 200:
-                    resp_json = response.json()
-                    if resp_json.get('success', False):
-                        correct = resp_json.get('correct', False)
-                        verdict = resp_json.get('verdict', 'UNKNOWN')
-
-                        if correct:
-                            # Return success indication
-                            return {'success': True, 'verdict': verdict, 'correct': correct}
-                        else:
-                            return {'success': False, 'verdict': verdict, 'correct': correct}
-                    else:
-                        print(f"Judge server error: {resp_json.get('error', 'Unknown error')}")
-                        char_budget = shrink_char_window(char_budget)
-                        time.sleep(self.wait)
-                elif response.status_code == 400 and "maximum context length" in response.text.lower():
-                    char_budget = shrink_char_window(char_budget)
-                    print(f"Judge server context overflow, retrying with last {char_budget} chars")
-                else:
-                    print(f"Judge server HTTP error: {response.status_code}")
-                    time.sleep(self.wait)
-            except Exception as e:
-                print(f"Judge server error: {e}")
-                time.sleep(self.wait)
-
-        return {'success': False, 'error': 'Failed after retries'}
-
-    def generate(self, prompt, temperature=0):
-        """Extract answer from prompt and call judge method.
-
-        The prompt format from build_mathv_gpt4_prompt is:
-        Question: <question>
-        Model response: <prediction>
-        Extracted answer:
-        """
-        # Parse the prompt to extract question and prediction
-        lines = prompt.strip().split('\n')
-
-        # Find the question (after "Question:" and before "Model response:")
-        question_start = None
-        model_response_idx = None
-
-        for i, line in enumerate(lines):
-            if line.startswith('Question:'):
-                # Question might be on the same line or next lines
-                if ':' in line:
-                    question_start = i
-                elif i + 1 < len(lines):
-                    question_start = i + 1
-                break
-            elif 'Model response:' in line:
-                model_response_idx = i + 1
-                break
-
-        if question_start is None or model_response_idx is None:
-            return self.fail_msg
-
-        # Extract question (might span multiple lines until "Model response:")
-        if question_start < model_response_idx:
-            question_lines = lines[question_start:model_response_idx]
-            question = '\n'.join(question_lines).strip()
-        else:
-            question = lines[question_start].replace('Question:', '').strip()
-
-        # Extract prediction (from "Model response:" to end)
-        prediction_lines = lines[model_response_idx:]
-        # Remove any "Extracted answer:" prefix if present
-        if prediction_lines and 'Extracted answer:' in prediction_lines[-1]:
-            prediction_lines = prediction_lines[:-1]
-        prediction = '\n'.join(prediction_lines).strip().replace('Model response:', '').strip()
-
-        # Get the reference answer from the line dict (stored when building eval tasks)
-        # This is a workaround - we need to access the line data somehow
-        # For now, we'll return fail_msg and let the rule-based method handle it
-        # Or we could store the answer in a class variable
-
-        # Since we can't access the reference from here without changing the interface,
-        # we'll try to use the judge() method if we can reconstruct the reference
-        # Otherwise, return fail_msg to fall back to rule-based extraction
-        return self.fail_msg
-
-
 def build_judge(model, api_type, api_url=None, api_key=None):
     """Build a judge model for evaluation."""
     if api_type == 'custom':
-        # Use custom judge server
-        judge_url = api_url or os.environ.get('JUDGE_SERVER_URL', 'http://47.111.147.142:8600')
-        print(f"Using custom judge server: {judge_url}")
-        return CustomJudgeWrapper(judge_url)
+        api_base = normalize_chat_api_url(
+            api_url or os.environ.get('JUDGE_SERVER_URL', 'http://47.111.147.142:8600')
+        )
+        api_key = api_key or os.environ.get('LOCAL_API_KEY', 'EMPTY')
+        print(f"Using custom extraction server: {api_base}")
+        return OpenAIWrapper(model, api_base, api_key)
     elif api_type == 'local':
-        # Use local OpenAI-compatible API
-        api_base = api_url or os.environ.get('LOCAL_API_URL', 'http://localhost:8016/v1/chat/completions')
+        api_base = normalize_chat_api_url(
+            api_url or os.environ.get('LOCAL_API_URL', 'http://localhost:8016/v1/chat/completions')
+        )
         api_key = api_key or os.environ.get('LOCAL_API_KEY', 'EMPTY')
         print(f"Using local API: {api_base}")
         return OpenAIWrapper(model, api_base, api_key)
@@ -507,27 +356,6 @@ def MATH_V_auxeval(args):
     log = ''
     retry = 5
 
-    # Handle CustomJudge differently - it judges directly, no extraction needed
-    if hasattr(model, 'judge') and callable(model.judge):
-        # CustomJudge: directly judge correctness
-        question = line['question']
-        reference = line['answer']
-        prediction = line['prediction']
-
-        result = model.judge(question, reference, prediction)
-
-        if result.get('success', False) and result.get('correct', False):
-            log += f'{model.model} judged as CORRECT.\n'
-            log += f'Verdict: {result.get("verdict", "N/A")}\n'
-            # For CustomJudge, return the reference as 'res' since it will be compared
-            return dict(log=log, res=reference, extract_model=model.model, extract_flag=True)
-        else:
-            log += f'{model.model} judged as INCORRECT.\n'
-            log += f'Verdict: {result.get("verdict", "N/A")}\n'
-            # Return empty string to indicate incorrect
-            return dict(log=log, res='', extract_model=model.model, extract_flag=False)
-
-    # OpenAI-style judges: Try rule-based extraction first
     if post_check(line, prefetch=True):
         res = post_check(line, prefetch=True)
         log += 'Prefetch succeed.\n'
@@ -539,7 +367,10 @@ def MATH_V_auxeval(args):
             log += f'Rule extract success with ans: {res}'
         return dict(log=log, res=res, extract_model='rule', extract_flag=extract_flag)
 
-    # Use model-based extraction for OpenAI-style judges
+    if model is None:
+        log += "Rule extract failed and no judge model specified; returning Z.\n"
+        return dict(log=log, res='Z', extract_model='none', extract_flag=False)
+
     for i in range(retry):
         prediction = line['prediction']
         res = model.generate(prompt, temperature=i * 0.5)
@@ -572,23 +403,13 @@ def MATH_V_acc(result_file):
         if 'Prefetch succeed' in item['log']:
             fetch['Overall'] += 1
             fetch[cate] += 1
-
-        # For CustomJudge, use extract_flag directly (judge already determined correctness)
-        # For others, use post_check to compare extracted answer with ground truth
-        extract_model = item.get('extract_model', '')
-        extract_flag = item.get('extract_flag', False)
-
-        if extract_model == 'CustomJudge':
-            # CustomJudge already determined correctness
-            if extract_flag:
-                hit['Overall'] += 1
-                hit[cate] += 1
-        elif post_check(item, prefetch=False):
-            # For other judges, verify extracted answer matches ground truth
+        if post_check(item, prefetch=False):
             hit['Overall'] += 1
             hit[cate] += 1
 
         # Statistics of answers extracted by rule and gpt
+        extract_model = item['extract_model']
+        extract_flag = item['extract_flag']
         if extract_model in extract_counts:
             extract_counts[extract_model][1] += 1
         else:

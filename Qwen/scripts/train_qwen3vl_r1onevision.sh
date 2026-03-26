@@ -13,6 +13,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+source "$SCRIPT_DIR/train_qwen3vl_dataset_mix.sh"
 
 # Required python interpreter (OCRFlow env)
 PYTHON_BIN="$REPO_ROOT/../../envs/ocrflow/bin/python"
@@ -160,6 +161,7 @@ _set_env_from_runtime "QWEN3VL_THINKING_START_ID" "thinking_start_id" "151667"
 _set_env_from_runtime "QWEN3VL_THINKING_END_ID" "thinking_end_id" "151668"
 _set_env_from_runtime "QWEN3VL_THINKING_SEP_ID" "thinking_sep_id" "151670"
 _set_env_from_runtime "QWEN3VL_LOSS_TYPE" "loss_type" "vae+ot+mse"
+_set_env_from_runtime "QWEN3VL_LATENT_AUX_LOSS_SOURCE" "latent_aux_loss_source" "vae_sample"
 _set_env_from_runtime "QWEN3VL_MATCH_STRATEGY" "match_strategy" "truncate"
 _set_env_from_runtime "QWEN3VL_MAX_NEW_TOKENS" "max_new_tokens" "40960"
 _set_env_from_runtime "QWEN3VL_VAE_INTERMEDIATE_SIZE" "vae_intermediate_size" "512"
@@ -187,20 +189,6 @@ RUN_BENCHMARK="$(_get_runtime_config "benchmark_enable" "0")"
 BENCHMARK_LIST="$(_get_runtime_config "benchmark_list" "MathVision,MMMU,RealWorldQA")"
 BENCHMARK_NUM_SAMPLES="$(_get_runtime_config "benchmark_num_samples" "100")"
 
-# Check dataset exists
-DATASET_JSONL="$REPO_ROOT/Qwen/data/r1ov_thinking.jsonl"
-if [ ! -f "$DATASET_JSONL" ]; then
-    echo "❌ Dataset not found: $DATASET_JSONL" >&2
-    echo "" >&2
-    echo "Please build the dataset first:" >&2
-    echo "  bash Qwen/scripts/build_r1_onevision_thinking.sh --encode-only --all" >&2
-    exit 1
-fi
-
-echo "✓ Dataset found: $DATASET_JSONL"
-echo "  Samples: $(wc -l < "$DATASET_JSONL")"
-echo ""
-
 # Generate timestamp for unique output directory
 TIMESTAMP="${QWEN3VL_TIMESTAMP:-$(date '+%Y%m%d_%H%M%S')}"
 DEFAULT_OUTDIR="$REPO_ROOT/Qwen/checkpoints/qwen3vl-2b/lora/r1_onevision_thinking/run_${TIMESTAMP}"
@@ -219,7 +207,7 @@ if [ "$HAS_OUTDIR" = false ]; then
   set -- "$@" "output_dir=$DEFAULT_OUTDIR"
 fi
 
-# Determine final output directory
+# Determine final run directory
 OUTPUT_DIR="$DEFAULT_OUTDIR"
 for arg in "$@"; do
   if [[ "$arg" == output_dir=* ]]; then
@@ -227,6 +215,59 @@ for arg in "$@"; do
     break
   fi
 done
+RUN_DIR="$OUTPUT_DIR"
+CKPT_DIR="$RUN_DIR"
+
+# Resolve requested dataset(s) from config + CLI overrides.
+DATASET_SPEC="$(_get_main_config "dataset" || echo "")"
+DATASET_DIR="$(_get_main_config "dataset_dir" "$REPO_ROOT/Qwen/data")"
+DATASET_STREAMING="$(_get_main_config "streaming" "false")"
+DATASET_MIX_STRATEGY="$(_get_main_config "mix_strategy" "concat")"
+for arg in "$@"; do
+  if [[ "$arg" == dataset=* ]]; then
+    DATASET_SPEC="${arg#dataset=}"
+  elif [[ "$arg" == dataset_dir=* ]]; then
+    DATASET_DIR="${arg#dataset_dir=}"
+  elif [[ "$arg" == streaming=* ]]; then
+    DATASET_STREAMING="${arg#streaming=}"
+  elif [[ "$arg" == mix_strategy=* ]]; then
+    DATASET_MIX_STRATEGY="${arg#mix_strategy=}"
+  fi
+done
+
+if [ -z "$DATASET_SPEC" ]; then
+  echo "❌ No dataset specified in config or CLI override (dataset=...)" >&2
+  exit 1
+fi
+
+if [[ ! "$DATASET_DIR" = /* ]]; then
+  DATASET_DIR="$REPO_ROOT/$DATASET_DIR"
+fi
+
+mkdir -p "$RUN_DIR"
+eval "$(qwen3vl_materialize_dataset_mix "$PYTHON_BIN" "$DATASET_DIR" "$DATASET_SPEC" "$RUN_DIR")"
+DATASET_SPEC="$QWEN3VL_EFFECTIVE_DATASET_SPEC"
+DATASET_DIR="$QWEN3VL_EFFECTIVE_DATASET_DIR"
+DATASET_RATIO_APPLIED="${QWEN3VL_DATASET_RATIO_APPLIED:-0}"
+DATASET_MIX_SUMMARY_PATH="${QWEN3VL_DATASET_MIX_SUMMARY_PATH:-}"
+DATASET_COUNT="${QWEN3VL_DATASET_COUNT:-1}"
+
+if [ "$DATASET_COUNT" -gt 1 ]; then
+  case "${DATASET_STREAMING,,}" in
+    1|true|yes)
+      echo "❌ Multi-dataset SFT requires streaming=false so the merged dataset can be jointly shuffled." >&2
+      exit 1
+      ;;
+  esac
+  if [[ -z "$DATASET_MIX_STRATEGY" || "$DATASET_MIX_STRATEGY" == "null" ]]; then
+    DATASET_MIX_STRATEGY="concat"
+  fi
+fi
+
+set -- "$@" "dataset=$DATASET_SPEC" "dataset_dir=$DATASET_DIR"
+if [ "$DATASET_COUNT" -gt 1 ]; then
+  set -- "$@" "mix_strategy=$DATASET_MIX_STRATEGY"
+fi
 
 USE_SWANLAB_CONFIG="$(_get_main_config "use_swanlab" || echo "false")"
 SWANLAB_RUN_NAME=""
@@ -245,7 +286,7 @@ if [[ "$USE_SWANLAB_CONFIG" == "true" || "$USE_SWANLAB_CONFIG" == "True" || "$US
     fi
   done
   if [ "$HAS_SWANLAB_RUN_NAME" = false ]; then
-    SWANLAB_RUN_NAME="$(basename "$OUTPUT_DIR")"
+    SWANLAB_RUN_NAME="$(basename "$RUN_DIR")"
     set -- "$@" "swanlab_run_name=$SWANLAB_RUN_NAME"
   fi
 else
@@ -253,19 +294,55 @@ else
 fi
 
 # Setup logging
-mkdir -p "$OUTPUT_DIR"
-_snapshot_run_configs "$OUTPUT_DIR"
-CONFIG_PATH="$OUTPUT_DIR/$(basename "$CONFIG_PATH")"
-QWEN3VL_RUNTIME_ENV_CONFIG="$OUTPUT_DIR/$(basename "$QWEN3VL_RUNTIME_ENV_CONFIG")"
-RERUN_EVALS_SH="$OUTPUT_DIR/rerun_evals.sh"
+mkdir -p "$RUN_DIR" "$CKPT_DIR"
+_snapshot_run_configs "$RUN_DIR"
+CONFIG_PATH="$RUN_DIR/$(basename "$CONFIG_PATH")"
+QWEN3VL_RUNTIME_ENV_CONFIG="$RUN_DIR/$(basename "$QWEN3VL_RUNTIME_ENV_CONFIG")"
+RERUN_EVALS_SH="$RUN_DIR/rerun_evals.sh"
 cat > "$RERUN_EVALS_SH" <<EOF
 #!/bin/bash
 set -euo pipefail
-QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" CUDA_VISIBLE_DEVICES=\${BACKFILL_CUDA_VISIBLE_DEVICES:-0} $PYTHON_BIN Qwen/scripts/backfill_transparent_eval.py --checkpoint_dir "$OUTPUT_DIR" --checkpoint checkpoint_latest --gpu_memory_utilization \${GPU_MEMORY_UTILIZATION:-0.9} 2>&1 | tee \${BACKFILL_LOG:-/tmp/backfill_thinking_debug.log}
-QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" VLLM_FORCE_THINK=$VLLM_FORCE_THINK CUDA_VISIBLE_DEVICES=\${BENCH_CUDA_VISIBLE_DEVICES:-\${CUDA_VISIBLE_DEVICES:-0}} $PYTHON_BIN Qwen/evaluation/run_all_benchmarks.py --start-server --benchmarks \${BENCHMARKS:-MathVision,MMMU,RealWorldQA} --lora-path "$OUTPUT_DIR/checkpoint_latest"
+
+GPUS=""
+BACKFILL_GPUS=""
+BENCH_GPUS=""
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    --gpus)
+      GPUS="\$2"
+      shift 2
+      ;;
+    --backfill-gpus)
+      BACKFILL_GPUS="\$2"
+      shift 2
+      ;;
+    --bench-gpus)
+      BENCH_GPUS="\$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: \$1" >&2
+      echo "Usage: \$0 [--gpus 0,1,2,3] [--backfill-gpus 0,1] [--bench-gpus 0,1,2,3]" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -n "\$GPUS" ]]; then
+  BACKFILL_GPUS="\$GPUS"
+  BENCH_GPUS="\$GPUS"
+fi
+
+BACKFILL_GPUS="\${BACKFILL_GPUS:-\${BACKFILL_CUDA_VISIBLE_DEVICES:-\${CUDA_VISIBLE_DEVICES:-0}}}"
+BENCH_GPUS="\${BENCH_GPUS:-\${BENCH_CUDA_VISIBLE_DEVICES:-\${CUDA_VISIBLE_DEVICES:-\$BACKFILL_GPUS}}}"
+
+QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" CUDA_VISIBLE_DEVICES="\$BACKFILL_GPUS" $PYTHON_BIN Qwen/scripts/backfill_transparent_eval.py --checkpoint_dir "$CKPT_DIR" --checkpoint checkpoint_latest --gpu_memory_utilization \${GPU_MEMORY_UTILIZATION:-0.9} 2>&1 | tee \${BACKFILL_LOG:-/tmp/backfill_thinking_debug.log}
+BENCH_DIR="$RUN_DIR/bench"
+mkdir -p "\$BENCH_DIR"
+QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" VLLM_FORCE_THINK=$VLLM_FORCE_THINK CUDA_VISIBLE_DEVICES="\$BENCH_GPUS" $PYTHON_BIN Qwen/evaluation/run_all_benchmarks.py --start-server --gpus "\$BENCH_GPUS" --benchmarks \${BENCHMARKS:-MathVision,MMMU,RealWorldQA} --num-samples \${BENCHMARK_NUM_SAMPLES:-$BENCHMARK_NUM_SAMPLES} --lora-path "$CKPT_DIR/checkpoint_latest" --run-dir "\$BENCH_DIR"
 EOF
 chmod +x "$RERUN_EVALS_SH"
-LOG_FILE="$OUTPUT_DIR/training.log"
+LOG_FILE="$RUN_DIR/training.log"
 
 echo "Logging to: $LOG_FILE"
 echo ""
@@ -351,8 +428,24 @@ echo "========================================================================"
 echo "Training Type: $TRAINING_TYPE"
 echo "Distributed Backend: $([ "$USE_DEEPSPEED" = true ] && echo "DeepSpeed" || ([ "$USE_FSDP" = true ] && echo "FSDP" || echo "Unknown"))"
 echo "Config: $CONFIG_PATH"
-echo "Dataset: $DATASET_JSONL"
+echo "Run dir: $RUN_DIR"
+echo "Checkpoint dir: $CKPT_DIR"
+echo "Dataset(s): $DATASET_SPEC"
+echo "Dataset dir: $DATASET_DIR"
 echo "GPUs: $CUDA_VISIBLE_DEVICES"
+echo ""
+echo "Dataset Mixing:"
+echo "  - Entries: $DATASET_COUNT"
+echo "  - Ratio parsing: $([ "$DATASET_RATIO_APPLIED" = "1" ] && echo "enabled" || echo "disabled")"
+echo "  - Mix strategy: ${DATASET_MIX_STRATEGY:-concat}"
+if [ "${DATASET_MIX_STRATEGY:-concat}" = "concat" ]; then
+  echo "  - Joint shuffle: enabled via concat + Trainer random sampler"
+else
+  echo "  - Joint shuffle: Trainer random sampler enabled; mix ordering follows ${DATASET_MIX_STRATEGY}"
+fi
+if [ -n "$DATASET_MIX_SUMMARY_PATH" ]; then
+  echo "  - Summary: $DATASET_MIX_SUMMARY_PATH"
+fi
 echo ""
 echo "Latent Supervision:"
 echo "  - Enabled: $QWEN3VL_LATENT_SUPERVISION"
@@ -390,32 +483,47 @@ fi
 echo "========================================================================"
 echo ""
 
-_log_wrapper_status "wrapper_start config=$CONFIG_PATH output_dir=$OUTPUT_DIR cuda_visible_devices=$CUDA_VISIBLE_DEVICES run_backfill=$RUN_BACKFILL run_benchmark=$RUN_BENCHMARK"
+_log_wrapper_status "wrapper_start config=$CONFIG_PATH run_dir=$RUN_DIR ckpt_dir=$CKPT_DIR cuda_visible_devices=$CUDA_VISIBLE_DEVICES run_backfill=$RUN_BACKFILL run_benchmark=$RUN_BENCHMARK"
 
 # Run llamafactory CLI with tee for logging
 # Use PIPESTATUS to preserve exit code from llamafactory-cli
 NPROC_PER_NODE_DEFAULT="$(echo "$CUDA_VISIBLE_DEVICES" | awk -F, '{print NF}')"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-$NPROC_PER_NODE_DEFAULT}"
 
+TRAIN_ARGS=()
+for arg in "$@"; do
+    if [[ "$arg" == output_dir=* ]]; then
+        continue
+    fi
+    TRAIN_ARGS+=("$arg")
+done
+TRAIN_ARGS+=("output_dir=$CKPT_DIR")
+
 # Run training
 # FSDP: Direct Python call (LlamaFactory handles torchrun internally)
 # DeepSpeed: Use torchrun explicitly
 if [ "$USE_DEEPSPEED" = true ]; then
+    set +e
     torchrun \
       --standalone \
       --nproc_per_node="$NPROC_PER_NODE" \
-      -m llamafactory.cli train "$CONFIG_PATH" "$@" 2>&1 | tee -a "$LOG_FILE"
+      -m llamafactory.cli train "$CONFIG_PATH" "${TRAIN_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
+    exit_code=${PIPESTATUS[0]}
+    set -e
 else
-    "$PYTHON_BIN" -m llamafactory.cli train "$CONFIG_PATH" "$@" 2>&1 | tee -a "$LOG_FILE"
+    set +e
+    "$PYTHON_BIN" -m llamafactory.cli train "$CONFIG_PATH" "${TRAIN_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
+    exit_code=${PIPESTATUS[0]}
+    set -e
 fi
-exit_code=${PIPESTATUS[0]}
 _log_wrapper_status "training_finished exit_code=$exit_code"
+train_exit_code=$exit_code
 
 # ============================================================================
 # Post-training: Run backfill transparent eval on all checkpoints
 # Uses all training GPUs in parallel (round-robin, M jobs at a time)
 # ============================================================================
-if [ "$exit_code" -eq 0 ] && [ "$RUN_BACKFILL" = "1" ]; then
+if [ "$train_exit_code" -eq 0 ] && [ "$RUN_BACKFILL" = "1" ]; then
     _log_wrapper_status "backfill_gate entered exit_code=$exit_code run_backfill=$RUN_BACKFILL"
     echo ""
     echo "========================================================================"
@@ -429,7 +537,7 @@ if [ "$exit_code" -eq 0 ] && [ "$RUN_BACKFILL" = "1" ]; then
 
     # Find all checkpoints that need backfill
     CHECKPOINT_LIST=()
-    for CHECKPOINT in $(ls -td "$OUTPUT_DIR"/checkpoint-* 2>/dev/null | sort -V); do
+    for CHECKPOINT in $(ls -td "$CKPT_DIR"/checkpoint-* 2>/dev/null | sort -V); do
         CHECKPOINT_NAME=$(basename "$CHECKPOINT")
 
         # Skip if already has results
@@ -450,9 +558,12 @@ if [ "$exit_code" -eq 0 ] && [ "$RUN_BACKFILL" = "1" ]; then
     else
         _log_wrapper_status "backfill_launch starting"
         echo "Found $NUM_CHECKPOINTS checkpoints to backfill (running $NUM_GPUS at a time)"
+        backfill_failed=0
 
         # Run in batches of NUM_GPUS
         for ((i=0; i<NUM_CHECKPOINTS; i+=NUM_GPUS)); do
+            BATCH_PIDS=()
+            BATCH_CHECKPOINTS=()
             # Launch jobs for this batch (one per GPU)
             for ((j=0; j<NUM_GPUS && i+j<NUM_CHECKPOINTS; j++)); do
                 idx=$((i+j))
@@ -464,34 +575,53 @@ if [ "$exit_code" -eq 0 ] && [ "$RUN_BACKFILL" = "1" ]; then
 
                 # Run backfill in background with specific GPU
                 (
-                    echo "[$(date '+%F %T')] Start $checkpoint_name on GPU $gpu_id" >> "$OUTPUT_DIR/backfill_all_checkpoints.log"
+                    echo "[$(date '+%F %T')] Start $checkpoint_name on GPU $gpu_id" >> "$RUN_DIR/backfill_all_checkpoints.log"
                     if QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" CUDA_VISIBLE_DEVICES="$gpu_id" "$PYTHON_BIN" Qwen/scripts/backfill_transparent_eval.py \
-                        --checkpoint_dir "$OUTPUT_DIR" \
+                        --checkpoint_dir "$CKPT_DIR" \
                         --checkpoint "$checkpoint_name" \
                         --gpu_memory_utilization 0.9 \
-                        >> "$OUTPUT_DIR/backfill_all_checkpoints.log" 2>&1; then
-                        if ls "$OUTPUT_DIR/${checkpoint_name}/eval_results"/backfill_*.json >/dev/null 2>&1; then
-                            echo "[$(date '+%F %T')] $checkpoint_name: Completed!" >> "$OUTPUT_DIR/backfill_all_checkpoints.log"
+                        >> "$RUN_DIR/backfill_all_checkpoints.log" 2>&1; then
+                        if ls "$CKPT_DIR/${checkpoint_name}/eval_results"/backfill_*.json >/dev/null 2>&1; then
+                            echo "[$(date '+%F %T')] $checkpoint_name: Completed!" >> "$RUN_DIR/backfill_all_checkpoints.log"
+                            exit 0
                         else
-                            echo "[$(date '+%F %T')] $checkpoint_name: Python succeeded but no backfill_*.json generated" >> "$OUTPUT_DIR/backfill_all_checkpoints.log"
+                            echo "[$(date '+%F %T')] $checkpoint_name: Python succeeded but no backfill_*.json generated" >> "$RUN_DIR/backfill_all_checkpoints.log"
+                            exit 1
                         fi
                     else
                         code=$?
-                        echo "[$(date '+%F %T')] $checkpoint_name: Failed with exit code $code" >> "$OUTPUT_DIR/backfill_all_checkpoints.log"
+                        echo "[$(date '+%F %T')] $checkpoint_name: Failed with exit code $code" >> "$RUN_DIR/backfill_all_checkpoints.log"
+                        exit "$code"
                     fi
                 ) &
+                BATCH_PIDS+=($!)
+                BATCH_CHECKPOINTS+=("$checkpoint_name")
             done
 
             # Wait for this batch to finish before starting next batch
-            wait || true
+            for batch_idx in "${!BATCH_PIDS[@]}"; do
+                pid="${BATCH_PIDS[$batch_idx]}"
+                checkpoint_name="${BATCH_CHECKPOINTS[$batch_idx]}"
+                if ! wait "$pid"; then
+                    backfill_failed=1
+                    _log_wrapper_status "backfill_checkpoint_failed checkpoint=$checkpoint_name"
+                fi
+            done
         done
 
         _log_wrapper_status "backfill_launch complete"
         echo ""
-        echo "Backfill complete! Results saved to $OUTPUT_DIR/eval_results/"
+        echo "Backfill complete! Results saved under $CKPT_DIR/checkpoint-*/eval_results/"
+        if [ "$backfill_failed" -ne 0 ]; then
+            _log_wrapper_status "backfill_finished status=failed"
+            echo "⚠️  One or more backfill jobs failed. See $RUN_DIR/backfill_all_checkpoints.log"
+            exit_code=1
+        else
+            _log_wrapper_status "backfill_finished status=ok"
+        fi
     fi
 else
-    _log_wrapper_status "backfill_gate skipped exit_code=$exit_code run_backfill=$RUN_BACKFILL"
+    _log_wrapper_status "backfill_gate skipped exit_code=$train_exit_code run_backfill=$RUN_BACKFILL"
 fi
 
 cleanup_vllm_benchmark_processes() {
@@ -499,14 +629,15 @@ cleanup_vllm_benchmark_processes() {
     pkill -9 -f "VLLM::EngineCore" || true
 }
 
-if [ "$exit_code" -eq 0 ] && [ "$RUN_BENCHMARK" = "1" ]; then
-    _log_wrapper_status "benchmark_gate entered exit_code=$exit_code run_benchmark=$RUN_BENCHMARK"
-    LATEST_CHECKPOINT="$(ls -td "$OUTPUT_DIR"/checkpoint-* 2>/dev/null | sort -V | tail -n 1 || true)"
+if [ "$train_exit_code" -eq 0 ] && [ "$RUN_BENCHMARK" = "1" ]; then
+    _log_wrapper_status "benchmark_gate entered exit_code=$train_exit_code run_benchmark=$RUN_BENCHMARK"
+    cleanup_vllm_benchmark_processes
+    LATEST_CHECKPOINT="$(ls -td "$CKPT_DIR"/checkpoint-* 2>/dev/null | sort -V | tail -n 1 || true)"
     if [ -z "${LATEST_CHECKPOINT:-}" ] || [ ! -d "$LATEST_CHECKPOINT" ]; then
         _log_wrapper_status "benchmark_skip reason=no_checkpoint"
-        echo "⚠️  Benchmark skipped: no checkpoint-* found in $OUTPUT_DIR"
+        echo "⚠️  Benchmark skipped: no checkpoint-* found in $CKPT_DIR"
     else
-        BENCH_DIR="$OUTPUT_DIR/bench"
+        BENCH_DIR="$RUN_DIR/bench"
         mkdir -p "$BENCH_DIR"
         BENCH_GPUS="$CUDA_VISIBLE_DEVICES"
         if [ -n "${BENCHMARK_GPUS:-}" ] && [ "$BENCHMARK_GPUS" != "$CUDA_VISIBLE_DEVICES" ]; then
@@ -522,6 +653,7 @@ if [ "$exit_code" -eq 0 ] && [ "$RUN_BENCHMARK" = "1" ]; then
         echo "  - Output dir: $BENCH_DIR"
         echo "========================================================================"
 
+        set +e
         QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" "$PYTHON_BIN" -u Qwen/evaluation/run_all_benchmarks.py \
             --start-server \
             --benchmarks "$BENCHMARK_LIST" \
@@ -530,6 +662,7 @@ if [ "$exit_code" -eq 0 ] && [ "$RUN_BENCHMARK" = "1" ]; then
             --gpus "$BENCH_GPUS" \
             --run-dir "$BENCH_DIR"
         bench_exit_code=$?
+        set -e
         _log_wrapper_status "benchmark_finished exit_code=$bench_exit_code latest_checkpoint=$LATEST_CHECKPOINT"
         if [ "$bench_exit_code" -ne 0 ]; then
             echo "⚠️  Benchmark failed with exit code $bench_exit_code"
@@ -537,7 +670,7 @@ if [ "$exit_code" -eq 0 ] && [ "$RUN_BENCHMARK" = "1" ]; then
         fi
     fi
 else
-    _log_wrapper_status "benchmark_gate skipped exit_code=$exit_code run_benchmark=$RUN_BENCHMARK"
+    _log_wrapper_status "benchmark_gate skipped exit_code=$train_exit_code run_benchmark=$RUN_BENCHMARK"
 fi
 
 cleanup_vllm_benchmark_processes

@@ -38,7 +38,10 @@ _REPO_ROOT = _EVAL_DIR.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(_EVAL_DIR))
 from config import get_data_path, QWEN3_VL_2B_THINKING
+from utils import select_compatible_tensor_parallel_gpus
 from Qwen.scripts.vllm_utils import apply_runtime_env_for_thinking
+
+LOCAL_JUDGE_DEFAULT_MODEL = "/share/project/xiyan/huggingface/Qwen/Qwen2.5-VL-7B-Instruct"
 
 
 def _get_runtime_yaml_value(key: str, default):
@@ -168,6 +171,144 @@ def normalize_run_path(path: str | Path) -> str:
     if not path.is_absolute():
         path = (_REPO_ROOT / path).resolve()
     return str(path)
+
+
+_TOKENIZER_CACHE: dict[str, object] = {}
+
+
+def _load_counting_tokenizer(model_path: str):
+    model_path = normalize_run_path(model_path)
+    if model_path in _TOKENIZER_CACHE:
+        return _TOKENIZER_CACHE[model_path]
+    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None and hasattr(processor, "encode"):
+        tokenizer = processor
+    _TOKENIZER_CACHE[model_path] = tokenizer
+    return tokenizer
+
+
+def _count_text_tokens(tokenizer, text: str) -> int:
+    if tokenizer is None:
+        return 0
+    try:
+        return len(tokenizer.encode(str(text), add_special_tokens=False))
+    except Exception:
+        return 0
+
+
+def _split_generation_sections(raw_text: str, answer_text: str) -> tuple[str, str]:
+    raw = str(raw_text or "")
+    answer = str(answer_text or "").strip()
+    if "</think>" in raw:
+        thinking_part, answer_part = raw.rsplit("</think>", 1)
+        return thinking_part + "</think>", answer_part.strip()
+    if answer and raw.endswith(answer):
+        return raw[: -len(answer)], answer
+    return "", answer or raw
+
+
+def _get_inference_file(run_dir: str, benchmark: str) -> str | None:
+    candidates = {
+        "MMMU": ["mmmu_inference.jsonl"],
+        "MathVision": ["mathvision_inference.jsonl"],
+        "RealWorldQA": ["realworldqa_inference.jsonl"],
+        "ODinW-13": ["odinw_inference.jsonl"],
+    }.get(benchmark, [])
+    for name in candidates:
+        path = Path(run_dir) / name
+        if path.exists():
+            return str(path)
+    return None
+
+
+def collect_benchmark_token_stats(run_dir: str, benchmark: str, model_path: str) -> Dict:
+    inference_file = _get_inference_file(run_dir, benchmark)
+    if not inference_file or not os.path.exists(inference_file):
+        return {}
+
+    tokenizer = _load_counting_tokenizer(model_path)
+    sample_count = 0
+    total_tokens = 0
+    thinking_tokens = 0
+    answer_tokens = 0
+
+    with open(inference_file, "r") as f:
+        for line in f:
+            row = json.loads(line)
+            result = row.get("result", {}) or {}
+            raw_text = result.get("gen_raw", "")
+            answer_text = result.get("gen", "")
+            thinking_text, final_answer_text = _split_generation_sections(raw_text, answer_text)
+
+            total_tokens += _count_text_tokens(tokenizer, raw_text)
+            thinking_tokens += _count_text_tokens(tokenizer, thinking_text)
+            answer_tokens += _count_text_tokens(tokenizer, final_answer_text)
+            sample_count += 1
+
+    if sample_count == 0:
+        return {}
+
+    return {
+        "samples": sample_count,
+        "avg_generated_tokens": total_tokens / sample_count,
+        "avg_thinking_tokens": thinking_tokens / sample_count,
+        "avg_answer_tokens": answer_tokens / sample_count,
+    }
+
+
+def find_available_port(start_port: int, search_span: int = 100) -> int:
+    for port in range(start_port, start_port + search_span):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(("", port))
+                sock.listen(1)
+                return port
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                continue
+            raise
+    return start_port
+
+
+def stop_managed_process(
+    process: subprocess.Popen | None,
+    label: str,
+    logger: "BenchmarkLogger" = None,
+) -> None:
+    if process is None:
+        return
+
+    print(f"\nStopping {label} (PID: {process.pid})...")
+    if logger:
+        logger.log(f"Stopping {label} (PID: {process.pid})")
+    try:
+        if os.name != "nt":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+        process.wait(timeout=30)
+    except Exception as exc:
+        warn_msg = f"Warning: Error stopping {label}: {exc}"
+        print(warn_msg)
+        if logger:
+            logger.log(warn_msg)
+        try:
+            if os.name != "nt":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except Exception as kill_err:
+            warn_msg = f"Warning: Failed to force-kill {label} process {process.pid}: {kill_err}"
+            print(warn_msg)
+            if logger:
+                logger.log(warn_msg)
+    print(f"✓ {label} stopped")
+
+
+def requires_judge(benchmark: str) -> bool:
+    return benchmark != "ODinW-13"
 
 
 def run_unified_inference(
@@ -367,22 +508,37 @@ def run_server_inference(
         traceback.print_exc()
         return {}
 
-    # Import benchmark-specific functions
-    sys.path.insert(0, str(Path(__file__).parent))
+    try:
+        # Many dataset utilities expect LMUData to be set. Default to evaluation's data dir.
+        os.environ.setdefault("LMUData", str(Path(__file__).parent / "data"))
 
-    # Many dataset utilities expect LMUData to be set. Default to evaluation's data dir.
-    os.environ.setdefault("LMUData", str(Path(__file__).parent / "data"))
+        # Import through the full package path so relative imports inside benchmark modules work.
+        from Qwen.evaluation.MathVision.dataset_utils import (
+            load_dataset as load_mathv_dataset,
+            dump_image as mathv_dump_image,
+        )
+        from Qwen.evaluation.MathVision.run_mathv import build_mathv_prompt
+        from Qwen.evaluation.mmmu.dataset_utils import (
+            load_dataset as load_mmmu_dataset,
+            dump_image as mmmu_dump_image,
+        )
+        from Qwen.evaluation.mmmu.run_mmmu import build_mmmu_prompt
+        from Qwen.evaluation.RealWorldQA.dataset_utils import (
+            load_dataset as load_realworldqa_dataset,
+            dump_image as realworldqa_dump_image,
+        )
+        from Qwen.evaluation.RealWorldQA.run_realworldqa import build_realworldqa_prompt
 
-    from MathVision.dataset_utils import load_dataset as load_mathv_dataset, dump_image as mathv_dump_image
-    from MathVision.run_mathv import build_mathv_prompt
-    from mmmu.dataset_utils import load_dataset as load_mmmu_dataset, dump_image as mmmu_dump_image
-    from mmmu.run_mmmu import build_mmmu_prompt
-    from RealWorldQA.dataset_utils import load_dataset as load_realworldqa_dataset, dump_image as realworldqa_dump_image
-    from RealWorldQA.run_realworldqa import build_realworldqa_prompt
-
-    # Load processor
-    model_path = server_info.get("model", QWEN3_VL_2B_THINKING)
-    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+        # Load processor
+        model_path = server_info.get("model", QWEN3_VL_2B_THINKING)
+        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    except Exception as e:
+        print(f"Failed during server inference setup: {e}")
+        traceback.print_exc()
+        if logger:
+            logger.log(f"Error: server inference setup failed: {e}")
+            logger.log(traceback.format_exc(), to_console=False)
+        return {}
 
     output_files = {}
 
@@ -787,6 +943,7 @@ def run_evaluation(
     input_file: str,
     run_dir: str,
     num_samples: int,
+    judge_url: str = None,
     data_dir: str = None,
     logger: "BenchmarkLogger" = None
 ) -> Tuple[bool, str]:
@@ -848,8 +1005,12 @@ def run_evaluation(
     input_file = normalize_run_path(input_file)
     output_file = normalize_run_path(Path(run_dir) / config["output"])
 
-    # Get judge server URL from environment
-    judge_url = os.environ.get('JUDGE_SERVER_URL', 'http://47.111.147.142:8600')
+    # Always use the local judge server selected by the driver for judge-based benchmarks.
+    if benchmark != "ODinW-13" and not judge_url:
+        judge_url = os.environ.get("JUDGE_SERVER_URL")
+    if benchmark != "ODinW-13" and not judge_url:
+        print(f"Error: Local judge URL not configured for {benchmark}")
+        return False, ""
 
     cmd = [
         sys.executable,
@@ -1092,6 +1253,13 @@ def generate_summary(run_dir: str, results: Dict[str, Dict]) -> str:
                             except Exception:
                                 f.write(f"- {split}: {acc}\n")
                         f.write("\n")
+                token_stats = result.get("token_stats")
+                if token_stats:
+                    f.write("**Average Generated Tokens per Sample**:\n\n")
+                    f.write(f"- total: {token_stats['avg_generated_tokens']:.2f}\n")
+                    f.write(f"- thinking: {token_stats['avg_thinking_tokens']:.2f}\n")
+                    f.write(f"- answer: {token_stats['avg_answer_tokens']:.2f}\n")
+                    f.write(f"- samples: {token_stats['samples']}\n\n")
             else:
                 f.write("No detailed metrics available.\n\n")
 
@@ -1158,34 +1326,20 @@ def start_vllm_server(
     Returns:
         Tuple of (Server URL, Process) or (None, None) on failure
     """
-    # Find free port
-    def find_free_port(start_port):
-        for port in range(start_port, start_port + 100):
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    s.bind(('', port))
-                    # Also verify we can connect to it
-                    s.listen(1)
-                    return port
-            except OSError as e:
-                if e.errno == errno.EADDRINUSE:
-                    continue
-                raise
-        return start_port
-
     # Always find a free port to avoid conflicts
-    port = find_free_port(port)
+    port = find_available_port(port)
     print(f"Using port: {port}")
 
     server_url = f"http://localhost:{port}"
-    tensor_parallel_size = len(gpus)
+    server_gpus, tensor_parallel_size = select_compatible_tensor_parallel_gpus(model_path, gpus)
+    if not server_gpus:
+        server_gpus = list(gpus)
 
     if logger:
         logger.log_section("STARTING vLLM SERVER")
         logger.log(f"Model: {model_path}")
         logger.log(f"LoRA: {lora_path}")
-        logger.log(f"GPUs: {gpus}")
+        logger.log(f"GPUs: {server_gpus}")
         logger.log(f"Tensor parallel: {tensor_parallel_size}")
         logger.log(f"GPU memory util: {gpu_memory_utilization}")
         logger.log(f"Port: {port}")
@@ -1195,7 +1349,7 @@ def start_vllm_server(
     print(f"{'='*80}")
     print(f"Model: {model_path}")
     print(f"LoRA: {lora_path}")
-    print(f"GPUs: {gpus}")
+    print(f"GPUs: {server_gpus}")
     print(f"Tensor parallel: {tensor_parallel_size}")
     print(f"GPU memory util: {gpu_memory_utilization}")
     print(f"Port: {port}")
@@ -1224,7 +1378,7 @@ def start_vllm_server(
 
     # Set environment - CRITICAL: pass GPU IDs to server
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, server_gpus))
     if lora_path:
         env["VLLM_LORA_CHECKPOINT_PATH"] = lora_path
 
@@ -1297,6 +1451,100 @@ def start_vllm_server(
         return None, None
 
     return server_url, process
+
+
+def start_local_judge_server(
+    gpus: List[int],
+    port: int = 8600,
+    logger: "BenchmarkLogger" = None,
+) -> Tuple[str | None, subprocess.Popen | None]:
+    model_path = normalize_run_path(
+        os.environ.get("JUDGE_MODEL_PATH", LOCAL_JUDGE_DEFAULT_MODEL)
+    )
+    gpu_memory_utilization = float(os.environ.get("LOCAL_JUDGE_GPU_MEMORY_UTILIZATION", "0.9"))
+    max_model_len = int(os.environ.get("LOCAL_JUDGE_MAX_MODEL_LEN", "32768"))
+    judge_gpus, tensor_parallel_size = select_compatible_tensor_parallel_gpus(model_path, gpus)
+    if not judge_gpus:
+        judge_gpus = list(gpus)
+    port = find_available_port(port)
+    judge_url = f"http://127.0.0.1:{port}"
+    script_path = Path(__file__).parent / "judge_server.py"
+
+    if logger:
+        logger.log_section("STARTING LOCAL JUDGE SERVER")
+        logger.log(f"Judge model: {model_path}")
+        logger.log(f"GPUs: {judge_gpus}")
+        logger.log(f"Tensor parallel: {tensor_parallel_size}")
+        logger.log(f"GPU memory util: {gpu_memory_utilization}")
+        logger.log(f"Max model len: {max_model_len}")
+        logger.log(f"Port: {port}")
+
+    print(f"\n{'='*80}")
+    print("Starting local judge server...")
+    print(f"{'='*80}")
+    print(f"Model: {model_path}")
+    print(f"GPUs: {judge_gpus}")
+    print(f"Tensor parallel: {tensor_parallel_size}")
+    print(f"GPU memory util: {gpu_memory_utilization}")
+    print(f"Max model len: {max_model_len}")
+    print(f"Port: {port}")
+    print(f"{'='*80}\n")
+
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--model-path", model_path,
+        "--port", str(port),
+        "--tensor-parallel-size", str(tensor_parallel_size),
+        "--gpu-memory-utilization", str(gpu_memory_utilization),
+        "--max-model-len", str(max_model_len),
+    ]
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, judge_gpus))
+
+    process = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        cwd=str(Path(__file__).parent.parent.parent),
+        start_new_session=True,
+    )
+
+    print(f"Judge server process started (PID: {process.pid})")
+
+    output_lines = deque(maxlen=400)
+
+    def stream_output():
+        for line in process.stdout:
+            print(f"  [judge] {line.rstrip()}")
+            output_lines.append(line)
+
+    stream_thread = threading.Thread(target=stream_output, daemon=True)
+    stream_thread.start()
+
+    max_wait = 600
+    start_wait = time.time()
+    while time.time() - start_wait < max_wait:
+        try:
+            resp = requests.get(f"{judge_url}/health", timeout=5)
+            if resp.status_code == 200:
+                info = resp.json()
+                if info.get("status") == "healthy":
+                    if logger:
+                        logger.log(f"Local judge server ready at {judge_url}")
+                    print(f"✓ Local judge server ready at {judge_url}")
+                    return judge_url, process
+        except requests.RequestException:
+            pass
+        time.sleep(5)
+
+    print(f"✗ Local judge server failed to start within {max_wait}s")
+    stop_managed_process(process, "local judge server", logger)
+    return None, None
 
 
 def main():
@@ -1453,6 +1701,8 @@ Examples:
     with BenchmarkLogger(run_dir) as logger:
         # Track server we start (if any) so we can always clean it up, even on early returns.
         server_process = None
+        judge_process = None
+        judge_url = None
         # Log initial configuration
         logger.log_section("BENCHMARK RUN START")
 
@@ -1584,6 +1834,9 @@ Examples:
                             logger.log(f"Inference completed: {benchmark} -> {output_file}")
                         else:
                             logger.log(f"Warning: {benchmark} inference failed, skipping...")
+                    if not inference_files:
+                        logger.log("Error: All individual benchmark inference runs failed")
+                        return 1
             elif args.skip_infer and not args.skip_eval:
                 # Try to find existing inference files in run_dir
                 for benchmark in benchmarks:
@@ -1597,10 +1850,30 @@ Examples:
                             break
                     if benchmark not in inference_files:
                         logger.log(f"Warning: Could not find inference file for {benchmark}")
+                if not inference_files:
+                    logger.log("Error: No inference files found for evaluation")
+                    return 1
 
             # Run evaluation
             if not args.skip_eval:
+                # Inference is complete; free the training GPU set before bringing up the judge.
+                if server_process is not None:
+                    stop_managed_process(server_process, "vLLM server", logger)
+                    server_process = None
+
                 logger.log_section("PHASE 2: EVALUATION")
+                judge_benchmarks = [benchmark for benchmark in inference_files if requires_judge(benchmark)]
+                if judge_benchmarks:
+                    judge_url, judge_process = start_local_judge_server(
+                        gpus=gpus,
+                        port=8600,
+                        logger=logger,
+                    )
+                    if not judge_url:
+                        logger.log("Error: Failed to start local judge server")
+                        return 1
+                    os.environ["JUDGE_SERVER_URL"] = judge_url
+                    logger.log(f"Using local judge server for final scoring: {judge_url}")
 
                 for benchmark, input_file in inference_files.items():
                     success, result_file = run_evaluation(
@@ -1608,10 +1881,14 @@ Examples:
                         input_file=input_file,
                         run_dir=run_dir,
                         num_samples=args.num_samples,
+                        judge_url=judge_url if requires_judge(benchmark) else None,
                         logger=logger
                     )
                     if success:
                         parsed = parse_benchmark_results(benchmark, result_file)
+                        token_stats = collect_benchmark_token_stats(run_dir, benchmark, args.model_path)
+                        if token_stats:
+                            parsed["token_stats"] = token_stats
                         all_results[benchmark] = parsed
                         logger.log(f"Evaluation completed: {benchmark} -> {parsed}")
                     else:
@@ -1624,28 +1901,10 @@ Examples:
                 logger.log_section("BENCHMARK RUN COMPLETE")
                 logger.log(f"Results saved to: {run_dir}")
         finally:
-            # Cleanup: kill the server process if we started it (even on early return / exceptions)
+            if judge_process is not None:
+                stop_managed_process(judge_process, "local judge server", logger)
             if server_process is not None:
-                print(f"\nStopping vLLM server (PID: {server_process.pid})...")
-                logger.log(f"Stopping vLLM server (PID: {server_process.pid})")
-                try:
-                    if os.name != "nt":
-                        os.killpg(server_process.pid, signal.SIGTERM)
-                    else:
-                        server_process.terminate()
-                    server_process.wait(timeout=30)
-                except Exception as e:
-                    print(f"Warning: Error stopping server: {e}")
-                    try:
-                        if os.name != "nt":
-                            os.killpg(server_process.pid, signal.SIGKILL)
-                        else:
-                            server_process.kill()
-                    except Exception as kill_err:
-                        warn_msg = f"Warning: Failed to force-kill server process {server_process.pid}: {kill_err}"
-                        print(warn_msg)
-                        logger.log(warn_msg)
-                print("✓ Server stopped")
+                stop_managed_process(server_process, "vLLM server", logger)
 
     return 0
 

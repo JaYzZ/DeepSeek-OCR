@@ -24,6 +24,7 @@ thinking_sep_id: 151670
 
 ### latent objective runtime
 loss_type: ce+embed_ce+vae+mse+ot
+latent_aux_loss_source: vae_sample
 latent_step_ce_token: 0
 # 0 => use sampled CoT token IDs at latent-step CE positions (default)
 # 1 => force <latent> token ID at latent-step CE positions
@@ -33,9 +34,9 @@ vae_intermediate_size: 512
 
 ### curriculum
 curriculum_enable: 1
-curriculum_epochs: 0,1,2
-curriculum_loss_types: ce+embed_ce+vae+mse,ce+embed_ce+vae+mse+ot,ce+embed_ce+vae+mse+repa+ot
-curriculum_latent_step_ce: 1,1,0
+curriculum_epochs: 0
+curriculum_loss_types: ce+embed_ce+vae:0.0+mse:0.4+ot:0.4
+curriculum_latent_step_ce: 1
 
 ### backfill / transparent eval
 # Used by post-training backfill and transparent eval callbacks.

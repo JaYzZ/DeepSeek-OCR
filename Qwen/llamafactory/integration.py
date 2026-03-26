@@ -26,6 +26,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions
+import safetensors.torch
 
 from transformers import AutoTokenizer, TrainerCallback, Trainer
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
@@ -42,8 +43,8 @@ from llamafactory.data.template import (
     ToolFormatter,
     register_template,
 )
-from llamafactory.train.sft.trainer import CustomSeq2SeqTrainer
 from llamafactory.train.callbacks import SaveProcessorCallback
+from llamafactory.train.sft.trainer import CustomSeq2SeqTrainer
 
 from Qwen.llamafactory.transparent_eval_callback import QwenTransparentEvalCallback
 from Qwen.llamafactory.curriculum_callback import QwenCurriculumCallback
@@ -129,6 +130,14 @@ class QwenLossLoggingCallback(TrainerCallback):
                     parts.append(f"{name}={float(raw):.4f}" if raw is not None else f"{name}=NA")
                     if raw is not None:
                         step_metrics[f"qwen3vl/loss/{name}"] = float(raw)
+            for entry in extra_breakdown:
+                name = str(entry.get("name", "unknown"))
+                raw = entry.get("raw")
+                if name in {"vae", "latent_vae_nll", "vae_entropy", "embed_ce"}:
+                    continue
+                parts.append(f"{name}={float(raw):.4f}" if raw is not None else f"{name}=NA")
+                if raw is not None:
+                    step_metrics[f"qwen3vl/loss/{name}"] = float(raw)
             vae = extra_by_name.get("vae")
             latent_vae_nll = extra_by_name.get("latent_vae_nll")
             vae_entropy = extra_by_name.get("vae_entropy")
@@ -219,6 +228,22 @@ def _get_loss_spec() -> str:
     Default: ot+mse
     """
     return os.environ.get("QWEN3VL_LOSS_TYPE", "ot+mse").lower()
+
+
+def _get_latent_aux_loss_source() -> str:
+    """Choose where auxiliary latent losses are applied.
+
+    Values:
+    - "hidden": apply mse/ot/repa/nce on shifted pre-VAE hidden states
+    - "vae_sample": apply them on VAE rsample() outputs
+    """
+    source = os.environ.get("QWEN3VL_LATENT_AUX_LOSS_SOURCE", "hidden").strip().lower()
+    if source not in {"hidden", "vae_sample"}:
+        raise ValueError(
+            f"Invalid QWEN3VL_LATENT_AUX_LOSS_SOURCE={source!r}. "
+            "Expected 'hidden' or 'vae_sample'."
+        )
+    return source
 
 
 class LatentVAE(nn.Module):
@@ -549,6 +574,19 @@ def ensure_vae_in_model(model) -> None:
     _ensure_vae_trainable(model)
 
 
+def _resolve_latent_vae_module(model) -> Optional[nn.Module]:
+    """Find latent_vae through common training wrappers."""
+    visited: set[int] = set()
+    current = model
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        vae = getattr(current, "latent_vae", None)
+        if vae is not None:
+            return vae
+        current = getattr(current, "module", None)
+    return None
+
+
 def save_vae_checkpoint(model, output_dir: str) -> None:
     """Save VAE weights separately from the model checkpoint.
 
@@ -558,23 +596,28 @@ def save_vae_checkpoint(model, output_dir: str) -> None:
         model: The model with latent_vae module
         output_dir: Directory to save VAE checkpoint
     """
-    if not hasattr(model, 'latent_vae') or model.latent_vae is None:
+    vae = _resolve_latent_vae_module(model)
+    if vae is None:
         logger.warning("[Qwen3VL Latent] No VAE to save")
         return
 
-    import safetensors.torch
-    import os
+    # Keep all ranks participating in state extraction so distributed wrappers
+    # stay aligned, but only rank 0 writes the artifact.
+    vae_state_dict = {
+        name: tensor.detach().cpu()
+        for name, tensor in vae.state_dict().items()
+    }
 
-    # Canonical layout: <checkpoint_dir>/vae.safetensors
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Get VAE state dict
-    vae_state_dict = model.latent_vae.state_dict()
-
-    # Save VAE weights
-    vae_path = os.path.join(output_dir, "vae.safetensors")
-    safetensors.torch.save_file(vae_state_dict, vae_path)
-    logger.info(f"[Qwen3VL Latent] Saved VAE checkpoint to {vae_path}")
+    if _is_rank0():
+        os.makedirs(output_dir, exist_ok=True)
+        vae_path = os.path.join(output_dir, "vae.safetensors")
+        safetensors.torch.save_file(vae_state_dict, vae_path)
+        logger.info(f"[Qwen3VL Latent] Saved VAE checkpoint to {vae_path}")
+    try:
+        if dist.is_initialized():
+            dist.barrier()
+    except Exception:
+        pass
 
 
 def load_vae_checkpoint(model, checkpoint_path: str) -> None:
@@ -584,12 +627,10 @@ def load_vae_checkpoint(model, checkpoint_path: str) -> None:
         model: The model to load VAE weights into
         checkpoint_path: Path to VAE checkpoint file
     """
-    if not hasattr(model, 'latent_vae') or model.latent_vae is None:
+    vae = _resolve_latent_vae_module(model)
+    if vae is None:
         logger.warning("[Qwen3VL Latent] No VAE to load into")
         return
-
-    import safetensors.torch
-    import os
 
     if os.path.isdir(checkpoint_path):
         checkpoint_path = os.path.join(checkpoint_path, "vae.safetensors")
@@ -599,7 +640,7 @@ def load_vae_checkpoint(model, checkpoint_path: str) -> None:
         return
 
     vae_state_dict = safetensors.torch.load_file(checkpoint_path)
-    model.latent_vae.load_state_dict(vae_state_dict, strict=True)
+    vae.load_state_dict(vae_state_dict, strict=True)
     logger.info(f"[Qwen3VL Latent] Loaded VAE checkpoint from {checkpoint_path}")
 
 
@@ -1941,12 +1982,23 @@ def _patch_model_forward(logger) -> None:
         if hook_handle is not None:
             hook_handle.remove()
 
-        # Compute thinking loss using latent_supervision (direct on LLM hidden states)
+        # Compute auxiliary latent losses on the configured predictor branch.
         thinking_loss = None
         thinking_breakdown: list[dict[str, Any]] = []
         loss_spec = _get_loss_spec()
         loss_configs = _parse_loss_spec(loss_spec)
         loss_weights = {name: weight for name, weight in loss_configs}
+        latent_aux_loss_source = _get_latent_aux_loss_source()
+        hidden_loss_configs = loss_configs
+        post_vae_loss_configs: list[tuple[str, float]] = []
+        if use_latent_vae and latent_aux_loss_source == "vae_sample":
+            hidden_loss_configs = [
+                (name, weight) for name, weight in loss_configs if name not in {"mse", "ot", "repa", "nce"}
+            ]
+            post_vae_loss_configs = [
+                (name, weight) for name, weight in loss_configs if name in {"mse", "ot", "repa", "nce"}
+            ]
+        ot_stats = None
 
         if need_hidden_states:
             # Extract last layer hidden states from hook or outputs.hidden_states[-1]
@@ -1976,7 +2028,7 @@ def _patch_model_forward(logger) -> None:
                 latent_ground_truth=latent_ground_truth,
                 latent_supervision=latent_supervision,
                 latent_positions=latent_positions,
-                loss_configs=loss_configs,
+                loss_configs=hidden_loss_configs,
             )
         else:
             thinking_breakdown = []
@@ -1989,6 +2041,8 @@ def _patch_model_forward(logger) -> None:
         sampled_latents = None
         batch_indices = None
         seq_indices = None
+        post_vae_loss = None
+        post_vae_breakdown: list[dict[str, Any]] = []
         if use_latent_vae and need_hidden_states and latent_supervision is not None and last_hidden_states is not None:
             # VAE is already on the correct device as part of FSDP-wrapped model
             # Don't move it explicitly to avoid FSDP shard issues
@@ -2018,6 +2072,17 @@ def _patch_model_forward(logger) -> None:
                     gt_lens = [len(s) if s else 0 for s in latent_ground_truth] if latent_ground_truth else []
                     pos_sum = latent_positions.sum().item() if latent_positions is not None else 0
                     logger.info(f"[Qwen3VL Latent] VAE returned None: gt_lens={gt_lens}, pos_sum={pos_sum}")
+
+            if post_vae_loss_configs:
+                post_vae_loss, post_vae_ot_stats, post_vae_breakdown = _compute_post_vae_loss(
+                    sampled_latents=sampled_latents,
+                    batch_indices=batch_indices,
+                    latent_ground_truth=latent_ground_truth,
+                    latent_supervision=latent_supervision,
+                    loss_configs=post_vae_loss_configs,
+                )
+                if post_vae_ot_stats is not None:
+                    ot_stats = post_vae_ot_stats
 
         # FSDP safety: if any rank has sampled latents, all ranks must run pred-embed second forward.
         if use_latent_vae and loss_weights.get("embed_ce", 0.0) > 0 and inputs_embeds is not None and labels is not None:
@@ -2064,10 +2129,14 @@ def _patch_model_forward(logger) -> None:
         # Combine losses (OT is default, CE is optional during eval)
         ce_loss = outputs.loss if hasattr(outputs, 'loss') else None
         extra_breakdown: list[dict[str, Any]] = []
+        if post_vae_breakdown:
+            extra_breakdown.extend(post_vae_breakdown)
 
         aux_loss = None
         if thinking_loss is not None:
             aux_loss = thinking_loss
+        if post_vae_loss is not None:
+            aux_loss = post_vae_loss if aux_loss is None else aux_loss + post_vae_loss
         vae_weight = loss_weights.get("vae", 0.0)
         if vae_loss is not None and vae_weight > 0:
             aux_loss = (aux_loss if aux_loss is not None else 0.0) + vae_loss * vae_weight
@@ -2124,6 +2193,7 @@ def _patch_model_forward(logger) -> None:
                 {
                     "loss_spec": loss_spec,
                     "use_latent_vae": "vae" in loss_spec,
+                    "latent_aux_loss_source": latent_aux_loss_source,
                     "ce": float(ce_val),
                     "thinking": float(thinking_val) if thinking_loss is not None else None,
                     "vae": vae_val,
@@ -2209,6 +2279,10 @@ def _patch_trainer_callback(logger) -> None:
 
     Also patches Trainer.create_optimizer to ensure VAE parameters are added to optimizer.
     """
+    if getattr(_patch_trainer_callback, "_patched", False):
+        logger.debug("[Qwen3VL Latent] Trainer callback patch already applied")
+        return
+
     # Patch Trainer.create_optimizer to ensure VAE parameters are in optimizer
     try:
         original_create_optimizer = Trainer.create_optimizer
@@ -2250,24 +2324,9 @@ def _patch_trainer_callback(logger) -> None:
         logger.warning(f"[Qwen3VL Latent] Failed to patch Trainer.create_optimizer: {e}")
 
     original_save_model = CustomSeq2SeqTrainer.save_model
-    original_processor_on_train_end = SaveProcessorCallback.on_train_end
     # Store original __init__ method
     original_init = CustomSeq2SeqTrainer.__init__
-
-    class SaveLatestModelCallback(TrainerCallback):
-        """Save a final trainer-managed latest checkpoint before processor finalization."""
-
-        def __init__(self, trainer: CustomSeq2SeqTrainer) -> None:
-            self._trainer = trainer
-
-        def on_train_end(self, args, state, control, **kwargs):
-            if not args.should_save:
-                return
-
-            try:
-                self._trainer.save_model(output_dir=args.output_dir)
-            except Exception as e:
-                logger.warning(f"[Qwen3VL Latent] Failed to save latest checkpoint at train end: {e}")
+    original_save_processor_on_train_end = SaveProcessorCallback.on_train_end
 
     @functools.wraps(original_save_model)
     def patched_save_model(self, output_dir=None, *args, **kwargs):
@@ -2284,18 +2343,20 @@ def _patch_trainer_callback(logger) -> None:
         # Save VAE alongside every trainer-managed checkpoint save, including the final
         # `save_model(output_dir=self.args.output_dir)` path that is remapped to
         # `checkpoint_latest`.
-        try:
-            save_vae_checkpoint(self.model, output_dir)
-        except Exception as e:
-            logger.warning(f"[Qwen3VL Latent] Failed to save VAE checkpoint to {output_dir}: {e}")
+        should_save_vae = getattr(self.args, "should_save", False)
+        if not should_save_vae:
+            try:
+                should_save_vae = dist.is_initialized()
+            except Exception:
+                should_save_vae = False
+
+        if should_save_vae:
+            try:
+                save_vae_checkpoint(self.model, output_dir)
+            except Exception as e:
+                logger.warning(f"[Qwen3VL Latent] Failed to save VAE checkpoint to {output_dir}: {e}")
 
         return result
-
-    @functools.wraps(original_processor_on_train_end)
-    def patched_processor_on_train_end(self, args, state, control, **kwargs):
-        if args.should_save:
-            latest_dir = os.path.join(args.output_dir, "checkpoint_latest")
-            self.processor.save_pretrained(latest_dir)
 
     @functools.wraps(original_init)
     def patched_init(self, model=None, args=None, callbacks=None, **kwargs):
@@ -2314,18 +2375,6 @@ def _patch_trainer_callback(logger) -> None:
         # After optimizer is created, ensure VAE params are in optimizer
         if "vae" in loss_spec:
             _ensure_vae_in_optimizer(self, logger)
-
-            latest_save_callback = SaveLatestModelCallback(self)
-            save_processor_index = None
-            for idx, callback in enumerate(self.callback_handler.callbacks):
-                if isinstance(callback, SaveProcessorCallback):
-                    save_processor_index = idx
-                    break
-
-            if save_processor_index is None:
-                self.add_callback(latest_save_callback)
-            else:
-                self.callback_handler.callbacks.insert(save_processor_index, latest_save_callback)
 
         # Log loss spec + loss breakdown at Trainer logging_steps cadence (rank 0 only).
         # This replaces forward() logging to avoid slowing training.
@@ -2365,10 +2414,18 @@ def _patch_trainer_callback(logger) -> None:
 
         return result
 
+    @functools.wraps(original_save_processor_on_train_end)
+    def patched_save_processor_on_train_end(self, args, state, control, **kwargs):
+        if args.should_save:
+            self.processor.save_pretrained(os.path.join(args.output_dir, "checkpoint_latest"))
+            return
+        return original_save_processor_on_train_end(self, args, state, control, **kwargs)
+
     # Apply the patch
     CustomSeq2SeqTrainer.save_model = patched_save_model
-    SaveProcessorCallback.on_train_end = patched_processor_on_train_end
     CustomSeq2SeqTrainer.__init__ = patched_init
+    SaveProcessorCallback.on_train_end = patched_save_processor_on_train_end
+    _patch_trainer_callback._patched = True
     if _is_rank0():
         logger.info("[Qwen3VL Latent] Patched CustomSeq2SeqTrainer to auto-add callbacks")
 
@@ -3769,6 +3826,178 @@ def _compute_vae_loss(
     sampled_latents = vae_dist.rsample()
 
     return nll_loss, entropy, hidden_states, sampled_latents, batch_indices, seq_indices_original
+
+
+def _compute_post_vae_loss(
+    sampled_latents: torch.Tensor,
+    batch_indices: torch.Tensor,
+    latent_ground_truth: List[List[torch.Tensor]],
+    latent_supervision: List[List[torch.Tensor]],
+    loss_configs: Optional[List[tuple[str, float]]] = None,
+) -> tuple[Optional[torch.Tensor], Optional[dict[str, Any]], list[dict[str, Any]]]:
+    """Compute latent losses on sampled VAE outputs instead of pre-VAE hidden states."""
+    if sampled_latents is None or batch_indices is None or sampled_latents.numel() == 0:
+        return None, None, []
+
+    device = sampled_latents.device
+    dtype = sampled_latents.dtype
+    loss_configs = loss_configs or []
+
+    total_loss = None
+    total_breakdown: list[dict[str, Any]] = []
+    ot_stats = None
+
+    for loss_name, weight in loss_configs:
+        if weight <= 0 or loss_name not in {"mse", "ot", "repa", "nce"}:
+            continue
+
+        sample_losses = []
+        stats = {
+            "num_valid_samples": 0,
+            "total_pred_tokens": 0,
+            "total_target_tokens": 0,
+            "cost_stats": [],
+        } if loss_name == "ot" else None
+        pooled_preds = []
+        pooled_targets = []
+
+        unique_batches = torch.unique_consecutive(batch_indices)
+        for batch_idx_tensor in unique_batches:
+            batch_idx = int(batch_idx_tensor.item())
+            sample_mask = batch_indices == batch_idx_tensor
+            pred_tokens = sampled_latents[sample_mask]
+            if pred_tokens.numel() == 0:
+                continue
+
+            if loss_name == "mse":
+                target_tensor = _concat_supervision_tensors(
+                    latent_ground_truth[batch_idx] if batch_idx < len(latent_ground_truth) else [],
+                    device=device,
+                    dtype=dtype,
+                )
+                if target_tensor is None:
+                    continue
+                pred_aligned, target_aligned = _match_sequence_length(
+                    pred_tokens,
+                    target_tensor,
+                    strategy=os.environ.get("QWEN3VL_MATCH_STRATEGY", "truncate").lower(),
+                )
+                sample_losses.append(F.mse_loss(pred_aligned, target_aligned, reduction="mean"))
+                continue
+            if loss_name == "repa":
+                target_tensor = _concat_supervision_tensors(
+                    latent_ground_truth[batch_idx] if batch_idx < len(latent_ground_truth) else [],
+                    device=device,
+                    dtype=dtype,
+                )
+                if target_tensor is None:
+                    continue
+                pred_aligned, target_aligned = _match_sequence_length(
+                    pred_tokens,
+                    target_tensor,
+                    strategy=os.environ.get("QWEN3VL_MATCH_STRATEGY", "truncate").lower(),
+                )
+                pred_norm = F.normalize(pred_aligned, dim=-1)
+                target_norm = F.normalize(target_aligned, dim=-1)
+                sample_losses.append(-torch.mean((pred_norm * target_norm).sum(dim=-1)))
+                continue
+
+            target_tokens = _concat_supervision_tensors(
+                latent_supervision[batch_idx] if batch_idx < len(latent_supervision) else [],
+                device=device,
+                dtype=dtype,
+            )
+            if target_tokens is None:
+                continue
+            if loss_name == "nce":
+                pred_mean = pred_tokens.mean(dim=0)
+                pred_max = pred_tokens.max(dim=0)[0]
+                target_mean = target_tokens.mean(dim=0)
+                target_max = target_tokens.max(dim=0)[0]
+                pooled_preds.append(torch.cat([pred_mean, pred_max], dim=0))
+                pooled_targets.append(torch.cat([target_mean, target_max], dim=0))
+                continue
+
+            pred_for_ot = pred_tokens
+            target_for_ot = target_tokens
+            sample_k_raw = os.environ.get("QWEN3VL_OT_SAMPLE_K", "16")
+            sample_k = None
+            if isinstance(sample_k_raw, str):
+                if sample_k_raw.strip().lower() not in ("none", "null", "off", "disable", "disabled"):
+                    try:
+                        sample_k = int(sample_k_raw)
+                    except ValueError:
+                        sample_k = 16
+            elif isinstance(sample_k_raw, int):
+                sample_k = sample_k_raw
+
+            n_pred = pred_for_ot.shape[0]
+            n_target = target_for_ot.shape[0]
+            if sample_k is not None and sample_k > 0:
+                if n_pred > sample_k:
+                    idx = torch.randperm(n_pred, device=device)[:sample_k]
+                    pred_for_ot = pred_for_ot[idx]
+                    n_pred = pred_for_ot.shape[0]
+                if n_target > sample_k:
+                    idx = torch.randperm(n_target, device=device)[:sample_k]
+                    target_for_ot = target_for_ot[idx]
+                    n_target = target_for_ot.shape[0]
+
+            pred_norm = F.normalize(pred_for_ot, dim=-1)
+            target_norm = F.normalize(target_for_ot, dim=-1)
+            cost_matrix = 1.0 - torch.mm(pred_norm, target_norm.t())
+            sample_loss = cost_matrix.mean()
+            sample_losses.append(sample_loss)
+
+            assert stats is not None
+            stats["num_valid_samples"] += 1
+            stats["total_pred_tokens"] += n_pred
+            stats["total_target_tokens"] += n_target
+            stats["cost_stats"].append((
+                cost_matrix.min().item(),
+                cost_matrix.max().item(),
+                cost_matrix.mean().item(),
+                cost_matrix.std().item() if cost_matrix.numel() > 1 else 0.0,
+            ))
+
+        loss = None
+        if loss_name == "nce":
+            if len(pooled_preds) >= 2:
+                preds = torch.stack(pooled_preds, dim=0)
+                targets = torch.stack(pooled_targets, dim=0).to(dtype=preds.dtype)
+                sim_matrix = torch.mm(
+                    F.normalize(preds, dim=-1),
+                    F.normalize(targets, dim=-1).t(),
+                ) / 0.07
+                labels = torch.arange(len(pooled_preds), device=device)
+                loss = F.cross_entropy(sim_matrix, labels)
+        elif sample_losses:
+            loss = torch.stack(sample_losses).mean()
+        total_breakdown.append(
+            {
+                "name": loss_name,
+                "raw": float(loss.item()) if isinstance(loss, torch.Tensor) else None,
+            }
+        )
+        if loss is not None:
+            total_loss = weight * loss if total_loss is None else total_loss + weight * loss
+
+        if loss_name == "ot" and stats is not None and stats["cost_stats"]:
+            cost_mins = [s[0] for s in stats["cost_stats"]]
+            cost_maxs = [s[1] for s in stats["cost_stats"]]
+            cost_means = [s[2] for s in stats["cost_stats"]]
+            cost_stds = [s[3] for s in stats["cost_stats"]]
+            stats["aggregated"] = {
+                "cost_min": min(cost_mins),
+                "cost_max": max(cost_maxs),
+                "cost_mean": sum(cost_means) / len(cost_means),
+                "cost_std": sum(cost_stds) / len(cost_stds),
+                "avg_pred_tokens": stats["total_pred_tokens"] / max(1, stats["num_valid_samples"]),
+                "avg_target_tokens": stats["total_target_tokens"] / max(1, stats["num_valid_samples"]),
+            }
+            ot_stats = stats
+
+    return total_loss, ot_stats, total_breakdown
 
 
 def _compute_pred_embed_forward_loss(

@@ -76,7 +76,7 @@ TEST_FREQ="${TEST_FREQ:--1}"
 USE_DYNAMIC_BSZ="${USE_DYNAMIC_BSZ:-true}"
 ENTROPY_CHECKPOINTING="${ENTROPY_CHECKPOINTING:-true}"
 
-ENABLE_OVERLONG_BUFFER="${ENABLE_OVERLONG_BUFFER:-false}"
+ENABLE_OVERLONG_BUFFER="${ENABLE_OVERLONG_BUFFER:-true}"
 OVERLONG_BUFFER_LEN="${OVERLONG_BUFFER_LEN:-2000}"
 OVERLONG_PENALTY_FACTOR="${OVERLONG_PENALTY_FACTOR:-0.1}"
 OVERLONG_LOG="${OVERLONG_LOG:-false}"
@@ -221,6 +221,7 @@ printf 'Visible GPUs=%s cuda_visible_devices=%s nnodes=%s tp=%s train=%s val=%s\
 printf 'Gen batch=%s train batch=%s rollout_n=%s loss_mode=%s reward_manager=%s\n' "$GEN_BATCH_SIZE" "$TRAIN_BATCH_SIZE" "$ROLLOUT_N" 'gspo' 'dapo_batch'
 printf 'Rollout eager=%s gpu_mem_util=%s mm_preproc_cache_disabled=%s\n' "$ROLLOUT_ENFORCE_EAGER" "$GPU_MEMORY_UTILIZATION" "$ROLLOUT_DISABLE_MM_PREPROCESSOR_CACHE"
 printf 'Filter workers=%s rollout_max_model_len=%s rollout_max_batched_tokens=%s\n' "$FILTER_OVERLONG_PROMPTS_WORKERS" "$ROLLOUT_MAX_MODEL_LEN" "$ROLLOUT_MAX_BATCHED_TOKENS"
+printf 'Overlong buffer enabled=%s len=%s penalty_factor=%s log=%s\n' "$ENABLE_OVERLONG_BUFFER" "$OVERLONG_BUFFER_LEN" "$OVERLONG_PENALTY_FACTOR" "$OVERLONG_LOG"
 printf 'Runtime env stamp=%s\n' "$RUNTIME_ENV_STAMP"
 printf 'Ray no-set cuda visible devices=%s\n' "$RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"
 printf 'Init LoRA=%s resume_mode=%s resume_from=%s\n' "${INIT_LORA_PATH:-<none>}" "$RESUME_MODE" "${RESUME_FROM_PATH:-<none>}"

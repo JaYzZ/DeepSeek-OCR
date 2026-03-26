@@ -353,24 +353,64 @@ def run_evaluation(args):
         print(f"✓ Sampled {len(data)} examples deterministically")
         print(f"{'='*60}\n")
 
-    # Load dataset
-    meta = load_dataset(args.dataset)
+    try:
+        meta = load_dataset(args.dataset)
+    except Exception as exc:
+        print(f"Warning: failed to load MMMU metadata ({exc}); using embedded annotations only.")
+        meta = pd.DataFrame()
 
-    # Validation
     print(f"len(data): {len(data)}")
     print(f"len(meta): {len(meta)}")
-    meta_q_map = {x: y for x, y in zip(meta['index'], meta['question'])}
-    data_map = {x: y for x, y in zip(data['index'], data['question'])}
-    for k in data_map:
-        assert k in meta_q_map, (
-            f'eval_file should be the same as or a subset of dataset MMMU_DEV_VAL'
+
+    # Prefer stable sample ids embedded in the inference annotations.
+    # The inference jsonl already contains full MMMU annotations, so evaluation
+    # should remain valid even if the local dataset mirror changes.
+    meta_records = meta.to_dict('records') if len(meta) else []
+    meta_by_id = {str(x): y for x, y in zip(meta['id'], meta_records)} if 'id' in meta else {}
+    meta_by_index = {x: y for x, y in zip(meta['index'], meta_records)} if 'index' in meta else {}
+
+    data = MMMU_preproc(data)
+
+    missing_meta_ids = []
+    gt_answers = []
+    normalized_splits = []
+    normalized_questions = []
+
+    for _, row in data.iterrows():
+        meta_row = None
+        row_id = str(row['id']) if 'id' in row and not pd.isna(row['id']) else None
+        row_index = row['index']
+        if row_id and row_id in meta_by_id:
+            meta_row = meta_by_id[row_id]
+        elif row_index in meta_by_index:
+            meta_row = meta_by_index[row_index]
+
+        if meta_row is None:
+            if row_id:
+                missing_meta_ids.append(row_id)
+            elif row_index is not None:
+                missing_meta_ids.append(str(row_index))
+
+        answer = meta_row['answer'] if meta_row is not None and 'answer' in meta_row else row.get('answer')
+        split = meta_row['split'] if meta_row is not None and 'split' in meta_row else row.get('split', 'unknown')
+        question = meta_row['question'] if meta_row is not None and 'question' in meta_row else row.get('question', '')
+
+        gt_answers.append(answer if answer in list(string.ascii_uppercase) else 'A')
+        normalized_splits.append(split)
+        normalized_questions.append(question)
+
+    if missing_meta_ids:
+        preview = ", ".join(missing_meta_ids[:5])
+        print(
+            "Warning: "
+            f"{len(missing_meta_ids)} MMMU samples were not found in local dataset metadata; "
+            "using embedded annotation ground truth instead. "
+            f"Examples: {preview}"
         )
 
-    answer_map = {i: c for i, c in zip(meta['index'], meta['answer'])}
-    data = MMMU_preproc(data)
-    answer_map = {k: (v if v in list(string.ascii_uppercase) else 'A') for k, v in answer_map.items()}
-    data = data[data['index'].isin(answer_map)]
-    data['GT'] = [answer_map[idx] for idx in data['index']]
+    data['GT'] = gt_answers
+    data['split'] = normalized_splits
+    data['question'] = normalized_questions
     items = []
     for i in range(len(data)):
         item = data.iloc[i]

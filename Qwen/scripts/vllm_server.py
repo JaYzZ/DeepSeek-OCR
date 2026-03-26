@@ -41,18 +41,27 @@ from Qwen.scripts.vllm_utils import (
     parse_cuda_visible_devices,
 )
 
+
+def _env_flag_enabled(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
 # Set vLLM multiprocessing method BEFORE importing vLLM
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 
 # Load runtime env before enabling plugins so YAML can control VLLM_THINKING.
 apply_runtime_env_for_thinking(repo_root=_REPO_ROOT)
-existing_plugins = [p.strip() for p in os.environ.get("VLLM_PLUGINS", "").split(",") if p.strip()]
-if "vllm_thinking" not in existing_plugins:
-    existing_plugins.append("vllm_thinking")
-os.environ["VLLM_PLUGINS"] = ",".join(existing_plugins)
+THINKING_MODE_ENABLED = _env_flag_enabled("VLLM_THINKING") or _env_flag_enabled("VLLM_FORCE_THINK")
+if THINKING_MODE_ENABLED:
+    existing_plugins = [p.strip() for p in os.environ.get("VLLM_PLUGINS", "").split(",") if p.strip()]
+    if "vllm_thinking" not in existing_plugins:
+        existing_plugins.append("vllm_thinking")
+    os.environ["VLLM_PLUGINS"] = ",".join(existing_plugins)
 
-# Import thinking mode plugin BEFORE vLLM to apply patches
-from vllm_thinking.runner_patch import apply_thinking_mode_patch
+    # Import thinking mode plugin BEFORE vLLM to apply patches.
+    from vllm_thinking.runner_patch import apply_thinking_mode_patch
+else:
+    apply_thinking_mode_patch = None
 
 from vllm import LLM, SamplingParams
 from transformers import AutoProcessor
@@ -89,6 +98,37 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
 
 
+def run_llm_generation(
+    messages: List[Dict[str, Any]],
+    *,
+    temperature: float,
+    max_tokens: int,
+    top_p: float = 1.0,
+    presence_penalty: float = 0.0,
+    repetition_penalty: float = 1.0,
+):
+    global llm, processor, lora_request
+
+    vllm_input = prepare_inputs_for_vllm(messages, processor)
+    sampling_params = SamplingParams(
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        presence_penalty=presence_penalty,
+        repetition_penalty=repetition_penalty,
+        stop_token_ids=[151643, 151645],
+        skip_special_tokens=False,
+    )
+    outputs = llm.generate(
+        [vllm_input],
+        sampling_params=sampling_params,
+        lora_request=lora_request,
+    )
+    output = outputs[0]
+    response_text = output.outputs[0].text
+    return output, response_text
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""
@@ -96,6 +136,23 @@ async def health():
         "status": "healthy",
         "model": config.get("model_path"),
         "lora": config.get("lora_path"),
+        "thinking_enabled": config.get("thinking_enabled", False),
+    }
+
+
+@app.get("/v1/models")
+async def list_models():
+    """OpenAI-compatible model listing."""
+    model_id = Path(config.get("requested_model_path") or config.get("model_path") or "unknown").name
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": model_id,
+                "object": "model",
+                "owned_by": "local",
+            }
+        ],
     }
 
 
@@ -107,6 +164,7 @@ async def stats():
         "lora_path": config.get("lora_path"),
         "tensor_parallel_size": config.get("tensor_parallel_size"),
         "gpu_memory_utilization": config.get("gpu_memory_utilization"),
+        "thinking_enabled": config.get("thinking_enabled", False),
     }
 
 
@@ -121,31 +179,14 @@ async def chat_completions(request: ChatCompletionRequest):
     try:
         # Convert messages to vLLM format
         messages = [{"role": m.role, "content": m.content} for m in request.messages]
-
-        # Prepare inputs
-        vllm_input = prepare_inputs_for_vllm(messages, processor)
-
-        # Create sampling params
-        sampling_params = SamplingParams(
-            max_tokens=request.max_tokens,
+        output, response_text = run_llm_generation(
+            messages,
             temperature=request.temperature,
+            max_tokens=request.max_tokens,
             top_p=request.top_p,
             presence_penalty=request.presence_penalty,
             repetition_penalty=request.repetition_penalty,
-            stop_token_ids=[151643, 151645],
-            skip_special_tokens=False,
         )
-
-        # Run inference
-        outputs = llm.generate(
-            [vllm_input],
-            sampling_params=sampling_params,
-            lora_request=lora_request
-        )
-
-        # Extract response (raw; do not strip thinking tokens).
-        output = outputs[0]
-        response_text = output.outputs[0].text
 
         # DEBUG: Print raw output to see if thinking tokens exist (only if VLLM_DEBUG=1)
         if os.environ.get("VLLM_DEBUG", "0") == "1":
@@ -190,7 +231,7 @@ def prepare_inputs_for_vllm(messages, processor):
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     # Manually add generation prompt as per repo's common practice
     text = text + "<|im_start|>assistant\n"
-    if os.environ.get("VLLM_FORCE_THINK", "0") == "1":
+    if _env_flag_enabled("VLLM_FORCE_THINK"):
         text = text + "<think>"
 
     # Extract media from messages and, if provided, preserve benchmark-specific
@@ -337,7 +378,7 @@ def load_model(
             os.environ["QWEN3VL_THINKING_SEP_ID"] = str(token_id)
 
     # Apply thinking mode patch only when explicitly enabled.
-    if os.environ.get("VLLM_THINKING", "0").strip().lower() in {"1", "true", "yes", "on"}:
+    if THINKING_MODE_ENABLED and apply_thinking_mode_patch is not None:
         apply_thinking_mode_patch()
 
     # Load processor
@@ -388,6 +429,7 @@ def load_model(
         "lora_path": lora_path,
         "tensor_parallel_size": tensor_parallel_size,
         "gpu_memory_utilization": gpu_memory_utilization,
+        "thinking_enabled": THINKING_MODE_ENABLED,
     }
 
 

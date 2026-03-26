@@ -22,12 +22,12 @@ CONTINUOUS_LATENT_KEY = "continuous_latent_embeddings"
 CONTINUOUS_LATENT_LOGPROB_KEY = "continuous_latent_log_probs"
 CONTINUOUS_MASK_KEY = "continuous_token_mask"
 _PATCHED = False
-_ROLLOUT_TRACE_LOGGED = False
-_REPLAY_INJECTION_LOGGED = False
-_REPLAY_EMBED_BUILD_LOGGED = False
 _REPLAY_DTYPE_CAST_LOGGED = False
-_REPLAY_LATENT_LOGPROB_LOGGED = False
 _GRAD_FLOW_LOGGED = False
+_GRAD_FLOW_DEBUG = os.environ.get("QWEN3VL_CONTINUOUS_REPLAY_DEBUG", "0") == "1"
+_POLICY_VAE_LOGGED = False
+_ROLLOUT_CERT_LOGGED = False
+_REPLAY_CERT_LOGGED = False
 
 
 class LatentVAE(nn.Module):
@@ -133,42 +133,6 @@ def _resolve_qwen3vl_model(model):
     return None
 
 
-def _resolve_direct_qwen3vl_embed_tokens(model):
-    candidates = [
-        ("model", "language_model", "embed_tokens"),
-        ("language_model", "embed_tokens"),
-        ("model", "embed_tokens"),
-        ("embed_tokens",),
-    ]
-    for path in candidates:
-        node = model
-        ok = True
-        for attr_name in path:
-            node = getattr(node, attr_name, None)
-            if node is None:
-                ok = False
-                break
-        if not ok:
-            continue
-        weight = getattr(node, "weight", None)
-        if isinstance(weight, torch.Tensor) and weight.ndim == 2:
-            return node
-        unwrapped = _unwrap_embedding_candidate(node)
-        if unwrapped is not None:
-            return unwrapped
-
-    getter = getattr(model, "get_input_embeddings", None)
-    if callable(getter):
-        try:
-            layer = getter()
-        except Exception:
-            layer = None
-        unwrapped = _unwrap_embedding_candidate(layer)
-        if unwrapped is not None:
-            return unwrapped
-    return None
-
-
 def _unwrap_embedding_candidate(module):
     visited = set()
     queue = [module]
@@ -197,66 +161,10 @@ def _unwrap_embedding_candidate(module):
             except Exception:
                 pass
 
-        for attr_name in (
-            "_fsdp_wrapped_module",
-            "_orig_mod",
-            "_checkpoint_wrapped_module",
-            "base_layer",
-            "original_module",
-            "module",
-            "token_adapter",
-            "model",
-        ):
+        for attr_name in ("_fsdp_wrapped_module", "_orig_mod", "_checkpoint_wrapped_module", "base_layer", "original_module", "module", "token_adapter", "model"):
             child = getattr(node, attr_name, None)
             if child is not None:
                 queue.append(child)
-    return None
-
-
-def _resolve_qwen3vl_text_embedding_layer(model):
-    cached = getattr(model, "_continuous_replay_text_embedding_layer", None)
-    if cached is not None:
-        weight = getattr(cached, "weight", None)
-        if isinstance(weight, torch.Tensor) and weight.ndim == 2:
-            return cached
-
-    direct = _resolve_direct_qwen3vl_embed_tokens(model)
-    if direct is not None:
-        model._continuous_replay_text_embedding_layer = direct
-        return direct
-
-    candidates = []
-
-    def _collect_from(node):
-        if node is None:
-            return
-        for module_name, module in node.named_modules():
-            lowered = module_name.lower()
-            score = 0
-            if "embed_tokens" in lowered:
-                score += 100
-            if "word_embeddings" in lowered:
-                score += 90
-            if lowered.endswith("embed") or lowered.endswith("embedding"):
-                score += 20
-            layer = _unwrap_embedding_candidate(module)
-            if layer is None:
-                continue
-            weight = getattr(layer, "weight", None)
-            if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
-                continue
-            candidates.append((score, weight.shape[0], module_name, layer))
-
-    _collect_from(model)
-    for attr_name in ("language_model", "model", "base_model", "pretrained_model"):
-        child = getattr(model, attr_name, None)
-        if child is not None:
-            _collect_from(child)
-
-    if candidates:
-        candidates.sort(key=lambda item: (item[0], item[1], len(item[2])), reverse=True)
-        model._continuous_replay_text_embedding_layer = candidates[0][3]
-        return candidates[0][3]
     return None
 
 
@@ -272,34 +180,6 @@ def _resolve_hidden_size(model) -> int:
     if hidden_size is None:
         raise RuntimeError("Could not resolve hidden_size for latent replay")
     return int(hidden_size)
-
-
-def inspect_replay_binding(actor_module) -> dict:
-    qwen3vl_model = _resolve_qwen3vl_model(actor_module)
-    actor_embed = _resolve_input_embedding_layer(actor_module)
-    qwen_embed = _resolve_input_embedding_layer(qwen3vl_model) if qwen3vl_model is not None else None
-
-    def _module_summary(module):
-        if module is None:
-            return None
-        weight = getattr(module, "weight", None)
-        return {
-            "class": module.__class__.__name__,
-            "module": module.__class__.__module__,
-            "weight_shape": list(weight.shape) if isinstance(weight, torch.Tensor) else None,
-        }
-
-    return {
-        "qwen3vl_model": {
-            "class": qwen3vl_model.__class__.__name__,
-            "module": qwen3vl_model.__class__.__module__,
-        }
-        if qwen3vl_model is not None
-        else None,
-        "actor_api_embed": _module_summary(actor_embed),
-        "qwen_api_embed": _module_summary(qwen_embed),
-        "ok": actor_embed is not None or qwen_embed is not None,
-    }
 
 
 def _checkpoint_if_needed(function, *args):
@@ -497,6 +377,7 @@ def _resolve_vae_path(preferred_dir: str | None = None) -> Path | None:
 
 
 def _load_policy_latent_vae(policy) -> None:
+    global _POLICY_VAE_LOGGED
     vae_path = _resolve_vae_path()
     if vae_path is None:
         policy.latent_vae = None
@@ -520,38 +401,14 @@ def _load_policy_latent_vae(policy) -> None:
         new_params = [param for param in policy.latent_vae.parameters() if id(param) not in existing_param_ids]
         if new_params:
             policy.actor_optimizer.add_param_group({"params": new_params})
-    logger.warning(
-        "[ContinuousReplay] Loaded latent_vae path=%s trainable=%s params=%s",
-        vae_path,
-        bool(policy.actor_optimizer is not None),
-        sum(param.numel() for param in policy.latent_vae.parameters()),
-    )
-
-
-def _bind_policy_qwen3vl_replay_modules(policy) -> None:
-    qwen3vl_model = _resolve_qwen3vl_model(policy.actor_module)
-    policy._continuous_replay_qwen3vl_model = qwen3vl_model
-    policy._continuous_replay_text_embedding_layer = None
-    if qwen3vl_model is None:
-        logger.warning("[ContinuousReplay] Replay bind: Qwen3VL model not found under actor module.")
-        return
-
-    api_embed_layer = _resolve_input_embedding_layer(policy.actor_module)
-    qwen_api_embed_layer = _resolve_input_embedding_layer(qwen3vl_model)
-    embed_layer = api_embed_layer or qwen_api_embed_layer
-    embed_weight = getattr(embed_layer, "weight", None)
-    logger.warning(
-        "[ContinuousReplay] Replay bind: qwen_model=%s embed=%s embed_module=%s weight_shape=%s source=%s",
-        qwen3vl_model.__class__.__name__,
-        embed_layer.__class__.__name__ if embed_layer is not None else None,
-        embed_layer.__class__.__module__ if embed_layer is not None else None,
-        tuple(embed_weight.shape) if isinstance(embed_weight, torch.Tensor) else None,
-        (
-            "actor_api"
-            if api_embed_layer is not None
-            else ("qwen_api" if qwen_api_embed_layer is not None else "missing")
-        ),
-    )
+    if not _POLICY_VAE_LOGGED:
+        logger.warning(
+            "[ContinuousReplay] Actor latent VAE loaded: path=%s trainable=%s params=%s",
+            vae_path,
+            bool(policy.actor_optimizer is not None),
+            sum(param.numel() for param in policy.latent_vae.parameters()),
+        )
+        _POLICY_VAE_LOGGED = True
 
 
 def _restore_policy_latent_vae(policy, checkpoint_dir: str | None) -> None:
@@ -579,7 +436,11 @@ def _restore_policy_latent_vae(policy, checkpoint_dir: str | None) -> None:
 
 
 def _has_continuous_replay_inputs(micro_batch) -> bool:
-    return CONTINUOUS_HIDDEN_KEY in micro_batch and CONTINUOUS_MASK_KEY in micro_batch
+    return (
+        CONTINUOUS_HIDDEN_KEY in micro_batch
+        and CONTINUOUS_LATENT_KEY in micro_batch
+        and CONTINUOUS_MASK_KEY in micro_batch
+    )
 
 
 def _iter_object_array_rows(value) -> Iterable:
@@ -595,6 +456,30 @@ def _pack_object_rows(rows: list[object]) -> np.ndarray:
     for idx, row in enumerate(rows):
         packed[idx] = row
     return packed
+
+
+def _validate_request_trace(trace: dict, request_id: str, response_length: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    hidden_row = np.asarray(trace[CONTINUOUS_HIDDEN_KEY], dtype=np.float16)
+    latent_row = np.asarray(trace[CONTINUOUS_LATENT_KEY], dtype=np.float16)
+    mask_row = np.asarray(trace[CONTINUOUS_MASK_KEY], dtype=np.bool_).reshape(-1)
+
+    if hidden_row.ndim == 1 and hidden_row.size > 0:
+        hidden_row = hidden_row.reshape(1, -1)
+    if latent_row.ndim == 1 and latent_row.size > 0:
+        latent_row = latent_row.reshape(1, -1)
+
+    if mask_row.size > response_length:
+        mask_row = mask_row[:response_length]
+    active_positions = int(mask_row.sum())
+    hidden_steps = int(hidden_row.shape[0]) if hidden_row.ndim == 2 else 0
+    latent_steps = int(latent_row.shape[0]) if latent_row.ndim == 2 else 0
+    if hidden_steps != active_positions or latent_steps != active_positions:
+        raise RuntimeError(
+            "Continuous replay trace shape mismatch for request_id="
+            f"{request_id}: active_positions={active_positions} hidden_steps={hidden_steps} latent_steps={latent_steps}"
+        )
+
+    return hidden_row, latent_row, mask_row
 
 
 def _build_qwen3vl_input_embeds_compat(
@@ -675,71 +560,20 @@ def _build_qwen3vl_input_embeds_compat(
     }
 
 
-def _build_base_inputs_embeds(
-    policy,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    multi_modal_inputs: dict | None,
-) -> tuple[torch.Tensor, dict]:
-    global _REPLAY_EMBED_BUILD_LOGGED
-    qwen3vl_model = getattr(policy, "_continuous_replay_qwen3vl_model", None)
-    qwen3vl_text_embedding = getattr(policy, "_continuous_replay_text_embedding_layer", None)
-    if qwen3vl_model is not None:
-        embed_weight = getattr(qwen3vl_text_embedding, "weight", None)
-        if not isinstance(embed_weight, torch.Tensor) or embed_weight.ndim != 2:
-            _bind_policy_qwen3vl_replay_modules(policy)
-            qwen3vl_model = getattr(policy, "_continuous_replay_qwen3vl_model", None)
-            qwen3vl_text_embedding = getattr(policy, "_continuous_replay_text_embedding_layer", None)
-        with torch.no_grad():
-            input_kwargs = _build_qwen3vl_input_embeds_compat(
-                qwen3vl_model,
-                embed_layer=qwen3vl_text_embedding,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pixel_values=(multi_modal_inputs or {}).get("pixel_values"),
-                pixel_values_videos=(multi_modal_inputs or {}).get("pixel_values_videos"),
-                image_grid_thw=(multi_modal_inputs or {}).get("image_grid_thw"),
-                video_grid_thw=(multi_modal_inputs or {}).get("video_grid_thw"),
-            )
-
-        inputs_embeds = input_kwargs["inputs_embeds"].detach()
-        replay_model_kwargs = {}
-        visual_pos_masks = input_kwargs.get("visual_pos_masks")
-        deepstack_visual_embeds = input_kwargs.get("deepstack_visual_embeds")
-        if visual_pos_masks is not None:
-            replay_model_kwargs["visual_pos_masks"] = visual_pos_masks.detach()
-        if deepstack_visual_embeds is not None:
-            replay_model_kwargs["deepstack_visual_embeds"] = [embed.detach() for embed in deepstack_visual_embeds]
-        if not _REPLAY_EMBED_BUILD_LOGGED:
-            logger.warning(
-                "[ContinuousReplay] Using direct Qwen3VL multimodal embedding builder for replay inputs."
-            )
-            _REPLAY_EMBED_BUILD_LOGGED = True
-        return inputs_embeds, replay_model_kwargs
-
-    embed_layer = _resolve_input_embedding_layer(policy.actor_module)
-    if embed_layer is None:
-        raise RuntimeError("Continuous replay could not resolve input embedding layer")
-    with torch.no_grad():
-        inputs_embeds = embed_layer(input_ids)
-    if not _REPLAY_EMBED_BUILD_LOGGED:
-        logger.warning("[ContinuousReplay] Using embedding-layer fallback for replay inputs.")
-        _REPLAY_EMBED_BUILD_LOGGED = True
-    return inputs_embeds.detach(), {}
-
-
 def _prepare_inputs_embeds(
     policy,
     micro_batch,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor | None,
     multi_modal_inputs: dict | None,
-) -> tuple[torch.Tensor | None, dict, dict]:
-    global _REPLAY_INJECTION_LOGGED
+) -> tuple[dict, dict]:
+    global _REPLAY_CERT_LOGGED
+    del attention_mask
+    del multi_modal_inputs
     if not _has_continuous_replay_inputs(micro_batch):
-        return None, {}, {}
+        return {}, {}
     if getattr(policy, "latent_vae", None) is None:
-        return None, {}, {}
+        return {}, {}
 
     response_length = int(micro_batch["responses"].size(-1))
     response_start = input_ids.size(1) - response_length
@@ -802,18 +636,17 @@ def _prepare_inputs_embeds(
         next_row_id += n_steps
         total_replaced_positions += int(n_steps)
 
-    if total_replaced_positions > 0 and not _REPLAY_INJECTION_LOGGED:
+    if total_replaced_positions == 0:
+        return {}, {}
+    if not _REPLAY_CERT_LOGGED:
         logger.warning(
-            "[ContinuousReplay] Replay injection active: batch=%s response_len=%s replaced_positions=%s latent_vae_trainable=%s",
+            "[ContinuousReplay] Actor replay active: batch=%s full_seq_len=%s response_len=%s continuous_positions=%s discrete_positions_preserved=true source=saved_rollout_latents",
             int(input_ids.size(0)),
+            int(input_ids.size(1)),
             int(response_length),
             total_replaced_positions,
-            any(param.requires_grad for param in vae.parameters()),
         )
-        _REPLAY_INJECTION_LOGGED = True
-
-    if total_replaced_positions == 0:
-        return None, {}, {}
+        _REPLAY_CERT_LOGGED = True
 
     replay_state = {
         "continuous_replay_row_ids": replay_row_ids,
@@ -821,7 +654,7 @@ def _prepare_inputs_embeds(
         "continuous_replay_latent_embeddings": torch.cat(latent_tensors, dim=0),
         "continuous_replay_latent_vae": vae,
     }
-    return None, {
+    return {
         "continuous_replay_row_ids": replay_row_ids,
         "continuous_replay_latent_embeddings": replay_state["continuous_replay_latent_embeddings"],
     }, replay_state
@@ -832,7 +665,6 @@ def _merge_continuous_policy_stats(
     entropy: torch.Tensor | None,
     replay_state: dict,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    global _REPLAY_LATENT_LOGPROB_LOGGED
     if not replay_state:
         return log_probs, entropy
 
@@ -858,12 +690,6 @@ def _merge_continuous_policy_stats(
     merged_log_probs = log_probs.clone()
     selected_row_ids = response_row_ids[replay_mask].to(dtype=torch.long)
     merged_log_probs[replay_mask] = latent_log_probs.index_select(0, selected_row_ids)
-    if not _REPLAY_LATENT_LOGPROB_LOGGED:
-        logger.warning(
-            "[ContinuousReplay] Replaced discrete log_probs with latent VAE log_probs at %s continuous positions.",
-            int(replay_mask.to(torch.int64).sum().item()),
-        )
-        _REPLAY_LATENT_LOGPROB_LOGGED = True
 
     merged_entropy = entropy
     if entropy is not None:
@@ -884,15 +710,9 @@ def _compact_replay_model_kwargs_for_rmpad(replay_model_kwargs: dict, indices, d
         ).transpose(0, 1)
         compacted["continuous_replay_row_ids"] = replay_row_ids_rmpad.squeeze(-1)
 
-    hidden_states = replay_model_kwargs.get("continuous_replay_hidden_states")
-    if hidden_states is not None:
-        compacted["continuous_replay_hidden_states"] = hidden_states
     latent_embeddings = replay_model_kwargs.get("continuous_replay_latent_embeddings")
     if latent_embeddings is not None:
         compacted["continuous_replay_latent_embeddings"] = latent_embeddings
-    latent_vae = replay_model_kwargs.get("continuous_replay_latent_vae")
-    if latent_vae is not None:
-        compacted["continuous_replay_latent_vae"] = latent_vae
 
     return compacted
 
@@ -967,12 +787,8 @@ def _patch_verl_qwen3vl_inputs_embeds_support() -> None:
         **kwargs,
     ):
         continuous_replay_row_ids = kwargs.pop("continuous_replay_row_ids", None)
-        continuous_replay_hidden_states = kwargs.pop("continuous_replay_hidden_states", None)
         continuous_replay_latent_embeddings = kwargs.pop("continuous_replay_latent_embeddings", None)
-        continuous_replay_latent_vae = kwargs.pop("continuous_replay_latent_vae", None)
         inputs_embeds = kwargs.pop("inputs_embeds", None)
-        del continuous_replay_hidden_states
-        del continuous_replay_latent_vae
 
         if inputs_embeds is None:
             input_kwargs = qwen3_vl_mod._get_input_embeds(
@@ -1009,8 +825,6 @@ def _patch_verl_qwen3vl_inputs_embeds_support() -> None:
 
     Qwen3VLModel.forward = compat_qwen3_vl_base_forward
     Qwen3VLMoeModel.forward = compat_qwen3_vl_base_forward
-    logger.warning("Patched VERL Qwen3VL model forward to inject continuous replay inside model embedding path.")
-
 
 def apply_continuous_replay_patches() -> None:
     global _PATCHED
@@ -1027,7 +841,6 @@ def apply_continuous_replay_patches() -> None:
 
     def compat_policy_init(self, config, actor_module, actor_optimizer=None):
         original_policy_init(self, config=config, actor_module=actor_module, actor_optimizer=actor_optimizer)
-        _bind_policy_qwen3vl_replay_modules(self)
         _load_policy_latent_vae(self)
 
     def compat_forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False):
@@ -1053,15 +866,13 @@ def apply_continuous_replay_patches() -> None:
             if position_ids.dim() == 3:
                 position_ids = position_ids.transpose(0, 1)
 
-            inputs_embeds, replay_model_kwargs, replay_state = _prepare_inputs_embeds(
+            replay_model_kwargs, replay_state = _prepare_inputs_embeds(
                 self,
                 micro_batch,
                 input_ids,
                 attention_mask=attention_mask,
                 multi_modal_inputs=multi_modal_inputs,
             )
-            if not replay_model_kwargs:
-                replay_model_kwargs = {}
 
             extra_args = {}
             if self.use_fused_kernels:
@@ -1342,7 +1153,8 @@ def apply_continuous_replay_patches() -> None:
                         self.scaler.scale(loss).backward()
                     else:
                         loss.backward()
-                    _log_grad_flow_probe(self, model_inputs)
+                    if _GRAD_FLOW_DEBUG:
+                        _log_grad_flow_probe(self, model_inputs)
 
                     micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
                     dp_actor_mod.append_to_dict(metrics, micro_batch_metrics)
@@ -1353,6 +1165,7 @@ def apply_continuous_replay_patches() -> None:
         return metrics
 
     def compat_rollout_generate_sequences(self, prompts, **kwargs):
+        global _ROLLOUT_CERT_LOGGED
         from verl import DataProto
         from tensordict import TensorDict
         from vllm.lora.request import LoRARequest
@@ -1426,6 +1239,21 @@ def apply_continuous_replay_patches() -> None:
             rollout_log_probs = []
             for output in outputs:
                 trace = pop_request_trace(output.request_id)
+                if len(output.outputs) != 1:
+                    raise RuntimeError(
+                        "Continuous replay currently requires exactly one sampled output per vLLM request; "
+                        f"got {len(output.outputs)} outputs for request_id={output.request_id}"
+                    )
+                if trace is None:
+                    raise RuntimeError(
+                        "Continuous replay trace missing for vLLM request_id="
+                        f"{output.request_id}. This indicates trace capture did not survive rollout."
+                    )
+                hidden_row, latent_row, mask_row = _validate_request_trace(
+                    trace,
+                    request_id=str(output.request_id),
+                    response_length=self.config.response_length,
+                )
                 for sample_id in range(len(output.outputs)):
                     response_ids = output.outputs[sample_id].token_ids
                     response.append(response_ids)
@@ -1434,19 +1262,22 @@ def apply_continuous_replay_patches() -> None:
                         for i, logprob in enumerate(output.outputs[sample_id].logprobs):
                             curr_log_prob.append(logprob[response_ids[i]].logprob)
 
-                    if sample_id == 0 and trace is not None:
-                        continuous_hidden_states.append(trace[CONTINUOUS_HIDDEN_KEY])
-                        continuous_latent_embeddings.append(trace.get(CONTINUOUS_LATENT_KEY, np.empty((0, 0), dtype=np.float16)))
-                        continuous_token_masks.append(trace[CONTINUOUS_MASK_KEY])
+                    if sample_id == 0:
+                        continuous_hidden_states.append(hidden_row)
+                        continuous_latent_embeddings.append(latent_row)
+                        continuous_token_masks.append(mask_row)
                         if self.config.calculate_log_probs:
                             latent_log_probs = np.asarray(
                                 trace.get(CONTINUOUS_LATENT_LOGPROB_KEY, np.empty((0,), dtype=np.float32)),
                                 dtype=np.float32,
                             ).reshape(-1)
-                            mask_np = np.asarray(trace[CONTINUOUS_MASK_KEY], dtype=np.bool_).reshape(-1)
-                            true_positions = np.flatnonzero(mask_np)
-                            n_steps = min(len(curr_log_prob), true_positions.size, latent_log_probs.shape[0])
-                            for pos_idx in range(n_steps):
+                            true_positions = np.flatnonzero(mask_row)
+                            if latent_log_probs.shape[0] != true_positions.size:
+                                raise RuntimeError(
+                                    "Continuous replay latent log_prob mismatch for request_id="
+                                    f"{output.request_id}: latent_log_probs={latent_log_probs.shape[0]} active_positions={true_positions.size}"
+                                )
+                            for pos_idx in range(true_positions.size):
                                 curr_log_prob[int(true_positions[pos_idx])] = float(latent_log_probs[pos_idx])
                     else:
                         continuous_hidden_states.append(np.empty((0, 0), dtype=np.float16))
@@ -1495,38 +1326,27 @@ def apply_continuous_replay_patches() -> None:
         non_tensor_batch[CONTINUOUS_HIDDEN_KEY] = _pack_object_rows(continuous_hidden_states)
         non_tensor_batch[CONTINUOUS_LATENT_KEY] = _pack_object_rows(continuous_latent_embeddings)
         non_tensor_batch[CONTINUOUS_MASK_KEY] = _pack_object_rows(continuous_token_masks)
-        global _ROLLOUT_TRACE_LOGGED
-        if not _ROLLOUT_TRACE_LOGGED:
-            nonempty_traces = sum(int(getattr(item, "shape", (0,))[0] > 0) for item in continuous_hidden_states)
+        if not _ROLLOUT_CERT_LOGGED:
+            traced_samples = sum(int(getattr(item, "shape", (0,))[0] > 0) for item in continuous_hidden_states)
             active_positions = sum(int(np.asarray(mask, dtype=np.bool_).sum()) for mask in continuous_token_masks)
+            saved_latents = sum(int(getattr(item, "shape", (0,))[0] > 0) for item in continuous_latent_embeddings)
             logger.warning(
-                "[ContinuousReplay] Rollout trace batch: samples=%s traced=%s active_positions=%s response_len=%s saved_latents=%s",
+                "[ContinuousReplay] Rollout trace active: samples=%s traced=%s response_len=%s active_positions=%s saved_latents=%s",
                 len(continuous_hidden_states),
-                nonempty_traces,
-                active_positions,
+                traced_samples,
                 int(response.size(1)),
-                sum(int(getattr(item, "shape", (0,))[0] > 0) for item in continuous_latent_embeddings),
+                active_positions,
+                saved_latents,
             )
-            _ROLLOUT_TRACE_LOGGED = True
+            _ROLLOUT_CERT_LOGGED = True
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
-
-    original_rollout_generate_sequences = rollout_mod.vLLMRollout.generate_sequences
-
-    def compat_rollout_generate_sequences_with_fallback(self, prompts, **kwargs):
-        try:
-            return compat_rollout_generate_sequences(self, prompts, **kwargs)
-        except Exception:
-            logger.exception("Continuous replay rollout trace capture failed; falling back to default rollout.")
-            return original_rollout_generate_sequences(self, prompts, **kwargs)
 
     dp_actor_mod.DataParallelPPOActor.__init__ = compat_policy_init
     dp_actor_mod.DataParallelPPOActor._forward_micro_batch = compat_forward_micro_batch
     dp_actor_mod.DataParallelPPOActor.compute_log_prob = compat_compute_log_prob
     dp_actor_mod.DataParallelPPOActor.update_policy = compat_update_policy
-    rollout_mod.vLLMRollout.generate_sequences = compat_rollout_generate_sequences_with_fallback
+    rollout_mod.vLLMRollout.generate_sequences = compat_rollout_generate_sequences
     _PATCHED = True
-    logger.warning("Applied repo-local continuous replay patches.")
-
 
 __all__ = [
     "CONTINUOUS_HIDDEN_KEY",

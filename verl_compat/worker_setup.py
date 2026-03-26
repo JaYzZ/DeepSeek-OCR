@@ -2,20 +2,18 @@
 
 from __future__ import annotations
 
-import json
-import logging
 import os
 import sys
 
-logger = logging.getLogger(__name__)
+from .bootstrap import apply_runtime_compat_patches
+from vllm.lora.models import LoRAModel
+from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager, WorkerLoRAManager
+from verl.utils.vllm.utils import VLLMHijack
 
 
 def collect_patch_diagnostics() -> dict:
     rollout_module = sys.modules.get("verl.workers.rollout.vllm_rollout.vllm_rollout_spmd")
     sharding_module = sys.modules.get("verl.workers.sharding_manager.fsdp_vllm")
-    from vllm.lora.models import LoRAModel
-    from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager, WorkerLoRAManager
-    from verl.utils.vllm.utils import VLLMHijack
 
     return {
         "compat_env_flag": os.environ.get("QWEN3VL_APPLY_VERL_PATCHES"),
@@ -56,8 +54,4 @@ def collect_patch_diagnostics() -> dict:
 
 
 def apply_worker_compat_patches() -> None:
-    from .bootstrap import apply_runtime_compat_patches
-
     apply_runtime_compat_patches()
-    diagnostics = collect_patch_diagnostics()
-    logger.warning("VERL compat worker setup ok: %s", json.dumps(diagnostics, sort_keys=True))

@@ -125,7 +125,6 @@ def _build_load_adapter():
 class VLLMHijack:
     @staticmethod
     def hijack() -> None:
-        patched = False
         _install_multimodal_lora_warning_filters()
         original_from_lora_tensors = LoRAModel.from_lora_tensors.__func__
 
@@ -139,17 +138,12 @@ class VLLMHijack:
 
             compat_from_lora_tensors._qwen3vl_compat_patch = True
             LoRAModel.from_lora_tensors = classmethod(compat_from_lora_tensors)
-            patched = True
 
         compat_load_adapter = _build_load_adapter()
         for cls in (WorkerLoRAManager, LRUCacheWorkerLoRAManager):
             current = getattr(cls, "_load_adapter", None)
             if not getattr(current, "_qwen3vl_compat_patch", False):
                 setattr(cls, "_load_adapter", compat_load_adapter)
-                patched = True
-
-        if patched:
-            logger.warning("Installed repo-local vLLM LoRA compatibility patch.")
 
 
 def is_version_ge(pkg: str = "vllm", minver: str = "0.7.3") -> bool:
