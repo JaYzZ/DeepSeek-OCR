@@ -16,7 +16,7 @@ import os
 import sys
 import time
 import traceback
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -35,6 +35,7 @@ from llamafactory.data import SFTDataCollatorWith4DAttentionMask, loader as load
 from llamafactory.data.converter import SharegptDatasetConverter
 from llamafactory.data.mm_plugin import Qwen3VLPlugin
 from llamafactory.data.processor.processor_utils import greedy_knapsack
+from llamafactory.extras.constants import FILEEXT2TYPE
 from llamafactory.data.processor.supervised import PackedSupervisedDatasetProcessor, SupervisedDatasetProcessor
 from llamafactory.data.template import (
     FunctionFormatter,
@@ -48,6 +49,11 @@ from llamafactory.train.sft.trainer import CustomSeq2SeqTrainer
 
 from Qwen.llamafactory.transparent_eval_callback import QwenTransparentEvalCallback
 from Qwen.llamafactory.curriculum_callback import QwenCurriculumCallback
+
+try:
+    import swanlab  # type: ignore
+except ImportError:
+    swanlab = None
 
 logger = logging.getLogger(__name__)
 debug_enabled = os.environ.get("LLAMAFACTORY_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -72,8 +78,6 @@ class QwenLossLoggingCallback(TrainerCallback):
     def __init__(self, model: Any) -> None:
         self._model = model
         self._last_logged_step: int | None = None
-        self._swanlab: Any = None
-        self._swanlab_checked = False
         self._swanlab_enabled: bool | None = None
 
     def on_log(self, args, state, control, logs=None, **kwargs):
@@ -203,20 +207,11 @@ class QwenLossLoggingCallback(TrainerCallback):
         if not self._swanlab_is_enabled(args):
             return
 
-        if not self._swanlab_checked:
-            self._swanlab_checked = True
-            try:
-                import swanlab  # type: ignore
-
-                self._swanlab = swanlab
-            except Exception:
-                self._swanlab = None
-
-        if self._swanlab is None:
+        if swanlab is None:
             return
 
         try:
-            self._swanlab.log(metrics, step=step)
+            swanlab.log(metrics, step=step)
         except Exception as e:
             logger.debug(f"[Qwen3VL Latent] swanlab.log failed: {e}")
 
@@ -432,6 +427,49 @@ def _patch_tokenizer_for_special_tokens(logger) -> None:
     logger.debug("[Qwen3VL Latent] Patched AutoTokenizer for special tokens")
 
 
+def _patch_loader_file_extension_filter(logger: logging.Logger) -> None:
+    """Patch LlamaFactory loader to filter files by supported extensions.
+
+    Fixes bug where metadata files (README.md, .gitattributes, etc.) in dataset
+    directories cause "Allowed file types" errors.
+
+    The bug is in llamafactory.data.loader._load_single_dataset() where it
+    blindly adds all files from os.listdir() without filtering by extension.
+
+    Solution: Monkey-patch os.listdir to filter results when called from
+    _load_single_dataset on dataset directories.
+    """
+    try:
+        original_listdir = os.listdir
+
+        def _patched_listdir(path):
+            """Filter listdir results when called from _load_single_dataset."""
+            # Check if we're being called from _load_single_dataset
+            call_stack = traceback.extract_stack()
+            in_loader = any('_load_single_dataset' in frame.name for frame in call_stack)
+
+            all_files = original_listdir(path)
+
+            if in_loader:
+                # Filter to only supported extensions
+                filtered = [
+                    f for f in all_files
+                    if os.path.splitext(f)[-1][1:].lower() in FILEEXT2TYPE
+                ]
+                return filtered
+            return all_files
+
+        os.listdir = _patched_listdir
+
+        if _is_rank0():
+            logger.info("[Qwen3VL Loader] Patched os.listdir to filter files when loading datasets")
+
+    except ImportError as e:
+        logger.warning(f"[Qwen3VL Loader] Failed to import loader module: {e}")
+    except Exception as e:
+        logger.warning(f"[Qwen3VL Loader] Failed to patch loader: {e}")
+
+
 def _patch_once() -> None:
     """Apply patches once per process."""
     # Check if latent supervision is enabled (default: 1 for latent thinking training)
@@ -449,6 +487,12 @@ def _patch_once() -> None:
 
     if _is_rank0():
         logger.info("[Qwen3VL Latent] Starting latent supervision integration...")
+
+    # Patch -1: Fix loader file extension filter bug
+    try:
+        _patch_loader_file_extension_filter(logger)
+    except Exception as e:
+        logger.warning(f"[Qwen3VL Loader] Failed to apply loader patch: {e}")
 
     # Patch 0: Patch tokenizer for special tokens (<latent>, <think_sep>)
     try:
@@ -4129,7 +4173,6 @@ def _compute_pred_embed_forward_loss(
 
 # Module-level cache for latent tensors (to avoid reference issues after function wrapping)
 # Using OrderedDict for O(1) LRU operations
-from collections import OrderedDict
 _LATENT_TENSOR_CACHE: OrderedDict = OrderedDict()
 # Centralized user-facing knob:
 # - Tensor cache size = QWEN3VL_LATENT_CACHE_SIZE

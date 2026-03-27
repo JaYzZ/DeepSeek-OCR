@@ -626,7 +626,10 @@ fi
 
 cleanup_vllm_benchmark_processes() {
     # Ensure leaked vLLM worker/core processes do not affect later jobs.
-    pkill -9 -f "VLLM::EngineCore" || true
+    "$PYTHON_BIN" - <<'PY'
+from Qwen.scripts.vllm_utils import cleanup_vllm_engine_processes
+cleanup_vllm_engine_processes()
+PY
 }
 
 if [ "$train_exit_code" -eq 0 ] && [ "$RUN_BENCHMARK" = "1" ]; then

@@ -1,0 +1,77 @@
+### model
+# Native Qwen3-VL-2B-Thinking plain SFT on DeepVision-103K JSONL with extracted
+# images. This uses the standard qwen3vl template, not the latent r1ov path.
+model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking
+image_max_pixels: 262144
+video_max_pixels: 16384
+trust_remote_code: true
+flash_attn: fa2
+
+### method
+stage: sft
+do_train: true
+do_eval: false
+finetuning_type: lora
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target: q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj
+freeze_vision_tower: true
+
+### dataset
+dataset: qwen3vl_deepvision_sft
+dataset_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/data
+template: qwen3_vl
+cutoff_len: 2048
+max_samples: null
+streaming: false
+packing: false
+preprocessing_num_workers: 8
+dataloader_num_workers: 8
+dataloader_prefetch_factor: 8
+dataloader_pin_memory: true
+dataloader_persistent_workers: true
+
+### output
+output_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/qwen3vl-2b/lora/deepvision_sft
+logging_steps: 10
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: false
+save_only_model: false
+report_to: none
+
+### train
+per_device_train_batch_size: 32
+gradient_accumulation_steps: 2
+dataloader_drop_last: true
+learning_rate: 2.0e-4
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+pure_bf16: true
+gradient_checkpointing: false
+
+fsdp:
+  - full_shard
+  - auto_wrap
+fsdp_config:
+  activation_checkpointing: true
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  transformer_layer_cls_to_wrap:
+    - "Qwen3VLTextDecoderLayer"
+    - "Qwen3VLVisionBlock"
+    - "Qwen3VLVisionPatchMerger"
+  ignored_modules: "model\\.visual(\\..*)?"
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_forward_prefetch: false
+  fsdp_use_orig_params: true
+  fsdp_cpu_ram_efficient_loading: false
+  fsdp_sync_module_states: true
+  fsdp_state_dict_type: full_state_dict
+
+ddp_find_unused_parameters: false
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+adapter_name_or_path: null

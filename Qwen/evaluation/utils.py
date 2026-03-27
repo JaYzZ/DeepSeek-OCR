@@ -93,12 +93,26 @@ def get_model_attention_heads(model_path: str) -> Optional[int]:
 
 def compatible_tensor_parallel_candidates(max_requested_tp: int) -> list[int]:
     upper = max(1, max_requested_tp)
+    return list(range(upper, 0, -1))
+
+
+def capped_tensor_parallel_candidates(max_requested_tp: int) -> list[int]:
+    upper = max(1, max_requested_tp)
     return [tp for tp in (4, 2, 1) if tp <= upper] or [1]
 
 
-def pick_compatible_tensor_parallel_size(model_path: str, requested_tp: int) -> int:
+def pick_compatible_tensor_parallel_size(
+    model_path: str,
+    requested_tp: int,
+    *,
+    capped: bool = False,
+) -> int:
     attn_heads = get_model_attention_heads(model_path)
-    allowed_tps = compatible_tensor_parallel_candidates(requested_tp)
+    allowed_tps = (
+        capped_tensor_parallel_candidates(requested_tp)
+        if capped
+        else compatible_tensor_parallel_candidates(requested_tp)
+    )
     if not attn_heads:
         return allowed_tps[0]
 
@@ -111,9 +125,15 @@ def pick_compatible_tensor_parallel_size(model_path: str, requested_tp: int) -> 
 def select_compatible_tensor_parallel_gpus(
     model_path: str,
     gpus: list[int],
+    *,
+    capped: bool = False,
 ) -> tuple[list[int], int]:
     if not gpus:
         return [], 1
 
-    tensor_parallel_size = pick_compatible_tensor_parallel_size(model_path, len(gpus))
+    tensor_parallel_size = pick_compatible_tensor_parallel_size(
+        model_path,
+        len(gpus),
+        capped=capped,
+    )
     return list(gpus[:tensor_parallel_size]), tensor_parallel_size

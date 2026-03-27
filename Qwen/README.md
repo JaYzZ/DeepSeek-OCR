@@ -11,6 +11,21 @@ This repo currently maintains two active Qwen3-VL training paths:
 tmux new-session -d -s r1_sft 'CUDA_VISIBLE_DEVICES=0,1,2,3 bash Qwen/scripts/train_qwen3vl_r1onevision.sh Qwen/configs/qwen3vl_native_r1onevision_thinking.yaml'
 ```
 
+## DeepVision Plain SFT (Direct Parquet, No Image Materialization)
+
+Launch plain Qwen3VL SFT directly from the original DeepVision parquet files:
+
+```bash
+tmux new-session -d -s deepvision_sft 'CUDA_VISIBLE_DEVICES=0,1,2,3 bash Qwen/scripts/train_qwen3vl.sh Qwen/configs/qwen3vl_native_deepvision_sft.yaml'
+```
+
+Notes:
+- This path does not use latent `<think>` supervision.
+- It does not create copied image folders, rendered thinking images, encoded `.pt` latent files, or prebuilt SFT parquet.
+- The dataset definition in [dataset_info.json](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/data/dataset_info.json) points directly at the raw DeepVision parquet directory.
+- A small runtime patch in [converter.py](/share/project/xiyan/sources/LlamaFactory/src/llamafactory/data/converter.py) lets ShareGPT datasets append an assistant target from a nested field like `reward_model.ground_truth`.
+- At load time, `datasets` decodes the inline parquet image bytes into PIL images, so training still avoids any extra image-materialization folder.
+
 ## DeepVision GSPO (VERL + vLLM)
 
 ### 1. Build RL parquet from local DeepVision-103K

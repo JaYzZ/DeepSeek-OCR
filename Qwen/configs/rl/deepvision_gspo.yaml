@@ -76,6 +76,8 @@ actor_rollout_ref:
     engine_kwargs:
       vllm:
         disable_mm_preprocessor_cache: ${oc.decode:${oc.env:ROLLOUT_DISABLE_MM_PREPROCESSOR_CACHE,false}}
+    agent:
+      num_workers: ${oc.decode:${oc.env:AGENT_NUM_WORKERS,4}}
 
 reward_model:
   reward_manager: dapo_batch

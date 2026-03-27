@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 from typing import List, Optional
 
@@ -95,3 +96,27 @@ def apply_runtime_env_for_thinking(
             f"VLLM_FORCE_THINK={os.environ['VLLM_FORCE_THINK']}, "
             f"VLLM_ENFORCE_EAGER={os.environ['VLLM_ENFORCE_EAGER']}"
         )
+
+
+def cleanup_vllm_engine_processes(logger=None) -> None:
+    """Kill leaked vLLM engine-core workers that can survive parent shutdown."""
+
+    def _emit(msg: str) -> None:
+        if logger is not None:
+            if hasattr(logger, "log"):
+                logger.log(msg)
+            elif hasattr(logger, "info"):
+                logger.info(msg)
+        else:
+            print(msg)
+
+    try:
+        subprocess.run(
+            ["pkill", "-9", "-f", "VLLM::EngineCore"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _emit("Cleaned up leaked vLLM engine-core processes")
+    except Exception as e:
+        _emit(f"Warning: Failed to clean vLLM engine-core processes: {e}")

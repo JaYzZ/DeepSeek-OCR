@@ -35,7 +35,7 @@ vae_intermediate_size: 512
 ### curriculum
 curriculum_enable: 1
 curriculum_epochs: 0
-curriculum_loss_types: ce+embed_ce+vae:0.0+mse:0.4+ot:0.4
+curriculum_loss_types: ce+embed_ce+vae:0.1+mse:0.4+ot:0.4
 curriculum_latent_step_ce: 1
 
 ### backfill / transparent eval

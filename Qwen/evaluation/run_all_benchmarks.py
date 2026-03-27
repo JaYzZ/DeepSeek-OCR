@@ -39,7 +39,10 @@ sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(_EVAL_DIR))
 from config import get_data_path, QWEN3_VL_2B_THINKING
 from utils import select_compatible_tensor_parallel_gpus
-from Qwen.scripts.vllm_utils import apply_runtime_env_for_thinking
+from Qwen.scripts.vllm_utils import (
+    apply_runtime_env_for_thinking,
+    cleanup_vllm_engine_processes,
+)
 
 LOCAL_JUDGE_DEFAULT_MODEL = "/share/project/xiyan/huggingface/Qwen/Qwen2.5-VL-7B-Instruct"
 
@@ -305,6 +308,47 @@ def stop_managed_process(
             if logger:
                 logger.log(warn_msg)
     print(f"✓ {label} stopped")
+
+
+def _stream_managed_process_output(
+    process: subprocess.Popen,
+    prefix: str,
+    output_lines: deque,
+    logger: "BenchmarkLogger" = None,
+) -> threading.Thread:
+    """Mirror managed child output to console, benchmark.log, and an in-memory tail."""
+
+    def _stream() -> None:
+        for line in process.stdout:
+            rendered = line.rstrip()
+            print(f"  [{prefix}] {rendered}")
+            output_lines.append(rendered)
+            if logger:
+                logger.log(f"[{prefix}] {rendered}", to_console=False)
+
+    thread = threading.Thread(target=_stream, daemon=True)
+    thread.start()
+    return thread
+
+
+def _log_managed_process_failure(
+    process: subprocess.Popen,
+    label: str,
+    output_lines: deque,
+    logger: "BenchmarkLogger" = None,
+) -> None:
+    """Persist the child exit code and recent output when startup fails."""
+    returncode = process.poll()
+    msg = f"{label} exited before readiness check completed"
+    if returncode is not None:
+        msg += f" (returncode={returncode})"
+    print(f"✗ {msg}")
+    if logger:
+        logger.log(f"ERROR: {msg}")
+        if output_lines:
+            logger.log(f"Recent {label} output tail:", to_console=False)
+            for line in output_lines:
+                logger.log(f"  [{label}] {line}", to_console=False)
 
 
 def requires_judge(benchmark: str) -> bool:
@@ -1331,7 +1375,11 @@ def start_vllm_server(
     print(f"Using port: {port}")
 
     server_url = f"http://localhost:{port}"
-    server_gpus, tensor_parallel_size = select_compatible_tensor_parallel_gpus(model_path, gpus)
+    server_gpus, tensor_parallel_size = select_compatible_tensor_parallel_gpus(
+        model_path,
+        gpus,
+        capped=False,
+    )
     if not server_gpus:
         server_gpus = list(gpus)
 
@@ -1399,12 +1447,7 @@ def start_vllm_server(
 
     # Stream server output for visibility (cap to avoid unbounded memory growth)
     output_lines = deque(maxlen=400)
-    def stream_output():
-        for line in process.stdout:
-            print(f"  [server] {line.rstrip()}")
-            output_lines.append(line)
-    stream_thread = threading.Thread(target=stream_output, daemon=True)
-    stream_thread.start()
+    _stream_managed_process_output(process, "server", output_lines, logger)
 
     print(f"Waiting for server to be ready...")
 
@@ -1416,6 +1459,10 @@ def start_vllm_server(
 
     while time.time() - start_wait < max_wait:
         wait_count += 1
+        if process.poll() is not None:
+            _log_managed_process_failure(process, "vLLM server", output_lines, logger)
+            stop_managed_process(process, "vLLM server", logger)
+            return None, None
         if wait_count % 6 == 0:  # Print every ~30 seconds
             elapsed = time.time() - start_wait
             print(f"Still waiting for server... ({elapsed:.0f}s elapsed)")
@@ -1447,6 +1494,10 @@ def start_vllm_server(
 
     if not server_ready:
         print(f"✗ Server failed to start within {max_wait}s")
+        if logger and output_lines:
+            logger.log("Recent vLLM server output tail before timeout:", to_console=False)
+            for line in output_lines:
+                logger.log(f"  [vLLM server] {line}", to_console=False)
         process.kill()
         return None, None
 
@@ -1463,7 +1514,11 @@ def start_local_judge_server(
     )
     gpu_memory_utilization = float(os.environ.get("LOCAL_JUDGE_GPU_MEMORY_UTILIZATION", "0.9"))
     max_model_len = int(os.environ.get("LOCAL_JUDGE_MAX_MODEL_LEN", "32768"))
-    judge_gpus, tensor_parallel_size = select_compatible_tensor_parallel_gpus(model_path, gpus)
+    judge_gpus, tensor_parallel_size = select_compatible_tensor_parallel_gpus(
+        model_path,
+        gpus,
+        capped=True,
+    )
     if not judge_gpus:
         judge_gpus = list(gpus)
     port = find_available_port(port)
@@ -1518,17 +1573,15 @@ def start_local_judge_server(
 
     output_lines = deque(maxlen=400)
 
-    def stream_output():
-        for line in process.stdout:
-            print(f"  [judge] {line.rstrip()}")
-            output_lines.append(line)
-
-    stream_thread = threading.Thread(target=stream_output, daemon=True)
-    stream_thread.start()
+    _stream_managed_process_output(process, "judge", output_lines, logger)
 
     max_wait = 600
     start_wait = time.time()
     while time.time() - start_wait < max_wait:
+        if process.poll() is not None:
+            _log_managed_process_failure(process, "local judge server", output_lines, logger)
+            stop_managed_process(process, "local judge server", logger)
+            return None, None
         try:
             resp = requests.get(f"{judge_url}/health", timeout=5)
             if resp.status_code == 200:
@@ -1543,6 +1596,10 @@ def start_local_judge_server(
         time.sleep(5)
 
     print(f"✗ Local judge server failed to start within {max_wait}s")
+    if logger and output_lines:
+        logger.log("Recent local judge output tail before timeout:", to_console=False)
+        for line in output_lines:
+            logger.log(f"  [local judge server] {line}", to_console=False)
     stop_managed_process(process, "local judge server", logger)
     return None, None
 
@@ -1859,6 +1916,7 @@ Examples:
                 # Inference is complete; free the training GPU set before bringing up the judge.
                 if server_process is not None:
                     stop_managed_process(server_process, "vLLM server", logger)
+                    cleanup_vllm_engine_processes(logger)
                     server_process = None
 
                 logger.log_section("PHASE 2: EVALUATION")
@@ -1903,8 +1961,10 @@ Examples:
         finally:
             if judge_process is not None:
                 stop_managed_process(judge_process, "local judge server", logger)
+                cleanup_vllm_engine_processes(logger)
             if server_process is not None:
                 stop_managed_process(server_process, "vLLM server", logger)
+                cleanup_vllm_engine_processes(logger)
 
     return 0
 

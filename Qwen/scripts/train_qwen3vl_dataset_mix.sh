@@ -92,7 +92,23 @@ for raw_item in dataset_spec.split(","):
     if not source_path.exists():
         raise FileNotFoundError(f"Dataset file for {name} not found: {source_path}")
     if source_path.is_dir():
-        raise ValueError(f"Dataset ratio parsing currently expects file datasets, got directory: {source_path}")
+        if ratio is not None:
+            raise ValueError(
+                f"Dataset ratio parsing currently expects file datasets, got directory: {source_path}"
+            )
+
+        entries.append(
+            {
+                "name": name,
+                "ratio": ratio,
+                "total_samples": None,
+                "selected_samples": None,
+                "source_path": str(source_path),
+                "materialized_path": str(source_path),
+                "config": entry,
+            }
+        )
+        continue
 
     total_samples = line_count(source_path)
     selected_samples = total_samples

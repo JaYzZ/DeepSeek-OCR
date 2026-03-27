@@ -220,6 +220,7 @@ def load_model(
         gpu_memory_utilization=gpu_memory_utilization,
         trust_remote_code=True,
         max_model_len=max_model_len,
+        disable_custom_all_reduce=True,
     )
     load_time = time.time() - start_time
     print(f"Model loaded in {load_time:.2f}s")
@@ -372,7 +373,11 @@ def main():
         else args.tensor_parallel_size
     )
     visible_gpus = parse_cuda_visible_devices(os.environ.get("CUDA_VISIBLE_DEVICES"))
-    compatible_tp = pick_compatible_tensor_parallel_size(args.model_path, resolved_tp)
+    compatible_tp = pick_compatible_tensor_parallel_size(
+        args.model_path,
+        resolved_tp,
+        capped=True,
+    )
     if compatible_tp != resolved_tp:
         print(
             f"Adjusting tensor parallel size from {resolved_tp} to {compatible_tp} "

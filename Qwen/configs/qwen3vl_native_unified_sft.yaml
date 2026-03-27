@@ -34,7 +34,7 @@ freeze_vision_tower: true
 # (not fixed 640x640 like DPSK OCR encoder requires)
 dataset: qwen3vl_native_unified_sft
 dataset_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/data
-template: qwen3vl
+template: qwen3_vl
 cutoff_len: 2048
 max_samples: null
 streaming: false
