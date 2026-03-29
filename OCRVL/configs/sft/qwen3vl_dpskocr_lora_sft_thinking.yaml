@@ -98,8 +98,8 @@ dataloader_drop_last: true
 # Learning rate: Use VQA learning rate for unified SFT
 learning_rate: 2.0e-4
 
-# Training duration: 3 epochs
-num_train_epochs: 3.0
+# Training duration
+num_train_epochs: 4.0
 
 # Scheduler configuration
 lr_scheduler_type: cosine

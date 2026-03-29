@@ -17,8 +17,8 @@
 #    shared runtime env (`qwen3vl_runtime_env.yaml`, used by train/backfill/server):
 #    - latent-step CE on expanded latent positions is controlled by curriculum
 #      in the main process.
-#    - `latent_step_ce_token=0` uses the prebuilt `cot_chunk_token_ids`.
-#    - `latent_step_ce_token=1` forces `<latent>` labels on those positions.
+#    - `latent_ce_token=0` uses the prebuilt `cot_chunk_token_ids`.
+#    - `latent_ce_token=1` forces `<latent>` labels on those positions.
 #
 # Hidden-state losses:
 # - `mse/repa` compare shifted hidden states against `latent_ground_truth`.
@@ -57,7 +57,7 @@ freeze_vision_tower: true
 # - `latent_seq_lens`: expanded latent lengths, used to size latent expansion without
 #   loading tensors in dataloader workers
 # - `cot_chunk_token_ids`: one tokenized CoT chunk per latent step, used when
-#   `latent_step_ce_token=0`
+#   `latent_ce_token=0`
 # - `num_latent_steps`: number of thinking chunks (`<think_sep>` count + 1)
 dataset: qwen3vl_r1_onevision_thinking
 dataset_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/data
@@ -88,6 +88,8 @@ per_device_train_batch_size: 32
 gradient_accumulation_steps: 2
 dataloader_drop_last: true
 learning_rate: 2.0e-4
+# Total training epochs are derived by the wrapper from curriculum boundaries
+# when `curriculum_epochs` is a comma-separated boundary list.
 num_train_epochs: 1.0
 lr_scheduler_type: cosine
 warmup_ratio: 0.1

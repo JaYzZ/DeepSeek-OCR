@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import os
 import subprocess
+import json
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 
 def parse_cuda_visible_devices(cuda_visible_devices: Optional[str]) -> List[str]:
@@ -26,6 +27,56 @@ def normalize_checkpoint_name(checkpoint: str) -> str:
     """Return the trailing checkpoint directory name."""
     checkpoint = checkpoint.rstrip("/")
     return checkpoint.split("/")[-1]
+
+
+def normalize_media_path(value: Any) -> Any:
+    """Normalize local file URIs to plain filesystem paths."""
+    if isinstance(value, str) and value.startswith("file://"):
+        return value[len("file://"):]
+    return value
+
+
+def resolve_lora_artifacts(
+    model_path: Optional[str],
+    lora_path: Optional[str],
+) -> Dict[str, Any]:
+    """Resolve base model path and adapter rank from a LoRA checkpoint if present."""
+    resolved_model_path = model_path
+    resolved_lora_rank = None
+    adapter_config_path = None
+
+    if not lora_path:
+        return {
+            "model_path": resolved_model_path,
+            "lora_rank": resolved_lora_rank,
+            "adapter_config_path": adapter_config_path,
+        }
+
+    adapter_config_path = Path(lora_path) / "adapter_config.json"
+    if not adapter_config_path.exists():
+        print(
+            f"WARNING: Missing adapter_config.json at {adapter_config_path}. "
+            f"Falling back to model_path={resolved_model_path!r} and default max LoRA rank handling."
+        )
+        return {
+            "model_path": resolved_model_path,
+            "lora_rank": resolved_lora_rank,
+            "adapter_config_path": str(adapter_config_path),
+        }
+
+    with open(adapter_config_path, "r", encoding="utf-8") as f:
+        adapter_config = json.load(f)
+
+    resolved_model_path = adapter_config.get("base_model_name_or_path") or resolved_model_path
+    rank_value = adapter_config.get("r")
+    if rank_value is not None:
+        resolved_lora_rank = int(rank_value)
+
+    return {
+        "model_path": resolved_model_path,
+        "lora_rank": resolved_lora_rank,
+        "adapter_config_path": str(adapter_config_path),
+    }
 
 
 def apply_runtime_env_for_thinking(

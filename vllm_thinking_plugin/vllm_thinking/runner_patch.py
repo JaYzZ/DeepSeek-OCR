@@ -497,10 +497,13 @@ def apply_thinking_mode_patch():
         hidden_states = None
         sample_hidden_states = None
         logits_for_trace = None
+        attention_weights = None
         if hasattr(self, 'execute_model_state') and self.execute_model_state is not None:
             hidden_states = self.execute_model_state.hidden_states
             sample_hidden_states = self.execute_model_state.sample_hidden_states
             logits_for_trace = self.execute_model_state.logits
+            # Try to extract attention weights if available
+            attention_weights = getattr(self.execute_model_state, 'attention_weights', None)
 
         # Call original sample_tokens
         result = _orig_sample_tokens(self, grammar_output)
@@ -653,12 +656,27 @@ def apply_thinking_mode_patch():
                         bool(latent_logprob is not None),
                     )
                     _CONTINUOUS_AR_CERT_LOGGED = True
+                # Prepare all hidden states and token IDs for visualization
+                all_hidden_for_step = None
+                all_token_ids_for_step = []
+
+                if hidden_states is not None and i < hidden_states.shape[0]:
+                    # Extract all hidden states for this request from the batch
+                    all_hidden_for_step = hidden_states[i:i+1]  # Keep batch dim
+
+                # Collect token IDs for this step
+                if sampled is not None:
+                    all_token_ids_for_step = [int(sampled)]
+
                 record_request_step(
                     req_id,
                     hidden_state=last_hidden,
                     latent_embedding=latent_embedding,
                     latent_logprob=latent_logprob,
                     use_continuous_embedding=use_continuous_embedding,
+                    all_hidden_states=all_hidden_for_step,
+                    all_token_ids=all_token_ids_for_step,
+                    attention_weights=attention_weights,
                 )
 
                 # vLLM's next decode step reads slot `num_computed_tokens`, which

@@ -27,8 +27,9 @@ from typing import List, Dict, Any, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
+import numpy as np
 from tokenizers import AddedToken
 
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -37,10 +38,8 @@ sys.path.insert(0, str(_REPO_ROOT))
 from Qwen.scripts.vllm_utils import (
     apply_runtime_env_for_thinking,
     infer_tensor_parallel_size,
-    normalize_media_path,
     normalize_checkpoint_name,
     parse_cuda_visible_devices,
-    resolve_lora_artifacts,
 )
 
 
@@ -76,7 +75,15 @@ except ImportError:
     HAS_LORA_REQUEST = False
     LoRARequest = None
 
-app = FastAPI(title="vLLM Thinking Server")
+app = FastAPI(title="Qwen3-VL Thinking Mode Visualization")
+
+# Import visualization utilities
+sys.path.insert(0, str(Path(__file__).parent))
+from utils.visualization_utils import compute_tsne, aggregate_attention, create_attention_heatmap_data, encode_image_to_base64
+
+# Import trace store utilities if thinking mode is enabled
+if THINKING_MODE_ENABLED:
+    from vllm_thinking.trace_store import get_latest_trace
 
 # Global state
 llm = None
@@ -94,7 +101,6 @@ class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage]
     temperature: float = 0.0
     max_tokens: int = 8192
-    n: int = 1
     top_p: float = 1.0
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
@@ -106,7 +112,6 @@ def run_llm_generation(
     *,
     temperature: float,
     max_tokens: int,
-    n: int = 1,
     top_p: float = 1.0,
     presence_penalty: float = 0.0,
     repetition_penalty: float = 1.0,
@@ -117,7 +122,6 @@ def run_llm_generation(
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
         temperature=temperature,
-        n=n,
         top_p=top_p,
         presence_penalty=presence_penalty,
         repetition_penalty=repetition_penalty,
@@ -173,6 +177,163 @@ async def stats():
     }
 
 
+# ============================================================================
+# Visualization-specific endpoints
+# ============================================================================
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    """Serve the main visualization interface."""
+    static_dir = Path(__file__).parent / "static"
+    index_path = static_dir / "index.html"
+    with open(index_path, 'r') as f:
+        return HTMLResponse(content=f.read())
+
+
+@app.get("/api/example")
+async def get_example():
+    """Get default deepvision example."""
+    # Load first example from deepvision data
+    deepvision_path = _REPO_ROOT / "Qwen/data/deepvision_103k_sft.jsonl"
+    if deepvision_path.exists():
+        with open(deepvision_path, 'r') as f:
+            first_line = f.readline()
+            example = json.loads(first_line)
+
+        # Extract image and question
+        image_path = example.get("images", [None])[0]
+        messages = example.get("messages", [])
+        question = ""
+        for msg in messages:
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                # Remove <image> tag if present
+                question = content.replace("<image>\n", "")
+                break
+
+        # Encode image to base64
+        image_base64 = None
+        if image_path and Path(image_path).exists():
+            with open(image_path, 'rb') as f:
+                image_bytes = f.read()
+            image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+
+        return {
+            "image_base64": image_base64,
+            "question": question,
+            "answer": messages[-1].get("content", "") if messages else "",
+        }
+    else:
+        raise HTTPException(status_code=404, detail="Deepvision data file not found")
+
+
+@app.post("/api/infer")
+async def infer_vis(request: Dict[str, Any]):
+    """Run inference with thinking mode and return visualization data."""
+    global llm, processor, lora_request
+
+    if llm is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    try:
+        # Prepare messages from request
+        text = request.get("text", "")
+        image_base64 = request.get("image_base64")
+        max_tokens = request.get("max_tokens", 2048)
+        temperature = request.get("temperature", 0.7)
+
+        messages = []
+        if image_base64:
+            # For vLLM, use the image directly as bytes
+            import io
+            from PIL import Image
+            image_bytes = base64.b64decode(image_base64)
+            image = Image.open(io.BytesIO(image_bytes))
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": text},
+                ],
+            })
+        else:
+            messages.append({
+                "role": "user",
+                "content": text,
+            })
+
+        # Run inference
+        output, response_text = run_llm_generation(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+        # Collect trace data for visualization
+        trace_data = {
+            "tokens": [],
+            "hidden_states": None,
+            "attention_weights": None,
+            "continuous_mask": [],
+            "tsne_coordinates": None,
+        }
+
+        if THINKING_MODE_ENABLED:
+            try:
+                trace = get_latest_trace()
+                if trace:
+                    # Extract tokens
+                    token_ids = output.outputs[0].token_ids
+                    for i, token_id in enumerate(token_ids):
+                        token_text = processor.tokenizer.decode([token_id])[0]
+                        trace_data["tokens"].append({
+                            'id': int(token_id),
+                            'text': token_text,
+                            'position': i,
+                        })
+
+                    # Extract hidden states and other data
+                    all_hidden_states = trace.get('all_hidden_states', [])
+                    continuous_mask = trace.get('continuous_token_mask', [])
+                    attention_weights = trace.get('attention_weights', [])
+
+                    trace_data["continuous_mask"] = continuous_mask
+
+                    # Compute t-SNE if hidden states available
+                    if all_hidden_states and len(all_hidden_states) > 0:
+                        hidden_array = np.array(all_hidden_states)
+                        if hidden_array.ndim == 3:
+                            hidden_array = hidden_array.reshape(-1, hidden_array.shape[-1])
+                        tsne_coords = compute_tsne(hidden_array)
+                        trace_data["tsne_coordinates"] = tsne_coords.tolist()
+                        trace_data["hidden_states"] = hidden_array.tolist()
+
+                    if attention_weights:
+                        trace_data["attention_weights"] = np.array(attention_weights).tolist()
+
+            except Exception as e:
+                print(f"Warning: Failed to collect trace data: {e}")
+
+        return {
+            "answer": response_text,
+            "tokens": trace_data["tokens"],
+            "hidden_states": trace_data["hidden_states"],
+            "attention_weights": trace_data["attention_weights"],
+            "continuous_mask": trace_data["continuous_mask"],
+            "tsne_coordinates": trace_data["tsne_coordinates"],
+            "token_metadata": {
+                "total_tokens": len(trace_data["tokens"]),
+                "continuous_tokens": sum(trace_data["continuous_mask"]),
+            },
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
+
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     """Chat completion endpoint."""
@@ -188,7 +349,6 @@ async def chat_completions(request: ChatCompletionRequest):
             messages,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
-            n=request.n,
             top_p=request.top_p,
             presence_penalty=request.presence_penalty,
             repetition_penalty=request.repetition_penalty,
@@ -198,31 +358,25 @@ async def chat_completions(request: ChatCompletionRequest):
         if os.environ.get("VLLM_DEBUG", "0") == "1":
             print(f"[DEBUG] Raw response_text: {repr(response_text[:500])}")
 
-        choices = []
-        total_completion_tokens = 0
-        for idx, candidate in enumerate(output.outputs):
-            total_completion_tokens += len(candidate.token_ids)
-            choices.append(
-                {
-                    "index": idx,
-                    "message": {
-                        "role": "assistant",
-                        "content": candidate.text,
-                    },
-                    "finish_reason": candidate.finish_reason if hasattr(candidate, "finish_reason") else "stop",
-                }
-            )
-
         return {
             "id": "chatcmpl-" + str(int(time.time())),
             "object": "chat.completion",
             "created": int(time.time()),
             "model": config.get("model_path"),
-            "choices": choices,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": response_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
             "usage": {
-                "prompt_tokens": len(output.prompt_token_ids),
-                "completion_tokens": total_completion_tokens,
-                "total_tokens": len(output.prompt_token_ids) + total_completion_tokens,
+                "prompt_tokens": output.prompt_token_ids,
+                "completion_tokens": len(output.outputs[0].token_ids),
+                "total_tokens": len(output.prompt_token_ids) + len(output.outputs[0].token_ids)
             }
         }
 
@@ -263,7 +417,9 @@ def prepare_inputs_for_vllm(messages, processor):
                     if img:
                         # ODinW jobs may emit "file:///abs/path". vLLM/HF processors generally
                         # expect a plain filesystem path for local files.
-                        images.append(normalize_media_path(img))
+                        if isinstance(img, str) and img.startswith("file://"):
+                            img = img[len("file://"):]
+                        images.append(img)
                     # Preserve any per-image resolution constraints if present.
                     if min_pixels is None and "min_pixels" in item:
                         min_pixels = item.get("min_pixels")
@@ -272,7 +428,9 @@ def prepare_inputs_for_vllm(messages, processor):
                 elif item.get("type") == "video":
                     vid = item.get("video")
                     if vid:
-                        videos.append(normalize_media_path(vid))
+                        if isinstance(vid, str) and vid.startswith("file://"):
+                            vid = vid[len("file://"):]
+                        videos.append(vid)
 
     if images:
         # Multi-modal input
@@ -329,9 +487,7 @@ def load_model(
 ):
     """Load vLLM model."""
     global llm, processor, lora_request, config
-    adapter_meta = resolve_lora_artifacts(model_path, lora_path)
-    resolved_model_path = adapter_meta["model_path"] or resolve_model_path(model_path, lora_path)
-    resolved_lora_rank = adapter_meta["lora_rank"] if adapter_meta["lora_rank"] is not None else 64
+    resolved_model_path = resolve_model_path(model_path, lora_path)
 
     print(f"\n{'='*80}")
     print(f"Loading vLLM model...")
@@ -341,7 +497,6 @@ def load_model(
     print(f"GPU memory: {gpu_memory_utilization}")
     if lora_path:
         print(f"LoRA: {lora_path}")
-        print(f"LoRA rank: {resolved_lora_rank}")
     print(f"{'='*80}\n")
 
     start_time = time.time()
@@ -413,8 +568,7 @@ def load_model(
     # Add LoRA config if path provided
     if lora_path:
         llm_kwargs["enable_lora"] = True
-        llm_kwargs["max_lora_rank"] = resolved_lora_rank
-        llm_kwargs["max_loras"] = 1
+        # Note: vLLM LoRA config needs proper setup
 
     # Load model
     llm = LLM(**llm_kwargs)
@@ -439,7 +593,6 @@ def load_model(
         "model_path": resolved_model_path,
         "requested_model_path": model_path,
         "lora_path": lora_path,
-        "resolved_lora_rank": resolved_lora_rank,
         "tensor_parallel_size": tensor_parallel_size,
         "gpu_memory_utilization": gpu_memory_utilization,
         "thinking_enabled": THINKING_MODE_ENABLED,
@@ -447,9 +600,9 @@ def load_model(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="vLLM Server with Thinking Mode")
+    parser = argparse.ArgumentParser(description="Qwen3-VL Thinking Mode Visualization Server")
     parser.add_argument("--model-path", type=str, required=True, help="Path to model")
-    parser.add_argument("--port", type=int, default=8016, help="Server port")
+    parser.add_argument("--port", type=int, default=8501, help="Server port")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
     parser.add_argument(
         "--tensor-parallel-size",
@@ -460,6 +613,7 @@ def main():
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="GPU memory utilization")
     parser.add_argument("--lora-path", type=str, default=None, help="LoRA adapter path")
     parser.add_argument("--lora-name", type=str, default="default", help="LoRA adapter name")
+
     args = parser.parse_args()
 
     visible_gpus = parse_cuda_visible_devices(os.environ.get("CUDA_VISIBLE_DEVICES"))

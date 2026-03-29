@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
 from transformers import AutoProcessor
+import pandas as pd
 
 # Add repo/evaluation directories to path for imports
 _EVAL_DIR = Path(__file__).parent
@@ -42,9 +43,14 @@ from utils import select_compatible_tensor_parallel_gpus
 from Qwen.scripts.vllm_utils import (
     apply_runtime_env_for_thinking,
     cleanup_vllm_engine_processes,
+    normalize_media_path,
+    resolve_lora_artifacts,
 )
 
 LOCAL_JUDGE_DEFAULT_MODEL = "/share/project/xiyan/huggingface/Qwen/Qwen2.5-VL-7B-Instruct"
+EXPLORE_TEMPERATURE = 0.7
+EXPLORE_MAX_TOKENS = 8192
+EXPLORE_N = 8
 
 
 def _get_runtime_yaml_value(key: str, default):
@@ -363,7 +369,6 @@ def run_unified_inference(
     model_path: str,
     lora_path: str = None,
     lora_name: str = "default",
-    max_lora_rank: int = 64,
     enable_lora: bool = False,
     logger: "BenchmarkLogger" = None
 ) -> Dict[str, str]:
@@ -379,19 +384,21 @@ def run_unified_inference(
         model_path: Path to the model
         lora_path: Path to LoRA adapter
         lora_name: Name for LoRA adapter
-        max_lora_rank: Maximum LoRA rank
         enable_lora: Whether LoRA is enabled
         logger: Optional BenchmarkLogger instance
 
     Returns:
         Dictionary mapping benchmark names to output files
     """
+    adapter_meta = resolve_lora_artifacts(model_path, lora_path)
+    resolved_model_path = adapter_meta["model_path"] or model_path
+    resolved_lora_rank = adapter_meta["lora_rank"] if adapter_meta["lora_rank"] is not None else 64
     script_path = Path(__file__).parent / "run_all_inference.py"
 
     cmd = [
         sys.executable,
         str(script_path),
-        "--model-path", model_path,
+        "--model-path", resolved_model_path,
         "--output-dir", run_dir,
         "--num-samples", str(num_samples),
         "--tensor-parallel-size", str(len(gpus)),
@@ -415,8 +422,11 @@ def run_unified_inference(
     # Log detailed information
     if logger:
         logger.log_section("RUNNING UNIFIED INFERENCE")
-        logger.log(f"Model: {model_path}")
+        logger.log(f"Requested model: {model_path}")
+        logger.log(f"Resolved model: {resolved_model_path}")
         logger.log(f"LoRA: {lora_path if lora_path else 'Disabled'}")
+        if lora_path:
+            logger.log(f"Resolved LoRA rank: {resolved_lora_rank}")
         logger.log(f"Benchmarks: {', '.join(benchmarks)}")
         logger.log(f"Num samples: {num_samples}")
         logger.log(f"GPUs: {gpus}")
@@ -431,7 +441,10 @@ def run_unified_inference(
     print(f"\n{'='*80}")
     print(f"Running HYBRID inference for {len(benchmarks)} benchmarks")
     print(f"Auto-detects model type: vLLM (official) or HF Transformers (Linear variant)")
+    print(f"Model: {resolved_model_path}")
     print(f"LoRA: {lora_path if lora_path else 'Disabled'}")
+    if lora_path:
+        print(f"LoRA rank: {resolved_lora_rank}")
     print(f"{'='*80}")
     print(f"Command: {' '.join(cmd)}")
     print(f"GPUs: {gpus}")
@@ -510,7 +523,13 @@ def run_server_inference(
     gpus: List[int],
     max_tokens: int,
     concurrency: int = 1,
-    logger: "BenchmarkLogger" = None
+    logger: "BenchmarkLogger" = None,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    n: int = 1,
+    presence_penalty: float = 0.0,
+    repetition_penalty: float = 1.0,
+    output_suffix: str = "",
 ) -> Dict[str, str]:
     """
     Run inference for all benchmarks using existing vLLM server.
@@ -533,6 +552,9 @@ def run_server_inference(
         logger.log(f"Num samples: {num_samples}")
         logger.log(f"Max tokens: {max_tokens}")
         logger.log(f"Concurrency: {concurrency}")
+        logger.log(f"Temperature: {temperature}")
+        logger.log(f"Top-p: {top_p}")
+        logger.log(f"Samples per prompt: {n}")
 
     # Check server health
     print(f"Checking server health at {server_url}/health...")
@@ -562,6 +584,7 @@ def run_server_inference(
             dump_image as mathv_dump_image,
         )
         from Qwen.evaluation.MathVision.run_mathv import build_mathv_prompt
+        from Qwen.evaluation.MathVision.eval_utils import post_check as mathvision_post_check
         from Qwen.evaluation.mmmu.dataset_utils import (
             load_dataset as load_mmmu_dataset,
             dump_image as mmmu_dump_image,
@@ -621,7 +644,7 @@ def run_server_inference(
             output_files[benchmark] = output_file
             continue
 
-        output_file = os.path.join(run_dir, f"{benchmark.lower()}_inference.jsonl")
+        output_file = os.path.join(run_dir, f"{benchmark.lower()}{output_suffix}_inference.jsonl")
         config = dataset_configs.get(benchmark)
         if not config:
             print(f"Unknown benchmark: {benchmark}")
@@ -689,6 +712,23 @@ def run_server_inference(
         # Process samples
         results_by_idx: Dict[int, Dict[str, object]] = {}
         start_time = time.time()
+        total_rows = len(rows)
+        progress_step = max(1, min(10, total_rows // 10 if total_rows >= 10 else 1))
+
+        def log_benchmark_progress(phase: str, completed: int, total: int, force: bool = False):
+            if not logger or total <= 0:
+                return
+            if not force and completed % progress_step != 0 and completed != total:
+                return
+            elapsed = time.time() - start_time
+            rate = completed / elapsed if elapsed > 0 else 0.0
+            remaining = total - completed
+            eta_seconds = remaining / rate if rate > 0 else 0.0
+            logger.log(
+                f"{phase} progress: {completed}/{total} "
+                f"({(completed / total) * 100:.1f}%) | "
+                f"elapsed={elapsed:.1f}s | rate={rate:.2f} samples/s | eta={eta_seconds:.1f}s"
+            )
 
         # Build prompts sequentially (avoids races when dumping images to disk).
         request_tasks: List[Tuple[int, object, List[dict], dict]] = []
@@ -710,11 +750,11 @@ def run_server_inference(
                         for item in content:
                             if isinstance(item, dict):
                                 if item.get("type") == "image":
-                                    # Normalize local file URIs like "file:///abs/path" to paths.
                                     img = item.get("image")
-                                    if isinstance(img, str) and img.startswith("file://"):
+                                    normalized_img = normalize_media_path(img)
+                                    if normalized_img != img:
                                         item = dict(item)
-                                        item["image"] = img[len("file://"):]
+                                        item["image"] = normalized_img
                                     processed_content.append(item)
                                 elif item.get("type") == "text":
                                     processed_content.append(item)
@@ -725,12 +765,19 @@ def run_server_inference(
                 payload = {
                     "messages": api_messages,
                     "max_tokens": max_tokens,
-                    "temperature": 0.0,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "n": n,
+                    "presence_penalty": presence_penalty,
+                    "repetition_penalty": repetition_penalty,
                 }
                 request_tasks.append((idx, row, messages, payload))
+                log_benchmark_progress("Prompt build", len(request_tasks), total_rows)
             except Exception as e:
                 print(f"Error building prompt for sample {idx}: {e}")
                 continue
+
+        log_benchmark_progress("Prompt build", len(request_tasks), total_rows, force=True)
 
         def call_server(task: Tuple[int, object, List[dict], dict]) -> Tuple[int, Optional[Dict[str, object]], Optional[str]]:
             idx, row, messages, payload = task
@@ -744,22 +791,44 @@ def run_server_inference(
                         raise RuntimeError(last_err)
 
                     result_data = resp.json()
-                    response_text = result_data["choices"][0]["message"]["content"]
-                    # Keep raw model output (may include <think>...</think>) and
-                    # also provide a stripped variant for evaluation.
-                    response_raw = response_text
-                    response_final = (
-                        response_raw.split("</think>")[-1].strip()
-                        if "</think>" in response_raw
-                        else response_raw
-                    )
+                    choices = result_data.get("choices", [])
+                    if not choices:
+                        raise RuntimeError("No choices returned from server")
+
+                    candidate_results = []
+                    for choice in choices:
+                        response_raw = choice["message"]["content"]
+                        response_final = (
+                            response_raw.split("</think>")[-1].strip()
+                            if "</think>" in response_raw
+                            else response_raw
+                        )
+                        candidate_results.append(
+                            {
+                                "gen": response_final,
+                                "gen_raw": response_raw,
+                                "finish_reason": choice.get("finish_reason", "stop"),
+                            }
+                        )
+
+                    primary = candidate_results[0]
+                    row_dict = row.to_dict() if hasattr(row, "to_dict") else dict(row)
                     out = {
                         "question_id": idx,
-                        "annotation": row.to_dict() if hasattr(row, "to_dict") else dict(row),
+                        "annotation": row_dict,
                         "task": benchmark,
-                        "result": {"gen": response_final, "gen_raw": response_raw},
+                        "result": {"gen": primary["gen"], "gen_raw": primary["gen_raw"]},
                         "messages": messages,
                     }
+                    if len(candidate_results) > 1:
+                        out["candidates"] = candidate_results
+                        out["candidate_stats"] = {
+                            "num_candidates": len(candidate_results),
+                            "num_unique_final_answers": len({c["gen"] for c in candidate_results}),
+                            "num_unique_raw_answers": len({c["gen_raw"] for c in candidate_results}),
+                        }
+                    if "usage" in result_data:
+                        out["usage"] = result_data["usage"]
                     return idx, out, None
                 except Exception as e:
                     last_err = str(e)
@@ -770,26 +839,62 @@ def run_server_inference(
         # Execute requests concurrently to keep vLLM busy.
         effective_concurrency = max(1, int(concurrency or 1))
         if effective_concurrency == 1:
+            completed_requests = 0
             for task in tqdm(request_tasks, total=len(request_tasks), desc=f"{benchmark} infer"):
                 idx, out, err = call_server(task)
                 if out is not None:
                     results_by_idx[idx] = out
                 else:
                     print(f"Error for sample {idx}: {err}")
+                completed_requests += 1
+                log_benchmark_progress("Inference", completed_requests, len(request_tasks))
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=effective_concurrency) as ex:
                 futures = [ex.submit(call_server, task) for task in request_tasks]
+                completed_requests = 0
                 for fut in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"{benchmark} infer"):
                     idx, out, err = fut.result()
                     if out is not None:
                         results_by_idx[idx] = out
                     else:
                         print(f"Error for sample {idx}: {err}")
+                    completed_requests += 1
+                    log_benchmark_progress("Inference", completed_requests, len(request_tasks))
+
+        log_benchmark_progress("Inference", len(request_tasks), len(request_tasks), force=True)
 
         # Save results
         with open(output_file, 'w') as f:
             for idx in sorted(results_by_idx.keys()):
                 f.write(json.dumps(results_by_idx[idx]) + '\n')
+
+        if benchmark == "MathVision" and n > 1:
+            completed_rows = [results_by_idx[idx] for idx in sorted(results_by_idx.keys())]
+            candidate_stats = [row.get("candidate_stats", {}) for row in completed_rows]
+            stats_payload = {
+                "benchmark": benchmark,
+                "num_samples": len(completed_rows),
+                "samples_with_candidates": sum(1 for row in completed_rows if "candidates" in row),
+                "avg_unique_final_answers": (
+                    sum(stats.get("num_unique_final_answers", 0) for stats in candidate_stats) / len(candidate_stats)
+                    if candidate_stats else 0.0
+                ),
+                "avg_unique_raw_answers": (
+                    sum(stats.get("num_unique_raw_answers", 0) for stats in candidate_stats) / len(candidate_stats)
+                    if candidate_stats else 0.0
+                ),
+                "temperature": temperature,
+                "top_p": top_p,
+                "max_tokens": max_tokens,
+                "n": n,
+                "status": "pending_judge_eval",
+            }
+            stats_file = os.path.join(run_dir, f"{benchmark.lower()}{output_suffix}_stats.json")
+            with open(stats_file, "w", encoding="utf-8") as f:
+                json.dump(stats_payload, f, indent=2)
+            if logger:
+                logger.log(f"Exploration stats saved: {stats_file}")
+                logger.log(f"MathVision exploration summary: {stats_payload}")
 
         elapsed = time.time() - start_time
         print(f"✓ {benchmark} inference completed in {elapsed:.2f}s ({len(results_by_idx)} samples)")
@@ -1220,6 +1325,246 @@ def parse_benchmark_results(benchmark: str, result_file: str) -> Dict:
         return {"error": str(e)}
 
 
+def _normalize_benchmark_name(benchmark: str) -> str:
+    normalized = str(benchmark).strip()
+    alias_map = {
+        "realworldqa": "RealWorldQA",
+        "real_world_qa": "RealWorldQA",
+        "real-world-qa": "RealWorldQA",
+        "mathvision": "MathVision",
+        "mmmu": "MMMU",
+        "odinw-13": "ODinW-13",
+        "odinw13": "ODinW-13",
+    }
+    return alias_map.get(normalized.lower(), normalized)
+
+
+def evaluate_multiple_choice_exploration(
+    benchmark: str,
+    inference_file: str,
+    stats_file: str,
+    judge_url: str | None,
+    logger: "BenchmarkLogger" = None,
+) -> Dict:
+    benchmark = _normalize_benchmark_name(benchmark)
+    if benchmark == "MMMU":
+        from Qwen.evaluation.mmmu.eval_utils import build_judge as build_mc_judge, eval_single_sample as eval_mc_single_sample
+    elif benchmark == "RealWorldQA":
+        from Qwen.evaluation.RealWorldQA.eval_utils import build_judge as build_mc_judge, eval_single_sample as eval_mc_single_sample
+    else:
+        payload = {"benchmark": benchmark, "error": f"Unsupported multiple-choice exploration benchmark: {benchmark}"}
+        with open(stats_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        return payload
+
+    rows = []
+    with open(inference_file, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                rows.append(json.loads(line))
+
+    if not rows:
+        payload = {"benchmark": benchmark, "error": "No exploration inference rows found"}
+        with open(stats_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        return payload
+
+    judge_model = None
+    scoring_logic = f"{benchmark} eval_single_sample candidate-wise (rule extraction only)"
+    if judge_url:
+        judge_model = build_mc_judge(
+            model="gpt-4o",
+            api_type="custom",
+            api_url=judge_url,
+            api_key=os.environ.get("LOCAL_API_KEY", "EMPTY"),
+        )
+        scoring_logic = f"{benchmark} eval_single_sample candidate-wise"
+
+    sample_rows = []
+    evaluated_rows = []
+    for row in rows:
+        annotation = row.get("annotation", {}) or {}
+        candidates = row.get("candidates") or [row.get("result", {})]
+        candidate_hits = []
+        candidate_evaluations = []
+
+        for candidate in candidates:
+            eval_row = dict(annotation)
+            eval_row["prediction"] = candidate.get("gen", "")
+            if benchmark == "MMMU":
+                eval_row["GT"] = annotation.get("answer")
+            elif benchmark == "RealWorldQA":
+                eval_row["answer"] = annotation.get("answer")
+            eval_result = eval_mc_single_sample((judge_model, eval_row))
+            hit = bool(eval_result.get("hit", 0))
+            candidate_hits.append(hit)
+            candidate_evaluations.append(
+                {
+                    "prediction": candidate.get("gen", ""),
+                    "prediction_raw": candidate.get("gen_raw", ""),
+                    "hit": hit,
+                    "extracted_answer": eval_result.get("extracted_answer"),
+                    "extraction_method": eval_result.get("extraction_method"),
+                    "extraction_success": eval_result.get("extraction_success"),
+                    "extraction_log": eval_result.get("extraction_log"),
+                }
+            )
+
+        sample_rows.append(
+            {
+                "question_id": row.get("question_id"),
+                "top1_hit": bool(candidate_hits[0]) if candidate_hits else False,
+                "pass_at_k": any(candidate_hits),
+                "num_correct": sum(1 for hit in candidate_hits if hit),
+                "num_candidates": len(candidate_hits),
+            }
+        )
+        enriched = dict(row)
+        enriched["candidate_evaluations"] = candidate_evaluations
+        evaluated_rows.append(enriched)
+
+    df = pd.DataFrame(sample_rows)
+    k = int(df["num_candidates"].max()) if len(df) else 0
+    payload = {
+        "benchmark": benchmark,
+        "num_samples": int(len(df)),
+        "samples_with_candidates": int((df["num_candidates"] > 0).sum()) if len(df) else 0,
+        "samples_with_any_correct": int(df["pass_at_k"].sum()) if len(df) else 0,
+        "top1_accuracy": float(df["top1_hit"].mean()) if len(df) else 0.0,
+        f"pass@{k}": float(df["pass_at_k"].mean()) if len(df) else 0.0,
+        f"mean@{k}": float((df["num_correct"] / df["num_candidates"].replace(0, 1)).mean()) if len(df) else 0.0,
+        "avg_correct_candidates": float(df["num_correct"].mean()) if len(df) else 0.0,
+        "avg_candidates": float(df["num_candidates"].mean()) if len(df) else 0.0,
+        "judge_url": judge_url or "",
+        "scoring_logic": scoring_logic,
+    }
+
+    evaluated_file = inference_file.replace("_inference.jsonl", "_evaluated.jsonl")
+    with open(evaluated_file, "w", encoding="utf-8") as f:
+        for row in evaluated_rows:
+            f.write(json.dumps(row) + "\n")
+    with open(stats_file, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    if logger:
+        logger.log(f"Exploration evaluation saved: {evaluated_file}")
+        logger.log(f"Exploration stats saved: {stats_file}")
+        logger.log(f"{benchmark} exploration evaluated summary: {payload}")
+
+    return payload
+
+
+def evaluate_mathvision_exploration(
+    inference_file: str,
+    stats_file: str,
+    judge_url: str | None,
+    logger: "BenchmarkLogger" = None,
+) -> Dict:
+    """Evaluate MathVision explore candidates using the same extraction/scoring path as benchmark eval."""
+    from Qwen.evaluation.MathVision.eval_utils import (
+        build_judge as build_mathvision_judge,
+        eval_single_sample as mathvision_eval_single_sample,
+        post_check as mathvision_post_check,
+    )
+
+    rows = []
+    with open(inference_file, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                rows.append(json.loads(line))
+
+    if not rows:
+        payload = {"benchmark": "MathVision", "error": "No exploration inference rows found"}
+        with open(stats_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        return payload
+
+    if not judge_url:
+        payload = {"benchmark": "MathVision", "error": "Judge URL required for exploration evaluation"}
+        with open(stats_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        return payload
+
+    judge_model = build_mathvision_judge(
+        model="gpt-4o",
+        api_type="custom",
+        api_url=judge_url,
+        api_key=os.environ.get("LOCAL_API_KEY", "EMPTY"),
+    )
+    scoring_logic = "MathVision eval_single_sample + post_check"
+
+    sample_rows = []
+    evaluated_rows = []
+    for row in rows:
+        annotation = row.get("annotation", {}) or {}
+        candidates = row.get("candidates") or [row.get("result", {})]
+        candidate_hits = []
+        candidate_evaluations = []
+
+        for candidate in candidates:
+            eval_row = dict(annotation)
+            eval_row["prediction"] = candidate.get("gen", "")
+            eval_result = mathvision_eval_single_sample((judge_model, eval_row))
+            scored_row = dict(eval_row)
+            scored_row.update(eval_result)
+            hit = bool(mathvision_post_check(scored_row, prefetch=False))
+            candidate_hits.append(hit)
+            candidate_evaluations.append(
+                {
+                    "prediction": candidate.get("gen", ""),
+                    "prediction_raw": candidate.get("gen_raw", ""),
+                    "hit": hit,
+                    "res": eval_result.get("res"),
+                    "log": eval_result.get("log"),
+                    "extract_model": eval_result.get("extract_model"),
+                    "extract_flag": eval_result.get("extract_flag"),
+                }
+            )
+
+        sample_rows.append(
+            {
+                "question_id": row.get("question_id"),
+                "top1_hit": bool(candidate_hits[0]) if candidate_hits else False,
+                "pass_at_k": any(candidate_hits),
+                "num_correct": sum(1 for hit in candidate_hits if hit),
+                "num_candidates": len(candidate_hits),
+            }
+        )
+        enriched = dict(row)
+        enriched["candidate_evaluations"] = candidate_evaluations
+        evaluated_rows.append(enriched)
+
+    df = pd.DataFrame(sample_rows)
+    k = int(df["num_candidates"].max()) if len(df) else 0
+    payload = {
+        "benchmark": "MathVision",
+        "num_samples": int(len(df)),
+        "samples_with_candidates": int((df["num_candidates"] > 0).sum()) if len(df) else 0,
+        "samples_with_any_correct": int(df["pass_at_k"].sum()) if len(df) else 0,
+        "top1_accuracy": float(df["top1_hit"].mean()) if len(df) else 0.0,
+        f"pass@{k}": float(df["pass_at_k"].mean()) if len(df) else 0.0,
+        f"mean@{k}": float((df["num_correct"] / df["num_candidates"].replace(0, 1)).mean()) if len(df) else 0.0,
+        "avg_correct_candidates": float(df["num_correct"].mean()) if len(df) else 0.0,
+        "avg_candidates": float(df["num_candidates"].mean()) if len(df) else 0.0,
+        "judge_url": judge_url or "",
+        "scoring_logic": scoring_logic,
+    }
+
+    evaluated_file = inference_file.replace("_inference.jsonl", "_evaluated.jsonl")
+    with open(evaluated_file, "w", encoding="utf-8") as f:
+        for row in evaluated_rows:
+            f.write(json.dumps(row) + "\n")
+    with open(stats_file, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    if logger:
+        logger.log(f"Exploration evaluation saved: {evaluated_file}")
+        logger.log(f"Exploration stats saved: {stats_file}")
+        logger.log(f"MathVision exploration evaluated summary: {payload}")
+
+    return payload
+
+
 def generate_summary(run_dir: str, results: Dict[str, Dict]) -> str:
     """
     Generate a comprehensive summary of all benchmark results.
@@ -1246,6 +1591,17 @@ def generate_summary(run_dir: str, results: Dict[str, Dict]) -> str:
         if 0.0 <= v <= 1.0:
             v *= 100.0
         return f"{v:.2f}"
+
+    explore_stats = []
+    try:
+        for name in sorted(os.listdir(run_dir)):
+            if not name.endswith("_explore_stats.json"):
+                continue
+            path = os.path.join(run_dir, name)
+            with open(path, "r", encoding="utf-8") as ef:
+                explore_stats.append((name, json.load(ef)))
+    except Exception:
+        pass
 
     with open(summary_file, 'w') as f:
         f.write(f"# Comprehensive Evaluation Summary\n\n")
@@ -1324,6 +1680,15 @@ def generate_summary(run_dir: str, results: Dict[str, Dict]) -> str:
         if map_scores:
             f.write(f"**Average mAP (ODinW-13)**: {_format_map_score(map_scores[0])}\n\n")
 
+        if explore_stats:
+            f.write("## Exploration Results\n\n")
+            for name, payload in explore_stats:
+                benchmark = payload.get("benchmark", name.replace("_explore_stats.json", ""))
+                f.write(f"### {benchmark} Explore\n\n")
+                for key, value in payload.items():
+                    f.write(f"- {key}: {value}\n")
+                f.write("\n")
+
     print(f"\n{'='*80}")
     print(f"Summary written to: {summary_file}")
     print(f"{'='*80}\n")
@@ -1370,6 +1735,9 @@ def start_vllm_server(
     Returns:
         Tuple of (Server URL, Process) or (None, None) on failure
     """
+    adapter_meta = resolve_lora_artifacts(model_path, lora_path)
+    resolved_model_path = adapter_meta["model_path"] or model_path
+    resolved_lora_rank = adapter_meta["lora_rank"] if adapter_meta["lora_rank"] is not None else 64
     # Always find a free port to avoid conflicts
     port = find_available_port(port)
     print(f"Using port: {port}")
@@ -1385,8 +1753,11 @@ def start_vllm_server(
 
     if logger:
         logger.log_section("STARTING vLLM SERVER")
-        logger.log(f"Model: {model_path}")
+        logger.log(f"Requested model: {model_path}")
+        logger.log(f"Resolved model: {resolved_model_path}")
         logger.log(f"LoRA: {lora_path}")
+        if lora_path:
+            logger.log(f"Resolved LoRA rank: {resolved_lora_rank}")
         logger.log(f"GPUs: {server_gpus}")
         logger.log(f"Tensor parallel: {tensor_parallel_size}")
         logger.log(f"GPU memory util: {gpu_memory_utilization}")
@@ -1395,8 +1766,10 @@ def start_vllm_server(
     print(f"\n{'='*80}")
     print(f"Starting vLLM server...")
     print(f"{'='*80}")
-    print(f"Model: {model_path}")
+    print(f"Model: {resolved_model_path}")
     print(f"LoRA: {lora_path}")
+    if lora_path:
+        print(f"LoRA rank: {resolved_lora_rank}")
     print(f"GPUs: {server_gpus}")
     print(f"Tensor parallel: {tensor_parallel_size}")
     print(f"GPU memory util: {gpu_memory_utilization}")
@@ -1415,7 +1788,7 @@ def start_vllm_server(
     cmd = [
         sys.executable,
         str(script_path),
-        "--model-path", model_path,
+        "--model-path", resolved_model_path,
         "--port", str(port),
         "--tensor-parallel-size", str(tensor_parallel_size),
         "--gpu-memory-utilization", str(gpu_memory_utilization),
@@ -1650,7 +2023,7 @@ Examples:
     parser.add_argument(
         "--run-dir",
         type=str,
-        help="Existing run directory (for skip-infer mode)"
+        help="Run directory. Defaults to <lora-path>/bench when --lora-path is set; otherwise creates a timestamped directory under evaluation/results"
     )
     parser.add_argument(
         "--skip-infer",
@@ -1665,8 +2038,8 @@ Examples:
     parser.add_argument(
         "--benchmarks",
         type=str,
-        default="MathVision,MMMU,RealWorldQA,ODinW-13",
-        help="Comma-separated list of benchmarks to run (default: all)"
+        default="MathVision,MMMU,RealWorldQA",
+        help="Comma-separated list of benchmarks to run (default: MathVision,MMMU,RealWorldQA)"
     )
 
     # LoRA arguments
@@ -1687,13 +2060,6 @@ Examples:
         default="default",
         help="Name for LoRA adapter (default: default)"
     )
-    parser.add_argument(
-        "--max-lora-rank",
-        type=int,
-        default=64,
-        help="Maximum LoRA rank (default: 64)"
-    )
-
     # Server mode arguments
     parser.add_argument(
         "--server-url",
@@ -1719,20 +2085,66 @@ Examples:
         default=None,
         help="Number of concurrent in-flight requests to the vLLM server (default: 16)"
     )
-
+    parser.add_argument(
+        "--server-temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for server-mode inference (default: 0.0)"
+    )
+    parser.add_argument(
+        "--server-top-p",
+        type=float,
+        default=1.0,
+        help="Top-p for server-mode inference (default: 1.0)"
+    )
+    parser.add_argument(
+        "--server-n",
+        type=int,
+        default=1,
+        help="Number of completions per prompt for server-mode inference (default: 1)"
+    )
+    parser.add_argument(
+        "--server-presence-penalty",
+        type=float,
+        default=0.0,
+        help="Presence penalty for server-mode inference (default: 0.0)"
+    )
+    parser.add_argument(
+        "--server-repetition-penalty",
+        type=float,
+        default=1.0,
+        help="Repetition penalty for server-mode inference (default: 1.0)"
+    )
+    parser.add_argument(
+        "--server-max-tokens",
+        type=int,
+        default=None,
+        help="Override max tokens for server-mode inference"
+    )
+    parser.add_argument(
+        "--explore",
+        action="store_true",
+        help="Run explore-only inference/evaluation on the provided benchmarks"
+    )
     args = parser.parse_args()
     apply_runtime_env_for_thinking(repo_root=Path(__file__).resolve().parents[2])
     if args.server_concurrency is None:
         args.server_concurrency = int(_get_runtime_yaml_value("benchmark_server_concurrency", 16))
+    if args.skip_eval:
+        print("Error: evaluation is required for both benchmark and explore runs")
+        return 1
 
     # Derive enable_lora from lora_path (if lora_path is provided, use LoRA)
     args.enable_lora = bool(args.lora_path)
+    adapter_meta = resolve_lora_artifacts(args.model_path, args.lora_path)
+    resolved_model_path = adapter_meta["model_path"] or args.model_path
+    resolved_lora_rank = adapter_meta["lora_rank"] if adapter_meta["lora_rank"] is not None else 64
 
     # Ensure dataset root is set for dataset utilities (some require LMUData).
     os.environ.setdefault("LMUData", str(Path(__file__).parent / "data"))
 
     # Parse benchmarks
-    benchmarks = [b.strip() for b in args.benchmarks.split(',')]
+    benchmarks = [_normalize_benchmark_name(b) for b in args.benchmarks.split(',') if b.strip()]
 
     # GPU selection
     if args.gpus:
@@ -1745,14 +2157,19 @@ Examples:
         print("Error: No GPUs available")
         return 1
 
-    # Create run directory
+    # Create or resolve run directory.
     if args.run_dir:
         run_dir = normalize_run_path(args.run_dir)
         Path(run_dir).mkdir(parents=True, exist_ok=True)
-        print(f"Using existing run directory: {run_dir}")
+        print(f"Using specified run directory: {run_dir}")
     else:
-        base_results_path = Path(__file__).parent / "results"
-        run_dir = normalize_run_path(create_timestamp_dir(str(base_results_path)))
+        if args.lora_path:
+            run_dir = normalize_run_path(Path(args.lora_path) / "bench")
+            Path(run_dir).mkdir(parents=True, exist_ok=True)
+            print(f"Using default LoRA benchmark directory: {run_dir}")
+        else:
+            base_results_path = Path(__file__).parent / "results"
+            run_dir = normalize_run_path(create_timestamp_dir(str(base_results_path)))
 
     # Initialize logger
     with BenchmarkLogger(run_dir) as logger:
@@ -1802,20 +2219,28 @@ Examples:
             "num_samples": args.num_samples,
             "gpus": str(gpus),
             "model_path": args.model_path,
+            "resolved_model_path": resolved_model_path,
             "enable_lora": args.enable_lora,
             "lora_path": args.lora_path or "None",
             "lora_name": args.lora_name,
-            "max_lora_rank": args.max_lora_rank,
+            "resolved_lora_rank": resolved_lora_rank,
             "benchmarks": ",".join(benchmarks),
             "skip_infer": args.skip_infer,
             "skip_eval": args.skip_eval,
             "server_concurrency": args.server_concurrency,
+            "explore_only": args.explore,
+            "explore_temperature": EXPLORE_TEMPERATURE,
+            "explore_max_tokens": EXPLORE_MAX_TOKENS,
+            "explore_n": EXPLORE_N,
         })
 
         try:
             # Results tracking
             all_results = {}
             inference_files = {}
+            explore_inference_files = {}
+            run_benchmark = not args.explore
+            run_explore = True
 
             # Run inference
             if not args.skip_infer:
@@ -1824,7 +2249,7 @@ Examples:
                 # Start server if requested
                 if args.start_server:
                     server_url, server_process = start_vllm_server(
-                        model_path=args.model_path,
+                        model_path=resolved_model_path,
                         lora_path=args.lora_path,
                         gpus=gpus,
                         gpu_memory_utilization=0.85,
@@ -1836,12 +2261,19 @@ Examples:
                         return 1
                     args.server_url = server_url
 
-                # Use server mode if server-url is provided
-                if args.server_url:
-                    server_max_tokens = int(
-                        os.environ.get(
-                            "QWEN3VL_TRANSPARENT_EVAL_MAX_NEW_TOKENS",
-                            _get_runtime_yaml_value("eval_max_new_tokens", 8192),
+                if not args.server_url:
+                    logger.log("Error: server mode is required for benchmark/explore runs")
+                    return 1
+
+                if run_benchmark:
+                    server_max_tokens = (
+                        int(args.server_max_tokens)
+                        if args.server_max_tokens is not None
+                        else int(
+                            os.environ.get(
+                                "QWEN3VL_TRANSPARENT_EVAL_MAX_NEW_TOKENS",
+                                _get_runtime_yaml_value("eval_max_new_tokens", 8192),
+                            )
                         )
                     )
                     inference_files = run_server_inference(
@@ -1852,48 +2284,38 @@ Examples:
                         gpus=gpus,
                         max_tokens=server_max_tokens,
                         concurrency=args.server_concurrency,
-                        logger=logger
+                        logger=logger,
+                        temperature=args.server_temperature,
+                        top_p=args.server_top_p,
+                        n=args.server_n,
+                        presence_penalty=args.server_presence_penalty,
+                        repetition_penalty=args.server_repetition_penalty,
+                        output_suffix="",
                     )
                     if not inference_files:
                         logger.log("Error: Server inference failed or produced no output files")
                         return 1
-                # Use unified inference if LoRA is enabled (single model load, faster)
-                elif args.enable_lora:
-                    inference_files = run_unified_inference(
+
+                if run_explore:
+                    logger.log_section("PHASE 1B: EXPLORATION")
+                    explore_inference_files = run_server_inference(
                         benchmarks=benchmarks,
                         run_dir=run_dir,
                         num_samples=args.num_samples,
+                        server_url=args.server_url,
                         gpus=gpus,
-                        model_path=args.model_path,
-                        lora_path=args.lora_path,
-                        lora_name=args.lora_name,
-                        max_lora_rank=args.max_lora_rank,
-                        enable_lora=args.enable_lora,
-                        logger=logger
+                        max_tokens=EXPLORE_MAX_TOKENS,
+                        concurrency=args.server_concurrency,
+                        logger=logger,
+                        temperature=EXPLORE_TEMPERATURE,
+                        top_p=1.0,
+                        n=EXPLORE_N,
+                        presence_penalty=0.0,
+                        repetition_penalty=1.0,
+                        output_suffix="_explore",
                     )
-                    if not inference_files:
-                        logger.log("Error: Unified inference failed or produced no output files")
-                        return 1
-                else:
-                    # Use individual benchmark scripts (original behavior)
-                    for benchmark in benchmarks:
-                        success, output_file = run_inference(
-                            benchmark=benchmark,
-                            run_dir=run_dir,
-                            num_samples=args.num_samples,
-                            gpus=gpus,
-                            model_path=args.model_path,
-                            server_url=args.server_url,
-                            logger=logger
-                        )
-                        if success:
-                            inference_files[benchmark] = output_file
-                            logger.log(f"Inference completed: {benchmark} -> {output_file}")
-                        else:
-                            logger.log(f"Warning: {benchmark} inference failed, skipping...")
-                    if not inference_files:
-                        logger.log("Error: All individual benchmark inference runs failed")
-                        return 1
+                    if not explore_inference_files:
+                        logger.log("Warning: Exploration mode produced no output files")
             elif args.skip_infer and not args.skip_eval:
                 # Try to find existing inference files in run_dir
                 for benchmark in benchmarks:
@@ -1920,7 +2342,8 @@ Examples:
                     server_process = None
 
                 logger.log_section("PHASE 2: EVALUATION")
-                judge_benchmarks = [benchmark for benchmark in inference_files if requires_judge(benchmark)]
+                eval_inputs = explore_inference_files if args.explore else inference_files
+                judge_benchmarks = [benchmark for benchmark in eval_inputs if requires_judge(benchmark)]
                 if judge_benchmarks:
                     judge_url, judge_process = start_local_judge_server(
                         gpus=gpus,
@@ -1933,7 +2356,7 @@ Examples:
                     os.environ["JUDGE_SERVER_URL"] = judge_url
                     logger.log(f"Using local judge server for final scoring: {judge_url}")
 
-                for benchmark, input_file in inference_files.items():
+                for benchmark, input_file in eval_inputs.items():
                     success, result_file = run_evaluation(
                         benchmark=benchmark,
                         input_file=input_file,
@@ -1944,7 +2367,7 @@ Examples:
                     )
                     if success:
                         parsed = parse_benchmark_results(benchmark, result_file)
-                        token_stats = collect_benchmark_token_stats(run_dir, benchmark, args.model_path)
+                        token_stats = collect_benchmark_token_stats(run_dir, benchmark, resolved_model_path)
                         if token_stats:
                             parsed["token_stats"] = token_stats
                         all_results[benchmark] = parsed
@@ -1953,8 +2376,35 @@ Examples:
                         all_results[benchmark] = {"error": "Evaluation failed"}
                         logger.log(f"Evaluation failed: {benchmark}")
 
+                if "MathVision" in explore_inference_files:
+                    stats_file = os.path.join(run_dir, "mathvision_explore_stats.json")
+                    evaluate_mathvision_exploration(
+                        inference_file=explore_inference_files["MathVision"],
+                        stats_file=stats_file,
+                        judge_url=judge_url if requires_judge("MathVision") else None,
+                        logger=logger,
+                    )
+                if "MMMU" in explore_inference_files:
+                    stats_file = os.path.join(run_dir, "mmmu_explore_stats.json")
+                    evaluate_multiple_choice_exploration(
+                        benchmark="MMMU",
+                        inference_file=explore_inference_files["MMMU"],
+                        stats_file=stats_file,
+                        judge_url=judge_url if requires_judge("MMMU") else None,
+                        logger=logger,
+                    )
+                if "RealWorldQA" in explore_inference_files:
+                    stats_file = os.path.join(run_dir, "realworldqa_explore_stats.json")
+                    evaluate_multiple_choice_exploration(
+                        benchmark="RealWorldQA",
+                        inference_file=explore_inference_files["RealWorldQA"],
+                        stats_file=stats_file,
+                        judge_url=judge_url if requires_judge("RealWorldQA") else None,
+                        logger=logger,
+                    )
+
             # Generate summary
-            if all_results:
+            if all_results or explore_inference_files:
                 generate_summary(run_dir, all_results)
                 logger.log_section("BENCHMARK RUN COMPLETE")
                 logger.log(f"Results saved to: {run_dir}")

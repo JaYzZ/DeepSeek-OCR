@@ -19,7 +19,7 @@ _SCRIPT_DIR = Path(__file__).parent
 _REPO_ROOT = _SCRIPT_DIR.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
-from Qwen.scripts.vllm_utils import apply_runtime_env_for_thinking
+from Qwen.scripts.vllm_utils import apply_runtime_env_for_thinking, resolve_lora_artifacts
 
 def run_vllm_inference(
     model_path: str,
@@ -29,16 +29,20 @@ def run_vllm_inference(
     benchmarks: list,
     tensor_parallel_size: int = 4,
     gpu_memory_utilization: float = 0.75,
-    lora_name: str = "default"
+    lora_name: str = "default",
 ):
     """Run inference using vLLM backend by calling individual benchmark scripts."""
+    adapter_meta = resolve_lora_artifacts(model_path, lora_path)
+    resolved_model_path = adapter_meta["model_path"] or model_path
+    resolved_lora_rank = adapter_meta["lora_rank"] if adapter_meta["lora_rank"] is not None else 64
 
     print("\n" + "="*80)
     print("🚀 UNIFIED INFERENCE - vLLM Backend")
     print("="*80)
-    print(f"Model: {model_path}")
+    print(f"Model: {resolved_model_path}")
     if lora_path:
         print(f"LoRA: {lora_path}")
+        print(f"LoRA rank: {resolved_lora_rank}")
     print(f"Tensor parallel size: {tensor_parallel_size}")
     print(f"Benchmarks: {', '.join(benchmarks)}")
     print(f"Output directory: {output_dir}")
@@ -81,7 +85,7 @@ def run_vllm_inference(
             sys.executable,
             str(script_path),
             "infer",
-            "--model-path", model_path,
+            "--model-path", resolved_model_path,
             "--output-file", output_file,
             "--tensor-parallel-size", str(tensor_parallel_size),
             "--gpu-memory-utilization", str(gpu_memory_utilization),
@@ -171,14 +175,13 @@ def main():
     parser.add_argument("--num-samples", type=int, default=100)
     parser.add_argument("--tensor-parallel-size", type=int, default=4)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.75)
-    parser.add_argument("--benchmarks", type=str, default="MathVision,MMMU,RealWorldQA,ODinW-13",
+    parser.add_argument("--benchmarks", type=str, default="MathVision,MMMU,RealWorldQA",
                        help="Comma-separated list of benchmarks to run")
 
     # LoRA arguments - note: vLLM backend requires scripts to support LoRA
     parser.add_argument("--enable-lora", action="store_true", help="Enable LoRA support")
     parser.add_argument("--lora-path", type=str, default=None, help="Path to LoRA adapter")
     parser.add_argument("--lora-name", type=str, default="default", help="Name for LoRA adapter")
-
     args = parser.parse_args()
     apply_runtime_env_for_thinking(repo_root=_REPO_ROOT)
 
@@ -194,7 +197,7 @@ def main():
         benchmarks=benchmarks,
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        lora_name=args.lora_name
+        lora_name=args.lora_name,
     )
 
 

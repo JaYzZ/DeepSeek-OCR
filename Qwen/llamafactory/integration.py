@@ -49,6 +49,7 @@ from llamafactory.train.sft.trainer import CustomSeq2SeqTrainer
 
 from Qwen.llamafactory.transparent_eval_callback import QwenTransparentEvalCallback
 from Qwen.llamafactory.curriculum_callback import QwenCurriculumCallback
+from Qwen.llamafactory.runtime_env import get_flag
 
 try:
     import swanlab  # type: ignore
@@ -122,10 +123,10 @@ class QwenLossLoggingCallback(TrainerCallback):
                 parts.append(f"ce={ce:.4f}")
                 step_metrics["qwen3vl/loss/ce"] = float(ce)
 
-            embed_ce = extra_by_name.get("embed_ce")
-            if embed_ce is not None:
-                parts.append(f"embed_ce={float(embed_ce):.4f}")
-                step_metrics["qwen3vl/loss/embed_ce"] = float(embed_ce)
+            vae_ce = extra_by_name.get("vae_ce")
+            if vae_ce is not None:
+                parts.append(f"vae_ce={float(vae_ce):.4f}")
+                step_metrics["qwen3vl/loss/vae_ce"] = float(vae_ce)
 
             if thinking_breakdown:
                 for entry in thinking_breakdown:
@@ -137,7 +138,7 @@ class QwenLossLoggingCallback(TrainerCallback):
             for entry in extra_breakdown:
                 name = str(entry.get("name", "unknown"))
                 raw = entry.get("raw")
-                if name in {"vae", "latent_vae_nll", "vae_entropy", "embed_ce"}:
+                if name in {"vae", "latent_vae_nll", "vae_entropy", "vae_ce"}:
                     continue
                 parts.append(f"{name}={float(raw):.4f}" if raw is not None else f"{name}=NA")
                 if raw is not None:
@@ -583,6 +584,7 @@ def _patch_model_for_thinking_projection(logger) -> None:
             # Create VAE before loading so weights can be restored
             hidden_size = self.config.hidden_size
             vae = LatentVAE(hidden_size=hidden_size, intermediate_size=int(os.environ.get("QWEN3VL_VAE_INTERMEDIATE_SIZE", "512")), deterministic=False)
+            _align_module_to_model_dtype_device(self, vae)
             self.register_module('latent_vae', vae)
             logger.info(f"[Qwen3VL Latent] Pre-created LatentVAE for checkpoint loading: {len(vae_keys)} keys")
 
@@ -595,17 +597,40 @@ def _patch_model_for_thinking_projection(logger) -> None:
     logger.info("[Qwen3VL Latent] Patched _load_from_state_dict for VAE checkpoint loading")
 
 
-def _ensure_vae_trainable(model) -> None:
-    """Ensure VAE module parameters are trainable.
+def _apply_vae_trainable(model, trainable: bool) -> None:
+    """Freeze or unfreeze VAE parameters based on curriculum stage.
 
-    This should be called after model is prepared for training to ensure
-    VAE parameters are included in trainable params.
+    Args:
+        model: The model with latent_vae module
+        trainable: If True, unfreeze VAE; if False, freeze VAE
     """
     if hasattr(model, 'latent_vae') and model.latent_vae is not None:
         for name, param in model.named_parameters():
             if 'latent_vae' in name:
-                param.requires_grad = True
-        logger.debug("[Qwen3VL Latent] Enabled VAE parameters as trainable")
+                if param.requires_grad != trainable:
+                    param.requires_grad = trainable
+
+        state = "trainable" if trainable else "frozen"
+        logger.info(f"[Qwen3VL Latent] Set VAE parameters to {state}")
+    else:
+        # No VAE in model yet
+        if trainable:
+            logger.debug("[Qwen3VL Latent] VAE not yet created, will be trainable when created")
+
+def _align_module_to_model_dtype_device(model: nn.Module, module: nn.Module) -> None:
+    """Match a newly-created module to the model's floating dtype/device."""
+    ref_tensor = None
+    for param in model.parameters():
+        if torch.is_floating_point(param):
+            ref_tensor = param
+            break
+    if ref_tensor is None:
+        for buffer in model.buffers():
+            if torch.is_floating_point(buffer):
+                ref_tensor = buffer
+                break
+    if ref_tensor is not None:
+        module.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
 
 
 # Export function for external use
@@ -615,7 +640,7 @@ def ensure_vae_in_model(model) -> None:
     Call this after model is loaded to ensure VAE is included in
     the model's trainable parameters for the optimizer.
     """
-    _ensure_vae_trainable(model)
+    _apply_vae_trainable(model, True)
 
 
 def _resolve_latent_vae_module(model) -> Optional[nn.Module]:
@@ -686,6 +711,11 @@ def load_vae_checkpoint(model, checkpoint_path: str) -> None:
     vae_state_dict = safetensors.torch.load_file(checkpoint_path)
     vae.load_state_dict(vae_state_dict, strict=True)
     logger.info(f"[Qwen3VL Latent] Loaded VAE checkpoint from {checkpoint_path}")
+
+
+def _should_save_vae_checkpoint() -> bool:
+    """Save VAE checkpoints only when the active stage actually uses VAE."""
+    return "vae" in _get_loss_spec()
 
 
 def _patch_dataset_converter(logger) -> None:
@@ -889,9 +919,9 @@ def _align_latent_metadata_with_model_inputs(
         model_inputs[field] = [values[i] if i < len(values) else None for i in kept_indices]
 
 
-def _latent_step_ce_enabled() -> bool:
+def _latent_ce_enabled() -> bool:
     """Whether CE loss on expanded latent positions is enabled in the main process."""
-    return os.environ.get("QWEN3VL_LATENT_STEP_CE_ACTIVE", "1").strip() == "1"
+    return get_flag("QWEN3VL_LATENT_CE_ACTIVE", True)
 
 
 def _resample_token_sequence(token_ids: list[int], target_len: int) -> list[int]:
@@ -936,7 +966,7 @@ def _normalize_int_list(value: Any) -> Optional[list[int]]:
     return [int(x) for x in value]
 
 
-def _build_latent_ce_targets(
+def _build_vae_ce_targets(
     *,
     exp_len: int,
     latent_label: int,
@@ -1181,7 +1211,7 @@ def _expand_sample_for_latent_injection(
 
     new_labels_tensor = labels_tensor[:latent_indices[0]]
 
-    use_latent_token = os.environ.get("QWEN3VL_LATENT_STEP_CE_TOKEN", "0") == "1"
+    use_latent_token = get_flag("QWEN3VL_LATENT_CE_TOKEN", False)
     use_cot_token = not use_latent_token
     latent_label = latent_token_id if use_latent_token else ignore_index
 
@@ -1191,7 +1221,7 @@ def _expand_sample_for_latent_injection(
         step_tokens = None
         if cot_step_token_ids is not None and i < len(cot_step_token_ids):
             step_tokens = cot_step_token_ids[i]
-        latent_block_labels = _build_latent_ce_targets(
+        latent_block_labels = _build_vae_ce_targets(
             exp_len=exp_len,
             latent_label=latent_label,
             use_latent_token=use_latent_token,
@@ -1205,26 +1235,26 @@ def _expand_sample_for_latent_injection(
     for i, (latent_idx, _exp_len) in enumerate(zip(latent_indices, expansion_lengths)):
         new_labels_tensor = torch.cat([new_labels_tensor, block_label_tensors[i]])
         if i == 0:
-            new_latent_ce_mask = torch.zeros_like(labels_tensor[:latent_indices[0]], dtype=torch.long)
-        new_latent_ce_mask = torch.cat([new_latent_ce_mask, block_mask_tensors[i]])
+            new_vae_ce_mask = torch.zeros_like(labels_tensor[:latent_indices[0]], dtype=torch.long)
+        new_vae_ce_mask = torch.cat([new_vae_ce_mask, block_mask_tensors[i]])
 
         if i < len(latent_indices) - 1:
             next_idx = latent_indices[i + 1]
             inter_labels = labels_tensor[latent_idx + 1:next_idx].clone()
             new_labels_tensor = torch.cat([new_labels_tensor, inter_labels])
-            new_latent_ce_mask = torch.cat(
-                [new_latent_ce_mask, torch.zeros_like(inter_labels, dtype=torch.long)]
+            new_vae_ce_mask = torch.cat(
+                [new_vae_ce_mask, torch.zeros_like(inter_labels, dtype=torch.long)]
             )
         else:
             new_labels_tensor = torch.cat([new_labels_tensor, labels_tensor[latent_idx + 1:]])
-            new_latent_ce_mask = torch.cat(
-                [new_latent_ce_mask, torch.zeros_like(labels_tensor[latent_idx + 1:], dtype=torch.long)]
+            new_vae_ce_mask = torch.cat(
+                [new_vae_ce_mask, torch.zeros_like(labels_tensor[latent_idx + 1:], dtype=torch.long)]
             )
 
     new_labels_tensor = new_labels_tensor.clone()
-    new_latent_ce_mask = new_latent_ce_mask.clone()
+    new_vae_ce_mask = new_vae_ce_mask.clone()
 
-    return new_input_ids_tensor, new_labels_tensor.tolist(), new_latent_ce_mask.tolist()
+    return new_input_ids_tensor, new_labels_tensor.tolist(), new_vae_ce_mask.tolist()
 
 
 def _resolve_sample_latent_inputs(latent_fields: dict[str, Any], logger) -> tuple[list[Any], list[int], Optional[list[list[int]]]]:
@@ -1316,7 +1346,7 @@ def _pack_features_after_injection(
 
         latent_gt, latent_gt_lengths, cot_step_token_ids = _resolve_sample_latent_inputs(latent_fields, logger)
 
-        new_input_ids, new_labels, new_latent_ce_mask = _expand_sample_for_latent_injection(
+        new_input_ids, new_labels, new_vae_ce_mask = _expand_sample_for_latent_injection(
             input_ids=input_ids,
             labels=labels,
             latent_token_id=latent_token_id,
@@ -1342,7 +1372,7 @@ def _pack_features_after_injection(
         new_feature = dict(feature)
         new_feature["input_ids"] = new_input_ids
         new_feature["labels"] = new_labels
-        new_feature["latent_ce_mask"] = new_latent_ce_mask
+        new_feature["vae_ce_mask"] = new_vae_ce_mask
         new_feature["attention_mask"] = [1] * len(new_input_ids)
 
         # OPTIMIZED: No longer need length2indexes with first-fit decreasing
@@ -1367,7 +1397,7 @@ def _pack_features_after_injection(
             )
             fallback_feature["input_ids"] = fallback_input_ids
             fallback_feature["labels"] = fallback_labels
-            fallback_feature["latent_ce_mask"] = [0] * len(fallback_input_ids)
+            fallback_feature["vae_ce_mask"] = [0] * len(fallback_input_ids)
             fallback_len = len(fallback_input_ids)
             if fallback_len > cutoff_len:
                 logger.warning(
@@ -1383,7 +1413,7 @@ def _pack_features_after_injection(
                 )
                 fallback_feature["input_ids"] = fallback_input_ids
                 fallback_feature["labels"] = fallback_labels
-                fallback_feature["latent_ce_mask"] = [0] * len(fallback_input_ids)
+                fallback_feature["vae_ce_mask"] = [0] * len(fallback_input_ids)
                 fallback_len = len(fallback_input_ids)
             fallback_feature["attention_mask"] = [1] * len(fallback_input_ids)
             expanded_features.append(fallback_feature)
@@ -1407,7 +1437,7 @@ def _pack_features_after_injection(
             )
             fallback_feature["input_ids"] = fallback_input_ids
             fallback_feature["labels"] = fallback_labels
-            fallback_feature["latent_ce_mask"] = [0] * len(fallback_input_ids)
+            fallback_feature["vae_ce_mask"] = [0] * len(fallback_input_ids)
             fallback_feature["attention_mask"] = [1] * len(fallback_input_ids)
             expanded_features.append(fallback_feature)
             expanded_latent_fields.append(
@@ -1448,7 +1478,7 @@ def _pack_features_after_injection(
         # Use list comprehension for faster initialization
         packed_input_ids: list[int] = [0] * total_len
         packed_labels: list[int] = [0] * total_len
-        packed_latent_ce_mask: list[int] = [0] * total_len
+        packed_vae_ce_mask: list[int] = [0] * total_len
         packed_attention_mask: list[int] = [0] * total_len
 
         # Use lists for mutable accumulation (extend faster than +=)
@@ -1465,12 +1495,12 @@ def _pack_features_after_injection(
             feat_input_ids = feature["input_ids"]
             feat_labels = feature["labels"]
             feat_len = len(feat_input_ids)
-            feat_latent_ce_mask = feature.get("latent_ce_mask") or [0] * feat_len
+            feat_vae_ce_mask = feature.get("vae_ce_mask") or [0] * feat_len
 
             # In-place assignment (faster than +=)
             packed_input_ids[current_pos:current_pos + feat_len] = feat_input_ids
             packed_labels[current_pos:current_pos + feat_len] = feat_labels
-            packed_latent_ce_mask[current_pos:current_pos + feat_len] = feat_latent_ce_mask
+            packed_vae_ce_mask[current_pos:current_pos + feat_len] = feat_vae_ce_mask
 
             # Vectorized attention mask creation
             attn_val = seg_idx + 1 if block_diag_attn else 1
@@ -1509,7 +1539,7 @@ def _pack_features_after_injection(
         # Trim to actual size
         packed_input_ids = packed_input_ids[:current_pos]
         packed_labels = packed_labels[:current_pos]
-        packed_latent_ce_mask = packed_latent_ce_mask[:current_pos]
+        packed_vae_ce_mask = packed_vae_ce_mask[:current_pos]
         packed_attention_mask = packed_attention_mask[:current_pos]
 
         # Padding (vectorized)
@@ -1517,7 +1547,7 @@ def _pack_features_after_injection(
             pad_length = cutoff_len - len(packed_input_ids) + 1
             packed_input_ids.extend([pad_token_id] * pad_length)
             packed_labels.extend([ignore_index] * pad_length)
-            packed_latent_ce_mask.extend([0] * pad_length)
+            packed_vae_ce_mask.extend([0] * pad_length)
             packed_attention_mask.extend([0] * pad_length)
 
         if len(packed_input_ids) != cutoff_len + 1:
@@ -1531,7 +1561,7 @@ def _pack_features_after_injection(
                 "input_ids": packed_input_ids,
                 "attention_mask": packed_attention_mask,
                 "labels": packed_labels,
-                "latent_ce_mask": packed_latent_ce_mask,
+                "vae_ce_mask": packed_vae_ce_mask,
                 "images": packed_images or None,
                 "videos": packed_videos or None,
                 "audios": packed_audios or None,
@@ -1610,25 +1640,25 @@ def _patch_data_collator(logger) -> None:
             raise
         pack_time = time.time() - pack_start
 
-        latent_ce_masks = []
+        vae_ce_masks = []
         if batch and isinstance(batch[0], dict):
             for item in batch:
-                latent_ce_masks.append(item.pop("latent_ce_mask", None))
+                vae_ce_masks.append(item.pop("vae_ce_mask", None))
 
         # Call original collator (tokenizer only sees standard fields)
         collator_start = time.time()
         result = original_call(self, batch)
         collator_time = time.time() - collator_start
 
-        # Rebuild latent_ce_mask outside the upstream collator. This avoids
+        # Rebuild vae_ce_mask outside the upstream collator. This avoids
         # tokenizer.pad treating it like a normal token field and applying
         # pad_to_multiple_of independently from labels.
         labels_tensor = result.get("labels")
-        if torch.is_tensor(labels_tensor) and latent_ce_masks:
+        if torch.is_tensor(labels_tensor) and vae_ce_masks:
             label_len = int(labels_tensor.shape[1])
             padding_side = self.tokenizer.padding_side
             normalized_masks = []
-            for mask in latent_ce_masks:
+            for mask in vae_ce_masks:
                 mask_list = list(mask) if isinstance(mask, list) else []
                 if len(mask_list) < label_len:
                     pad = [0] * (label_len - len(mask_list))
@@ -1636,7 +1666,7 @@ def _patch_data_collator(logger) -> None:
                 elif len(mask_list) > label_len:
                     mask_list = mask_list[:label_len] if padding_side == "right" else mask_list[-label_len:]
                 normalized_masks.append(mask_list)
-            result["latent_ce_mask"] = torch.tensor(
+            result["vae_ce_mask"] = torch.tensor(
                 normalized_masks,
                 dtype=torch.bool,
                 device=labels_tensor.device,
@@ -1854,22 +1884,26 @@ def _patch_model_forward(logger) -> None:
             print(f"[DEBUG] latent_supervision={type(latent_supervision)}, len={len(latent_supervision) if latent_supervision else 'None/0'}", flush=True, file=sys.stderr)
             print(f"[DEBUG] latent_positions={type(latent_positions)}, shape={latent_positions.shape if latent_positions is not None else 'None'}", flush=True, file=sys.stderr)
 
-        use_latent_vae = "vae" in loss_spec
+        has_vae_in_loss = "vae" in loss_spec
+        # Check curriculum control for VAE parameter trainability
+        vae_param_trainable = get_flag("QWEN3VL_VAE_TRAINABLE", True)
+
+        # VAE is used for losses if it exists in loss spec AND is trainable
+        use_latent_vae = has_vae_in_loss and vae_param_trainable
 
         # Lazy initialization of LatentVAE on first forward pass
-        if use_latent_vae:
+        # Create VAE if "vae" in loss spec, even if not trainable (frozen mode)
+        if has_vae_in_loss:
             # Check if VAE already exists (from checkpoint load) or needs to be created
             if not hasattr(self, 'latent_vae') or self.latent_vae is None:
                 # Get hidden size from model config and create VAE with default config
                 hidden_size = self.config.hidden_size
                 # Create VAE with config from env var
                 vae = LatentVAE(hidden_size=hidden_size, intermediate_size=int(os.environ.get("QWEN3VL_VAE_INTERMEDIATE_SIZE", "512")), deterministic=False)
+                _align_module_to_model_dtype_device(self, vae)
                 # Register as module so it gets saved/loaded with checkpoint
                 self.register_module('latent_vae', vae)
                 logger.info(f"[Qwen3VL Latent] Created LatentVAE: hidden_size={hidden_size}, intermediate_size={os.environ.get('QWEN3VL_VAE_INTERMEDIATE_SIZE', '512')}")
-
-            # Ensure VAE parameters are trainable (in case model was loaded with frozen params)
-            _ensure_vae_trainable(self)
 
             # If model was loaded from checkpoint, VAE weights should already be in the state dict
             # and will be applied automatically by PyTorch's load_state_dict
@@ -1961,10 +1995,10 @@ def _patch_model_forward(logger) -> None:
             print(f"  image_grid_thw: {image_grid_thw}", flush=True, file=sys.stderr)
             print(f"  labels: {labels.shape if labels is not None else None}", flush=True, file=sys.stderr)
 
-        latent_ce_mask = kwargs.pop("latent_ce_mask", None)
+        vae_ce_mask = kwargs.pop("vae_ce_mask", None)
         effective_labels = labels
-        if labels is not None and latent_ce_mask is not None and not _latent_step_ce_enabled():
-            effective_labels = labels.masked_fill(latent_ce_mask.bool(), -100)
+        if labels is not None and vae_ce_mask is not None and not _latent_ce_enabled():
+            effective_labels = labels.masked_fill(vae_ce_mask.bool(), -100)
 
         # Only skip pixel_values when latent_ground_truth is present and non-empty
         # OR when latent tokens exist in input_ids (latent injection training)
@@ -2081,7 +2115,7 @@ def _patch_model_forward(logger) -> None:
         vae_loss = None
         latent_vae_loss = None  # Initialize to avoid unbound variable
         entropy = None
-        embed_ce_loss = None  # Initialize for logging
+        vae_ce_loss = None  # Initialize for logging
         sampled_latents = None
         batch_indices = None
         seq_indices = None
@@ -2129,7 +2163,10 @@ def _patch_model_forward(logger) -> None:
                     ot_stats = post_vae_ot_stats
 
         # FSDP safety: if any rank has sampled latents, all ranks must run pred-embed second forward.
-        if use_latent_vae and loss_weights.get("embed_ce", 0.0) > 0 and inputs_embeds is not None and labels is not None:
+        # Check curriculum control for vae_ce (second forward)
+        vae_ce_enable = get_flag("QWEN3VL_VAE_CE_ENABLE", True)
+
+        if use_latent_vae and vae_ce_enable and loss_weights.get("vae_ce", 0.0) > 0 and inputs_embeds is not None and labels is not None:
             local_pred_ready = (
                 sampled_latents is not None
                 and batch_indices is not None
@@ -2156,14 +2193,14 @@ def _patch_model_forward(logger) -> None:
                     batch_indices_for_forward = torch.empty(0, dtype=torch.long, device=inputs_embeds.device)
                     seq_indices_for_forward = torch.empty(0, dtype=torch.long, device=inputs_embeds.device)
 
-                embed_ce_loss = _compute_pred_embed_forward_loss(
+                vae_ce_loss = _compute_pred_embed_forward_loss(
                     model=self.model,
                     original_inputs_embeds=inputs_embeds,
                     sampled_latents=sampled_latents_for_forward,
                     batch_indices=batch_indices_for_forward,
                     seq_indices=seq_indices_for_forward,
                     labels=labels,
-                    latent_ce_mask=latent_ce_mask,
+                    vae_ce_mask=vae_ce_mask,
                     attention_mask=attention_mask,
                     # Keep pred-embed forward text-only to avoid rank-dependent vision branches.
                     pixel_values=None,
@@ -2184,9 +2221,9 @@ def _patch_model_forward(logger) -> None:
         vae_weight = loss_weights.get("vae", 0.0)
         if vae_loss is not None and vae_weight > 0:
             aux_loss = (aux_loss if aux_loss is not None else 0.0) + vae_loss * vae_weight
-        embed_ce_weight = loss_weights.get("embed_ce", 0.0)
-        if embed_ce_loss is not None and embed_ce_weight > 0:
-            aux_loss = (aux_loss if aux_loss is not None else 0.0) + embed_ce_loss * embed_ce_weight
+        vae_ce_weight = loss_weights.get("vae_ce", 0.0)
+        if vae_ce_loss is not None and vae_ce_weight > 0:
+            aux_loss = (aux_loss if aux_loss is not None else 0.0) + vae_ce_loss * vae_ce_weight
 
         loss = ce_loss
         if aux_loss is not None:
@@ -2223,14 +2260,14 @@ def _patch_model_forward(logger) -> None:
         if rank_0:
             # Stash for TrainerCallback logging.
             vae_val = float(vae_loss.item()) if vae_loss is not None else None
-            embed_ce_val = float(embed_ce_loss.item()) if embed_ce_loss is not None else None
+            vae_ce_val = float(vae_ce_loss.item()) if vae_ce_loss is not None else None
             if latent_vae_loss is not None:
                 extra_breakdown.append({"name": "latent_vae_nll", "raw": float(latent_vae_loss.item())})
             if use_latent_vae:
                 if entropy is not None:
                     extra_breakdown.append({"name": "vae_entropy", "raw": float(entropy.item())})
                 extra_breakdown.append({"name": "vae", "raw": vae_val})
-                extra_breakdown.append({"name": "embed_ce", "raw": embed_ce_val})
+                extra_breakdown.append({"name": "vae_ce", "raw": vae_ce_val})
             setattr(
                 self,
                 "_qwen3vl_last_loss_info",
@@ -2241,7 +2278,7 @@ def _patch_model_forward(logger) -> None:
                     "ce": float(ce_val),
                     "thinking": float(thinking_val) if thinking_loss is not None else None,
                     "vae": vae_val,
-                    "embed_ce": embed_ce_val,
+                    "vae_ce": vae_ce_val,
                     "thinking_breakdown": thinking_breakdown,
                     "extra_breakdown": extra_breakdown,
                     "total": float(loss.item()) if loss is not None else None,
@@ -2282,6 +2319,7 @@ def _ensure_vae_created(model) -> None:
 
     # Create VAE
     vae = LatentVAE(hidden_size=hidden_size, intermediate_size=int(os.environ.get("QWEN3VL_VAE_INTERMEDIATE_SIZE", "512")), deterministic=False)
+    _align_module_to_model_dtype_device(model, vae)
     model.register_module('latent_vae', vae)
     logger.debug(f"[Qwen3VL Latent] Pre-created LatentVAE: hidden_size={hidden_size}, intermediate_size={os.environ.get('QWEN3VL_VAE_INTERMEDIATE_SIZE', '512')}")
 
@@ -2394,11 +2432,15 @@ def _patch_trainer_callback(logger) -> None:
             except Exception:
                 should_save_vae = False
 
-        if should_save_vae:
+        if should_save_vae and _should_save_vae_checkpoint():
             try:
                 save_vae_checkpoint(self.model, output_dir)
             except Exception as e:
                 logger.warning(f"[Qwen3VL Latent] Failed to save VAE checkpoint to {output_dir}: {e}")
+        elif should_save_vae and _is_rank0():
+            logger.info(
+                "[Qwen3VL Latent] Skipping VAE checkpoint save because active loss spec has no VAE"
+            )
 
         return result
 
@@ -2450,11 +2492,16 @@ def _patch_trainer_callback(logger) -> None:
                 logger.info("[Qwen3VL Latent] Skipping QwenTransparentEvalCallback (do_eval=false)")
 
         # 3) Add CurriculumCallback if enabled
-        if os.environ.get("QWEN3VL_CURRICULUM_ENABLE", "0") == "1":
+        curriculum_enable_env = os.environ.get("QWEN3VL_CURRICULUM_ENABLE", "0")
+        if _is_rank0():
+            logger.info(f"[Qwen3VL Latent] Checking curriculum: QWEN3VL_CURRICULUM_ENABLE={curriculum_enable_env}")
+        if curriculum_enable_env == "1":
             curriculum_callback = QwenCurriculumCallback()
             self.add_callback(curriculum_callback)
             if _is_rank0():
                 logger.info("[Qwen3VL Latent] Auto-registered QwenCurriculumCallback")
+        elif _is_rank0():
+            logger.warning(f"[Qwen3VL Latent] Curriculum DISABLED: QWEN3VL_CURRICULUM_ENABLE={curriculum_enable_env} (expected '1')")
 
         return result
 
@@ -3169,11 +3216,11 @@ def _compute_thinking_loss(
             loss, ot_stats = _compute_ot_loss(hidden_states, latent_supervision, latent_positions)
         elif loss_name == "mse":
             loss = _compute_mse_loss(hidden_states, latent_ground_truth, latent_positions)
-        elif loss_name in {"vae", "embed_ce", "ce"}:
+        elif loss_name in {"vae", "vae_ce", "ce"}:
             # These terms are combined in patched_forward.
             loss = None  # Will be computed separately
         else:
-            raise ValueError(f"Unknown loss type: {loss_name}. Must be 'repa', 'nce', 'ot', 'mse', 'vae', 'embed_ce', 'ce', or 'none'")
+            raise ValueError(f"Unknown loss type: {loss_name}. Must be 'repa', 'nce', 'ot', 'mse', 'vae', 'vae_ce', 'ce', or 'none'")
 
         # Debug logging (first call only)
         if not hasattr(_compute_thinking_loss, '_logged_loss'):
@@ -3181,7 +3228,7 @@ def _compute_thinking_loss(
                 logger.debug(f"[Qwen3VL Latent] {loss_name} loss result: {loss}, weight: {weight}")
             _compute_thinking_loss._logged_loss = True
 
-        if loss_name not in {"vae", "embed_ce", "ce"}:
+        if loss_name not in {"vae", "vae_ce", "ce"}:
             raw_value = loss.item() if isinstance(loss, torch.Tensor) else loss
             loss_breakdown.append(
                 {
@@ -3702,8 +3749,8 @@ def _add_latent_supervision_to_batch(
             thinking_end_id=thinking_end_id,
         )
         collated['latent_positions'] = latent_positions
-    if 'latent_ce_mask' in collated:
-        collated['latent_ce_mask'] = collated['latent_ce_mask'].bool()
+    if 'vae_ce_mask' in collated:
+        collated['vae_ce_mask'] = collated['vae_ce_mask'].bool()
 
     # Debug: Log batch and latent_positions info
     if debug_enabled:
@@ -4051,7 +4098,7 @@ def _compute_pred_embed_forward_loss(
     batch_indices: torch.Tensor,
     seq_indices: torch.Tensor,
     labels: torch.Tensor,
-    latent_ce_mask: Optional[torch.Tensor],
+    vae_ce_mask: Optional[torch.Tensor],
     attention_mask: torch.Tensor,
     pixel_values,
     image_grid_thw,
@@ -4115,8 +4162,8 @@ def _compute_pred_embed_forward_loss(
         inputs_embeds_with_sampled[b_idx, s_idx] = sampled_cast
 
     labels_sampled = labels.detach().clone()
-    if latent_ce_mask is not None and not _latent_step_ce_enabled():
-        labels_sampled = labels_sampled.masked_fill(latent_ce_mask.bool(), -100)
+    if vae_ce_mask is not None and not _latent_ce_enabled():
+        labels_sampled = labels_sampled.masked_fill(vae_ce_mask.bool(), -100)
 
     # Build shifted labels first, then keep the suffix that starts at the earliest
     # supervised position on any rank. Counting supervised tokens is insufficient
@@ -4144,6 +4191,7 @@ def _compute_pred_embed_forward_loss(
         return None
 
     target = shift_labels[:, -global_keep:].contiguous()
+
     try:
         second_outputs = model(
             input_ids=None,

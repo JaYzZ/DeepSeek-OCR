@@ -14,7 +14,9 @@ import random
 
 # Add parent directory to path to import shared config
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 from config import resolve_path, get_data_path, get_results_path, QWEN3_VL_2B_THINKING
+from Qwen.scripts.vllm_utils import normalize_media_path, resolve_lora_artifacts
 
 # vLLM imports
 from vllm import LLM, SamplingParams
@@ -144,7 +146,7 @@ def run_inference(args):
                             val = item.get(key)
                             if isinstance(val, str) and val.startswith("file://"):
                                 item = dict(item)
-                                item[key] = val[len("file://"):]
+                                item[key] = normalize_media_path(val)
                         new_content.append(item)
                     norm.append({"role": msg.get("role", "user"), "content": new_content})
                 else:
@@ -227,8 +229,10 @@ def run_inference(args):
         }
 
         if hasattr(args, 'enable_lora') and args.enable_lora and args.lora_path:
+            adapter_meta = resolve_lora_artifacts(args.model_path, args.lora_path)
+            resolved_lora_rank = adapter_meta["lora_rank"] if adapter_meta["lora_rank"] is not None else 64
             llm_kwargs["enable_lora"] = True
-            llm_kwargs["max_lora_rank"] = args.max_lora_rank
+            llm_kwargs["max_lora_rank"] = resolved_lora_rank
             llm_kwargs["max_loras"] = 1
             print(f"   LoRA enabled: {args.lora_name} from {args.lora_path}")
 
@@ -696,9 +700,6 @@ def main():
                             help="Path to LoRA adapter")
     infer_parser.add_argument("--lora-name", type=str, default="default",
                             help="LoRA adapter name (default: default)")
-    infer_parser.add_argument("--max-lora-rank", type=int, default=64,
-                            help="Maximum LoRA rank (default: 64)")
-
     # Generation parameters
     infer_parser.add_argument("--max-new-tokens", type=int, default=8192,
                             help="Maximum number of tokens to generate (default: 8192)")

@@ -68,8 +68,8 @@ def latent_env(monkeypatch):
     monkeypatch.setenv("QWEN3VL_THINKING_START_ID", str(THINK_START_ID))
     monkeypatch.setenv("QWEN3VL_THINKING_END_ID", str(THINK_END_ID))
     monkeypatch.setenv("QWEN3VL_CUTOFF_LEN", "64")
-    monkeypatch.setenv("QWEN3VL_LATENT_STEP_CE_ACTIVE", "1")
-    monkeypatch.setenv("QWEN3VL_LATENT_STEP_CE_TOKEN", "0")
+    monkeypatch.setenv("QWEN3VL_LATENT_CE_ACTIVE", "1")
+    monkeypatch.setenv("QWEN3VL_LATENT_CE_TOKEN", "0")
 
 
 def test_full_latent_pipeline_from_paths(tmp_path):
@@ -148,7 +148,7 @@ def test_full_latent_pipeline_from_paths(tmp_path):
         dtype=torch.float32,
     )
 
-    pre_loss = lfi._compute_pre_thinking_mse_loss(
+    pre_loss = lfi._compute_mse_loss(
         hidden_states=hidden_states,
         latent_ground_truth=materialized_gt,
         latent_positions=collated["latent_positions"],
@@ -161,7 +161,7 @@ def test_full_latent_pipeline_from_paths(tmp_path):
         vae=vae,
         hidden_states=hidden_states,
         latent_positions=collated["latent_positions"],
-        latent_supervision_packed=torch.cat(materialized_sup[0], dim=0),
+        latent_ground_truth_packed=torch.cat(materialized_gt[0], dim=0),
     )
     assert vae_loss is not None
     assert entropy is not None
@@ -194,6 +194,7 @@ def test_pred_embed_forward_loss_matches_shifted_labels():
         batch_indices=batch_indices,
         seq_indices=seq_indices,
         labels=labels,
+        vae_ce_mask=None,
         attention_mask=attention_mask,
         pixel_values=None,
         image_grid_thw=None,
@@ -236,15 +237,60 @@ def test_parse_loss_spec_defaults_unweighted_terms_to_one():
 
 def test_curriculum_applies_on_non_world_zero(monkeypatch):
     monkeypatch.setenv("QWEN3VL_CURRICULUM_ENABLE", "1")
-    monkeypatch.setenv("QWEN3VL_CURRICULUM_EPOCHS", "0")
+    monkeypatch.setenv("QWEN3VL_CURRICULUM_EPOCHS", "1")
     monkeypatch.setenv("QWEN3VL_CURRICULUM_LOSS_TYPES", "repa")
-    monkeypatch.setenv("QWEN3VL_CURRICULUM_LATENT_STEP_CE", "1")
+    monkeypatch.setenv("QWEN3VL_CURRICULUM_LATENT_CE", "1")
     monkeypatch.setenv("QWEN3VL_LOSS_TYPE", "mse")
-    monkeypatch.setenv("QWEN3VL_LATENT_STEP_CE_ACTIVE", "0")
+    monkeypatch.setenv("QWEN3VL_LATENT_CE_ACTIVE", "0")
 
     callback = QwenCurriculumCallback()
     state = SimpleNamespace(is_world_process_zero=False, epoch=0.0)
     callback.on_train_begin(args=None, state=state, control=None)
 
     assert os.environ["QWEN3VL_LOSS_TYPE"] == "repa"
-    assert os.environ["QWEN3VL_LATENT_STEP_CE_ACTIVE"] == "1"
+    assert os.environ["QWEN3VL_LATENT_CE_ACTIVE"] == "1"
+
+
+def test_curriculum_single_number_uses_zero_based_boundaries(monkeypatch):
+    monkeypatch.setenv("QWEN3VL_CURRICULUM_ENABLE", "1")
+    monkeypatch.setenv("QWEN3VL_CURRICULUM_EPOCHS", "3")
+    monkeypatch.setenv("QWEN3VL_CURRICULUM_LOSS_TYPES", "stage0,stage1,stage2")
+    monkeypatch.setenv("QWEN3VL_CURRICULUM_LATENT_CE", "0,0,0")
+
+    callback = QwenCurriculumCallback()
+
+    assert [stage["epoch"] for stage in callback.stages] == [0, 1, 2]
+    assert callback._get_stage_for_epoch(0.0)["loss_type"] == "stage0"
+    assert callback._get_stage_for_epoch(1.0)["loss_type"] == "stage1"
+    assert callback._get_stage_for_epoch(2.0)["loss_type"] == "stage2"
+
+
+def test_curriculum_applies_trainability_to_model(monkeypatch):
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora_a = torch.nn.Parameter(torch.ones(1))
+            self.latent_vae_weight = torch.nn.Parameter(torch.ones(1))
+
+    monkeypatch.setenv("QWEN3VL_CURRICULUM_ENABLE", "1")
+    monkeypatch.setenv("QWEN3VL_CURRICULUM_EPOCHS", "1")
+    monkeypatch.setenv("QWEN3VL_CURRICULUM_LOSS_TYPES", "ce+mse")
+    monkeypatch.setenv("QWEN3VL_CURRICULUM_LATENT_CE", "0")
+    monkeypatch.setenv("QWEN3VL_CURRICULUM_LORA_TRAINABLE", "0")
+    monkeypatch.setenv("QWEN3VL_CURRICULUM_VAE_TRAINABLE", "1")
+
+    callback = QwenCurriculumCallback()
+    model = DummyModel()
+    state = SimpleNamespace(is_world_process_zero=True, epoch=0.0)
+    callback.on_train_begin(args=None, state=state, control=None, model=model)
+
+    assert model.lora_a.requires_grad is False
+    assert model.latent_vae_weight.requires_grad is True
+
+
+def test_should_save_vae_checkpoint_respects_active_loss_spec(monkeypatch):
+    monkeypatch.setenv("QWEN3VL_LOSS_TYPE", "ce+mse:0.4+ot:0.4")
+    assert lfi._should_save_vae_checkpoint() is False
+
+    monkeypatch.setenv("QWEN3VL_LOSS_TYPE", "ce+vae_ce+vae:0.4+mse:0.4+ot:0.4")
+    assert lfi._should_save_vae_checkpoint() is True

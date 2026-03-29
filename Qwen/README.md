@@ -234,7 +234,7 @@ Supported terms:
 Curriculum is enabled by default in `Qwen/scripts/train_qwen3vl_r1onevision.sh` via:
 - `QWEN3VL_CURRICULUM_ENABLE=1`
 - `QWEN3VL_CURRICULUM_EPOCHS`, `QWEN3VL_CURRICULUM_LOSS_TYPES`
-- `QWEN3VL_CURRICULUM_LATENT_STEP_CE` (toggles CE on latent positions per stage)
+- `QWEN3VL_CURRICULUM_LATENT_CE` (toggles CE on latent positions per stage)
 
 Implementation: `Qwen/llamafactory/curriculum_callback.py` (it updates env vars at epoch boundaries).
 

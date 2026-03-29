@@ -154,6 +154,149 @@ _snapshot_run_configs() {
     cp -f "$QWEN3VL_RUNTIME_ENV_CONFIG" "$runtime_dest"
 }
 
+_build_curriculum_stage_plan() {
+    local epochs_str="$1"
+    local loss_types_str="$2"
+    local vae_trainable_str="$3"
+    local lora_trainable_str="$4"
+    local aux_source_str="$5"
+    local latent_ce_str="$6"
+    local total_epochs="$7"
+    "$PYTHON_BIN" - "$epochs_str" "$loss_types_str" "$vae_trainable_str" "$lora_trainable_str" "$aux_source_str" "$latent_ce_str" "$total_epochs" <<'PY'
+import sys
+
+epochs_str, loss_types_str, vae_trainable_str, lora_trainable_str, aux_source_str, latent_ce_str, total_epochs_str = sys.argv[1:]
+total_epochs = float(total_epochs_str)
+
+if "," in epochs_str:
+    boundaries = [float(x.strip()) for x in epochs_str.split(",") if x.strip()]
+else:
+    num_stages = int(epochs_str)
+    boundaries = [float(i) for i in range(num_stages)]
+
+if not boundaries:
+    raise SystemExit("Curriculum split requires at least one stage boundary.")
+if boundaries[0] != 0.0:
+    raise SystemExit(f"Curriculum split requires boundaries to start at 0, got {boundaries[0]}.")
+if any(boundaries[i] >= boundaries[i + 1] for i in range(len(boundaries) - 1)):
+    raise SystemExit(f"Curriculum boundaries must be strictly increasing: {boundaries}")
+if boundaries[-1] >= total_epochs:
+    raise SystemExit(
+        f"Last curriculum boundary {boundaries[-1]} must be less than total num_train_epochs {total_epochs}."
+    )
+
+loss_types = [x.strip() for x in loss_types_str.split(",") if x.strip()]
+
+def parse_stage_values(raw: str):
+    if "," in raw:
+        return [x.strip() for x in raw.split(",")]
+    return [raw.strip()] * len(boundaries)
+
+vae_trainable = parse_stage_values(vae_trainable_str)
+lora_trainable = parse_stage_values(lora_trainable_str)
+aux_source = parse_stage_values(aux_source_str)
+latent_ce = parse_stage_values(latent_ce_str)
+
+num_stages = len(boundaries)
+if not all(len(seq) == num_stages for seq in [loss_types, vae_trainable, lora_trainable, aux_source, latent_ce]):
+    raise SystemExit(
+        "Curriculum config length mismatch: "
+        f"boundaries={num_stages}, loss_types={len(loss_types)}, vae_trainable={len(vae_trainable)}, "
+        f"lora_trainable={len(lora_trainable)}, aux_source={len(aux_source)}, latent_ce={len(latent_ce)}"
+    )
+
+for idx, start_epoch in enumerate(boundaries):
+    end_epoch = boundaries[idx + 1] if idx + 1 < num_stages else total_epochs
+    print(
+        "\t".join(
+            [
+                str(idx + 1),
+                str(start_epoch),
+                str(end_epoch),
+                loss_types[idx],
+                vae_trainable[idx],
+                lora_trainable[idx],
+                aux_source[idx],
+                latent_ce[idx],
+            ]
+        )
+    )
+PY
+}
+
+_resolve_total_num_train_epochs() {
+    local main_total_epochs="$1"
+    local curriculum_epochs="$2"
+    "$PYTHON_BIN" - "$main_total_epochs" "$curriculum_epochs" <<'PY'
+import sys
+
+main_total_epochs_str, curriculum_epochs = sys.argv[1:]
+main_total_epochs = float(main_total_epochs_str)
+
+if "," not in curriculum_epochs:
+    print(main_total_epochs_str)
+    raise SystemExit(0)
+
+boundaries = [float(x.strip()) for x in curriculum_epochs.split(",") if x.strip()]
+if not boundaries:
+    raise SystemExit("Curriculum split requires at least one stage boundary.")
+if boundaries[0] != 0.0:
+    raise SystemExit(f"Curriculum split requires boundaries to start at 0, got {boundaries[0]}.")
+if any(boundaries[i] >= boundaries[i + 1] for i in range(len(boundaries) - 1)):
+    raise SystemExit(f"Curriculum boundaries must be strictly increasing: {boundaries}")
+
+if len(boundaries) == 1:
+    print("1.0")
+    raise SystemExit(0)
+
+# Boundary lists encode stage starts only. Infer the total epoch budget by
+# extending the final stage with the same width as the previous stage.
+last_span = boundaries[-1] - boundaries[-2]
+if last_span <= 0:
+    raise SystemExit(f"Invalid final curriculum span from boundaries: {boundaries}")
+
+derived_total_epochs = boundaries[-1] + last_span
+print(str(derived_total_epochs))
+PY
+}
+
+_compute_epoch_span() {
+    local start_epoch="$1"
+    local end_epoch="$2"
+    "$PYTHON_BIN" - "$start_epoch" "$end_epoch" <<'PY'
+import sys
+
+start_epoch = float(sys.argv[1])
+end_epoch = float(sys.argv[2])
+span = end_epoch - start_epoch
+if span <= 0:
+    raise SystemExit(f"Invalid stage epoch span: start={start_epoch}, end={end_epoch}")
+print(span)
+PY
+}
+
+_list_checkpoint_dirs() {
+    "$PYTHON_BIN" - "$CKPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+ckpt_dir = Path(sys.argv[1]).resolve()
+candidates = []
+for path in ckpt_dir.glob("checkpoint-*"):
+    if path.is_dir():
+        candidates.append(path)
+for stage_dir in ckpt_dir.glob("stage_*"):
+    if not stage_dir.is_dir():
+        continue
+    for path in stage_dir.glob("checkpoint-*"):
+        if path.is_dir():
+            candidates.append(path)
+
+for path in sorted(candidates, key=lambda p: str(p.relative_to(ckpt_dir))):
+    print(path.relative_to(ckpt_dir))
+PY
+}
+
 # Export env vars that Python code needs (canonicalized in qwen3vl_runtime_env.yaml)
 _set_env_from_runtime "QWEN3VL_LATENT_SUPERVISION" "latent_supervision" "1"
 _set_env_from_runtime "QWEN3VL_LATENT_TOKEN_ID" "latent_token_id" "151669"
@@ -167,9 +310,12 @@ _set_env_from_runtime "QWEN3VL_MAX_NEW_TOKENS" "max_new_tokens" "40960"
 _set_env_from_runtime "QWEN3VL_VAE_INTERMEDIATE_SIZE" "vae_intermediate_size" "512"
 _set_env_from_runtime "QWEN3VL_CURRICULUM_ENABLE" "curriculum_enable" "1"
 _set_env_from_runtime "QWEN3VL_CURRICULUM_EPOCHS" "curriculum_epochs" "0,1,2"
-_set_env_from_runtime "QWEN3VL_CURRICULUM_LOSS_TYPES" "curriculum_loss_types" "vae+mse,vae:0.5+mse:0.5,vae:0.5+ot:0.25+mse:0.25"
-_set_env_from_runtime "QWEN3VL_CURRICULUM_LATENT_STEP_CE" "curriculum_latent_step_ce" "1,1,1"
-_set_env_from_runtime "QWEN3VL_LATENT_STEP_CE_TOKEN" "latent_step_ce_token" "0"
+_set_env_from_runtime "QWEN3VL_CURRICULUM_LOSS_TYPES" "curriculum_loss_types" "ce+mse:0.4+ot:0.4,ce+vae:0.4+mse:0.4+ot:0.4,ce+vae_ce+vae:0.4+mse:0.4+ot:0.4"
+_set_env_from_runtime "QWEN3VL_CURRICULUM_VAE_TRAINABLE" "curriculum_vae_trainable" "1"
+_set_env_from_runtime "QWEN3VL_CURRICULUM_AUX_SOURCE" "curriculum_aux_source" "hidden"
+_set_env_from_runtime "QWEN3VL_CURRICULUM_LORA_TRAINABLE" "curriculum_lora_trainable" "1"
+_set_env_from_runtime "QWEN3VL_CURRICULUM_LATENT_CE" "curriculum_latent_ce" "1"
+_set_env_from_runtime "QWEN3VL_LATENT_CE_TOKEN" "latent_ce_token" "0"
 _set_env_from_runtime "QWEN3VL_HIDDEN_STATES_HOOK" "hidden_states_hook" "1"
 _set_env_from_main "DATALOADER_NUM_WORKERS" "dataloader_num_workers" "4"
 
@@ -217,6 +363,7 @@ for arg in "$@"; do
 done
 RUN_DIR="$OUTPUT_DIR"
 CKPT_DIR="$RUN_DIR"
+FINAL_HANDOFF_DIR="$CKPT_DIR/checkpoint_latest"
 
 # Resolve requested dataset(s) from config + CLI overrides.
 DATASET_SPEC="$(_get_main_config "dataset" || echo "")"
@@ -414,6 +561,23 @@ fi
 # 2) main training YAML cutoff_len
 MAIN_CUTOFF_LEN="$(_get_main_config "cutoff_len" "8192")"
 export QWEN3VL_CUTOFF_LEN="${QWEN3VL_CUTOFF_LEN:-$MAIN_CUTOFF_LEN}"
+MAIN_NUM_TRAIN_EPOCHS="$(_get_main_config "num_train_epochs" "1.0")"
+QWEN3VL_SPLIT_CURRICULUM_STAGES="${QWEN3VL_SPLIT_CURRICULUM_STAGES:-1}"
+TOTAL_NUM_TRAIN_EPOCHS="$(_resolve_total_num_train_epochs "$MAIN_NUM_TRAIN_EPOCHS" "$QWEN3VL_CURRICULUM_EPOCHS")"
+
+STAGE_PLAN_LINES=()
+if [ "$QWEN3VL_SPLIT_CURRICULUM_STAGES" = "1" ] && [ "$QWEN3VL_CURRICULUM_ENABLE" = "1" ]; then
+    mapfile -t STAGE_PLAN_LINES < <(
+        _build_curriculum_stage_plan \
+            "$QWEN3VL_CURRICULUM_EPOCHS" \
+            "$QWEN3VL_CURRICULUM_LOSS_TYPES" \
+            "$QWEN3VL_CURRICULUM_VAE_TRAINABLE" \
+            "$QWEN3VL_CURRICULUM_LORA_TRAINABLE" \
+            "$QWEN3VL_CURRICULUM_AUX_SOURCE" \
+            "$QWEN3VL_CURRICULUM_LATENT_CE" \
+            "$TOTAL_NUM_TRAIN_EPOCHS"
+    )
+fi
 
 
 # Display configuration
@@ -465,7 +629,14 @@ echo "Curriculum Learning:"
 echo "  - Enabled: $QWEN3VL_CURRICULUM_ENABLE"
 echo "  - Epochs: $QWEN3VL_CURRICULUM_EPOCHS"
 echo "  - Loss types: $QWEN3VL_CURRICULUM_LOSS_TYPES"
-echo "  - Latent step CE: $QWEN3VL_CURRICULUM_LATENT_STEP_CE"
+echo "  - Latent step CE: $QWEN3VL_CURRICULUM_LATENT_CE"
+echo "  - Split into separate runs: $QWEN3VL_SPLIT_CURRICULUM_STAGES"
+if [ "${#STAGE_PLAN_LINES[@]}" -gt 0 ]; then
+  for stage_line in "${STAGE_PLAN_LINES[@]}"; do
+    IFS=$'\t' read -r stage_num stage_start stage_end stage_loss stage_vae_trainable stage_lora_trainable stage_aux_source stage_latent_ce <<< "$stage_line"
+    echo "    Stage $stage_num: epochs [$stage_start, $stage_end) loss=$stage_loss vae_trainable=$stage_vae_trainable lora_trainable=$stage_lora_trainable aux_source=$stage_aux_source latent_ce=$stage_latent_ce"
+  done
+fi
 echo ""
 echo "Special Tokens:"
 echo "  - <latent>: $QWEN3VL_LATENT_TOKEN_ID"
@@ -483,7 +654,7 @@ fi
 echo "========================================================================"
 echo ""
 
-_log_wrapper_status "wrapper_start config=$CONFIG_PATH run_dir=$RUN_DIR ckpt_dir=$CKPT_DIR cuda_visible_devices=$CUDA_VISIBLE_DEVICES run_backfill=$RUN_BACKFILL run_benchmark=$RUN_BENCHMARK"
+_log_wrapper_status "wrapper_start config=$CONFIG_PATH run_dir=$RUN_DIR ckpt_dir=$CKPT_DIR cuda_visible_devices=$CUDA_VISIBLE_DEVICES run_backfill=$RUN_BACKFILL run_benchmark=$RUN_BENCHMARK split_curriculum=$QWEN3VL_SPLIT_CURRICULUM_STAGES"
 
 # Run llamafactory CLI with tee for logging
 # Use PIPESTATUS to preserve exit code from llamafactory-cli
@@ -495,36 +666,154 @@ for arg in "$@"; do
     if [[ "$arg" == output_dir=* ]]; then
         continue
     fi
+    if [[ "$arg" == swanlab_run_name=* ]]; then
+        continue
+    fi
     TRAIN_ARGS+=("$arg")
 done
-TRAIN_ARGS+=("output_dir=$CKPT_DIR")
 
-# Run training
-# FSDP: Direct Python call (LlamaFactory handles torchrun internally)
-# DeepSpeed: Use torchrun explicitly
-if [ "$USE_DEEPSPEED" = true ]; then
-    set +e
-    torchrun \
-      --standalone \
-      --nproc_per_node="$NPROC_PER_NODE" \
-      -m llamafactory.cli train "$CONFIG_PATH" "${TRAIN_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
-    exit_code=${PIPESTATUS[0]}
-    set -e
+_run_llamafactory_stage() {
+    local stage_num="$1"
+    local stage_start="$2"
+    local stage_end="$3"
+    local stage_loss="$4"
+    local stage_vae_trainable="$5"
+    local stage_lora_trainable="$6"
+    local stage_aux_source="$7"
+    local stage_latent_ce="$8"
+    local stage_resume="$9"
+    local stage_output_dir="$CKPT_DIR/stage_${stage_num}"
+    local stage_num_train_epochs
+    stage_num_train_epochs="$(_compute_epoch_span "$stage_start" "$stage_end")"
+
+    local stage_args=("${TRAIN_ARGS[@]}")
+    stage_args+=("output_dir=$stage_output_dir")
+    stage_args+=("num_train_epochs=$stage_num_train_epochs")
+    if [ -n "$stage_resume" ]; then
+        stage_args+=("adapter_name_or_path=$stage_resume")
+        stage_args+=("resume_from_checkpoint=null")
+    fi
+    if [[ "$USE_SWANLAB_CONFIG" == "true" || "$USE_SWANLAB_CONFIG" == "True" || "$USE_SWANLAB_CONFIG" == "1" ]]; then
+        local base_run_name="${SWANLAB_RUN_NAME:-$(basename "$RUN_DIR")}"
+        stage_args+=("swanlab_run_name=${base_run_name}-stage${stage_num}")
+    fi
+
+    export QWEN3VL_CURRICULUM_ENABLE=0
+    export QWEN3VL_LOSS_TYPE="$stage_loss"
+    export QWEN3VL_VAE_TRAINABLE="$stage_vae_trainable"
+    export QWEN3VL_LORA_TRAINABLE="$stage_lora_trainable"
+    export QWEN3VL_LATENT_AUX_LOSS_SOURCE="$stage_aux_source"
+    export QWEN3VL_LATENT_CE_ACTIVE="$stage_latent_ce"
+    if [[ "$stage_loss" == *"vae_ce"* ]]; then
+        export QWEN3VL_VAE_CE_ENABLE=1
+    else
+        export QWEN3VL_VAE_CE_ENABLE=0
+    fi
+
+    mkdir -p "$stage_output_dir"
+    _log_wrapper_status "stage_start stage=$stage_num start_epoch=$stage_start end_epoch=$stage_end stage_num_train_epochs=$stage_num_train_epochs loss_type=$stage_loss handoff=${stage_resume:-none} output_dir=$stage_output_dir"
+    echo ""
+    echo "========================================================================"
+    echo "Launching stage $stage_num"
+    echo "  Epoch window: [$stage_start, $stage_end)"
+    echo "  Train epochs this stage: $stage_num_train_epochs"
+    echo "  Loss type: $stage_loss"
+    echo "  VAE trainable: $stage_vae_trainable"
+    echo "  LoRA trainable: $stage_lora_trainable"
+    echo "  Aux source: $stage_aux_source"
+    echo "  Latent CE: $stage_latent_ce"
+    echo "  Handoff weights: ${stage_resume:-none}"
+    echo "  Stage output dir: $stage_output_dir"
+    echo "========================================================================"
+
+    local exit_code
+    if [ "$USE_DEEPSPEED" = true ]; then
+        set +e
+        torchrun \
+          --standalone \
+          --nproc_per_node="$NPROC_PER_NODE" \
+          -m llamafactory.cli train "$CONFIG_PATH" "${stage_args[@]}" 2>&1 | tee -a "$LOG_FILE"
+        exit_code=${PIPESTATUS[0]}
+        set -e
+    else
+        set +e
+        "$PYTHON_BIN" -m llamafactory.cli train "$CONFIG_PATH" "${stage_args[@]}" 2>&1 | tee -a "$LOG_FILE"
+        exit_code=${PIPESTATUS[0]}
+        set -e
+    fi
+
+    _log_wrapper_status "stage_finished stage=$stage_num exit_code=$exit_code"
+
+    if [ "$exit_code" -eq 0 ]; then
+        local stage_handoff_dir="$stage_output_dir/checkpoint_latest"
+        if [ ! -d "$stage_handoff_dir" ]; then
+            echo "❌ Stage $stage_num finished without checkpoint_latest: $stage_handoff_dir" >&2
+            _log_wrapper_status "stage_handoff_missing stage=$stage_num path=$stage_handoff_dir"
+            return 1
+        fi
+
+        rm -rf "$FINAL_HANDOFF_DIR"
+        cp -a "$stage_handoff_dir" "$FINAL_HANDOFF_DIR"
+        _log_wrapper_status "stage_handoff_ready stage=$stage_num path=$FINAL_HANDOFF_DIR"
+    fi
+
+    return "$exit_code"
+}
+
+train_exit_code=0
+if [ "${#STAGE_PLAN_LINES[@]}" -gt 0 ]; then
+    for stage_line in "${STAGE_PLAN_LINES[@]}"; do
+        IFS=$'\t' read -r stage_num stage_start stage_end stage_loss stage_vae_trainable stage_lora_trainable stage_aux_source stage_latent_ce <<< "$stage_line"
+        stage_resume=""
+        if [ "$stage_num" -gt 1 ]; then
+            stage_resume="$FINAL_HANDOFF_DIR"
+            if [ ! -d "$stage_resume" ]; then
+                echo "❌ Missing handoff checkpoint before stage $stage_num: $stage_resume" >&2
+                _log_wrapper_status "stage_resume_missing stage=$stage_num path=$stage_resume"
+                train_exit_code=1
+                break
+            fi
+        fi
+        _run_llamafactory_stage \
+            "$stage_num" \
+            "$stage_start" \
+            "$stage_end" \
+            "$stage_loss" \
+            "$stage_vae_trainable" \
+            "$stage_lora_trainable" \
+            "$stage_aux_source" \
+            "$stage_latent_ce" \
+            "$stage_resume"
+        stage_exit_code=$?
+        if [ "$stage_exit_code" -ne 0 ]; then
+            train_exit_code=$stage_exit_code
+            break
+        fi
+    done
 else
-    set +e
-    "$PYTHON_BIN" -m llamafactory.cli train "$CONFIG_PATH" "${TRAIN_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
-    exit_code=${PIPESTATUS[0]}
-    set -e
+    _run_llamafactory_stage \
+        "1" \
+        "0" \
+        "$TOTAL_NUM_TRAIN_EPOCHS" \
+        "$QWEN3VL_LOSS_TYPE" \
+        "${QWEN3VL_VAE_TRAINABLE:-1}" \
+        "${QWEN3VL_LORA_TRAINABLE:-1}" \
+        "$QWEN3VL_LATENT_AUX_LOSS_SOURCE" \
+        "${QWEN3VL_LATENT_CE_ACTIVE:-1}" \
+        ""
+    stage_exit_code=$?
+    if [ "$stage_exit_code" -ne 0 ]; then
+        train_exit_code=$stage_exit_code
+    fi
 fi
-_log_wrapper_status "training_finished exit_code=$exit_code"
-train_exit_code=$exit_code
+_log_wrapper_status "training_finished exit_code=$train_exit_code"
 
 # ============================================================================
 # Post-training: Run backfill transparent eval on all checkpoints
 # Uses all training GPUs in parallel (round-robin, M jobs at a time)
 # ============================================================================
 if [ "$train_exit_code" -eq 0 ] && [ "$RUN_BACKFILL" = "1" ]; then
-    _log_wrapper_status "backfill_gate entered exit_code=$exit_code run_backfill=$RUN_BACKFILL"
+    _log_wrapper_status "backfill_gate entered exit_code=$train_exit_code run_backfill=$RUN_BACKFILL"
     echo ""
     echo "========================================================================"
     echo "Training completed! Running backfill transparent eval on all checkpoints..."
@@ -537,8 +826,9 @@ if [ "$train_exit_code" -eq 0 ] && [ "$RUN_BACKFILL" = "1" ]; then
 
     # Find all checkpoints that need backfill
     CHECKPOINT_LIST=()
-    for CHECKPOINT in $(ls -td "$CKPT_DIR"/checkpoint-* 2>/dev/null | sort -V); do
-        CHECKPOINT_NAME=$(basename "$CHECKPOINT")
+    while IFS= read -r CHECKPOINT_NAME; do
+        [ -n "$CHECKPOINT_NAME" ] || continue
+        CHECKPOINT="$CKPT_DIR/$CHECKPOINT_NAME"
 
         # Skip if already has results
         if [ -d "$CHECKPOINT/eval_results" ] && [ "$(ls "$CHECKPOINT/eval_results"/backfill_*.json 2>/dev/null | wc -l)" -gt 0 ]; then
@@ -547,7 +837,7 @@ if [ "$train_exit_code" -eq 0 ] && [ "$RUN_BACKFILL" = "1" ]; then
         fi
 
         CHECKPOINT_LIST+=("$CHECKPOINT_NAME")
-    done
+    done < <(_list_checkpoint_dirs)
 
     NUM_CHECKPOINTS=${#CHECKPOINT_LIST[@]}
     _log_wrapper_status "backfill_discovery num_gpus=$NUM_GPUS num_checkpoints=$NUM_CHECKPOINTS checkpoints=${CHECKPOINT_LIST[*]:-none}"
@@ -635,10 +925,16 @@ PY
 if [ "$train_exit_code" -eq 0 ] && [ "$RUN_BENCHMARK" = "1" ]; then
     _log_wrapper_status "benchmark_gate entered exit_code=$train_exit_code run_benchmark=$RUN_BENCHMARK"
     cleanup_vllm_benchmark_processes
-    LATEST_CHECKPOINT="$(ls -td "$CKPT_DIR"/checkpoint-* 2>/dev/null | sort -V | tail -n 1 || true)"
+    LATEST_CHECKPOINT="$FINAL_HANDOFF_DIR"
+    if [ ! -d "$LATEST_CHECKPOINT" ]; then
+        latest_checkpoint_rel="$(_list_checkpoint_dirs | tail -n 1 || true)"
+        if [ -n "${latest_checkpoint_rel:-}" ]; then
+            LATEST_CHECKPOINT="$CKPT_DIR/$latest_checkpoint_rel"
+        fi
+    fi
     if [ -z "${LATEST_CHECKPOINT:-}" ] || [ ! -d "$LATEST_CHECKPOINT" ]; then
         _log_wrapper_status "benchmark_skip reason=no_checkpoint"
-        echo "⚠️  Benchmark skipped: no checkpoint-* found in $CKPT_DIR"
+        echo "⚠️  Benchmark skipped: no checkpoint found in $CKPT_DIR"
     else
         BENCH_DIR="$RUN_DIR/bench"
         mkdir -p "$BENCH_DIR"

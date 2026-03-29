@@ -14,7 +14,9 @@ import traceback
 
 # Add parent directory to path to import shared config
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 from config import resolve_path, get_data_path, get_results_path, QWEN3_VL_2B_THINKING
+from Qwen.scripts.vllm_utils import normalize_media_path, resolve_lora_artifacts
 
 # vLLM imports
 from vllm import LLM, SamplingParams
@@ -123,9 +125,9 @@ def prepare_inputs_for_vllm(messages, processor):
     for item in messages[0].get('content', []):
         if isinstance(item, dict):
             if item.get('type') == 'image':
-                raw_images.append(item['image'])  # Can be path or PIL image
+                raw_images.append(normalize_media_path(item['image']))  # Can be path or PIL image
             elif item.get('type') == 'video':
-                raw_videos.append(item['video'])
+                raw_videos.append(normalize_media_path(item['video']))
 
     # Get min/max pixels from processor or messages
     min_pixels = None
@@ -160,7 +162,6 @@ def prepare_inputs_for_vllm(messages, processor):
             'max_pixels': max_pixels,
         }
     }
-
 def run_inference(args):
     """Run inference on the MathVision dataset using vLLM."""
     print("\n" + "="*80)
@@ -244,8 +245,10 @@ def run_inference(args):
 
     # Add LoRA parameters if enabled
     if hasattr(args, 'enable_lora') and args.enable_lora and args.lora_path:
+        adapter_meta = resolve_lora_artifacts(args.model_path, args.lora_path)
+        resolved_lora_rank = adapter_meta["lora_rank"] if adapter_meta["lora_rank"] is not None else 64
         llm_kwargs["enable_lora"] = True
-        llm_kwargs["max_lora_rank"] = args.max_lora_rank
+        llm_kwargs["max_lora_rank"] = resolved_lora_rank
         llm_kwargs["max_loras"] = 1
         # Note: LoRA modules loaded dynamically via LoRARequest during generate()
         print(f"   LoRA enabled: {args.lora_name} from {args.lora_path}")
@@ -509,9 +512,6 @@ def main():
                             help="Path to LoRA adapter")
     infer_parser.add_argument("--lora-name", type=str, default="default",
                             help="LoRA adapter name (default: default)")
-    infer_parser.add_argument("--max-lora-rank", type=int, default=64,
-                            help="Maximum LoRA rank (default: 64)")
-
     # Generation parameters
     infer_parser.add_argument("--max-new-tokens", type=int, default=32768, 
                             help="Maximum number of tokens to generate (default: 2048)")

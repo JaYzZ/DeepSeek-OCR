@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Qwen3-VL Thinking Mode Visualization</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="https://cdn.plot.ly/plotly-2.26.0.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Qwen3-VL Thinking Mode Visualization</h1>
+            <p class="subtitle">Interactive exploration of continuous latent autoregressive generation</p>
+        </header>
+
+        <div class="main-content">
+            <!-- Input Panel -->
+            <aside class="input-panel">
+                <h2>Input</h2>
+
+                <div class="input-group">
+                    <label for="imageUpload">Upload Image</label>
+                    <input type="file" id="imageUpload" accept="image/*">
+                    <div id="imagePreview" class="image-preview">
+                        <img id="previewImg" src="" alt="Preview" style="display: none;">
+                    </div>
+                </div>
+
+                <div class="input-group">
+                    <label for="textInput">Question / Prompt</label>
+                    <textarea id="textInput" rows="5" placeholder="Enter your question here..."></textarea>
+                </div>
+
+                <div class="input-group">
+                    <button id="sendBtn" class="btn btn-primary" disabled>Generate</button>
+                    <button id="loadExampleBtn" class="btn btn-secondary">Load Example</button>
+                </div>
+
+                <div class="example-section">
+                    <label>
+                        <input type="checkbox" id="autoLoadExample">
+                        Auto-load Deepvision example on startup
+                    </label>
+                </div>
+
+                <div class="status-section">
+                    <h3>Status</h3>
+                    <div id="status" class="status">Ready</div>
+                    <div id="modelInfo" class="model-info"></div>
+                </div>
+            </aside>
+
+            <!-- Visualization Area -->
+            <main class="visualization-area">
+                <!-- Token Sequence -->
+                <section class="viz-section">
+                    <h2>Token Sequence</h2>
+                    <div id="tokenSequence" class="token-sequence">
+                        <p class="placeholder">Tokens will appear here after generation...</p>
+                    </div>
+                </section>
+
+                <!-- t-SNE Visualization -->
+                <section class="viz-section">
+                    <h2>t-SNE Visualization</h2>
+                    <div id="tsnePlot" class="plot-container">
+                        <p class="placeholder">t-SNE plot will appear here...</p>
+                    </div>
+                    <div class="legend">
+                        <span class="legend-item"><span class="dot red"></span> Image</span>
+                        <span class="legend-item"><span class="dot blue"></span> Question</span>
+                        <span class="legend-item"><span class="dot green"></span> Continuous</span>
+                        <span class="legend-item"><span class="dot orange"></span> Answer</span>
+                    </div>
+                </section>
+
+                <!-- Attention Heatmap -->
+                <section class="viz-section">
+                    <h2>Attention Heatmap</h2>
+                    <p class="hint">Click any token above to see its attention pattern</p>
+                    <div id="attentionPlot" class="plot-container">
+                        <p class="placeholder">Attention heatmap will appear here...</p>
+                    </div>
+                </section>
+
+                <!-- Answer -->
+                <section class="viz-section">
+                    <h2>Generated Answer</h2>
+                    <div id="answer" class="answer">
+                        <p class="placeholder">Answer will appear here...</p>
+                    </div>
+                </section>
+            </main>
+        </div>
+    </div>
+
+    <script src="/static/main.js"></script>
+</body>
+</html>
