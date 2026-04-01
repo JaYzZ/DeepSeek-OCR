@@ -7,7 +7,9 @@ import logging
 import os
 import functools
 import itertools
+from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Iterable
 
 import numpy as np
@@ -28,6 +30,237 @@ _GRAD_FLOW_DEBUG = os.environ.get("QWEN3VL_CONTINUOUS_REPLAY_DEBUG", "0") == "1"
 _POLICY_VAE_LOGGED = False
 _ROLLOUT_CERT_LOGGED = False
 _REPLAY_CERT_LOGGED = False
+_REPLAY_DEBUG_LOGGED = False
+
+
+def _replay_debug(message: str, *args) -> None:
+    if _GRAD_FLOW_DEBUG:
+        logger.warning(message, *args)
+
+
+def _log_multimodal_mismatch_debug(
+    *,
+    modality: str,
+    input_ids: torch.Tensor,
+    token_id: int,
+    feature_count: int,
+    grid_thw: torch.Tensor | None,
+) -> None:
+    """Log enough sequence context to debug reserved multimodal token mismatches."""
+
+    input_ids_cpu = input_ids.detach().to(device="cpu", dtype=torch.long)
+    token_mask = input_ids_cpu == int(token_id)
+    token_count = int(token_mask.sum().item())
+    per_row_counts = token_mask.sum(dim=-1).tolist() if token_mask.ndim == 2 else [token_count]
+    token_positions = torch.nonzero(token_mask, as_tuple=False)
+    position_pairs = token_positions.tolist()
+    raw_ids = input_ids_cpu.tolist()
+    tail_ids = input_ids_cpu[:, -64:].tolist() if input_ids_cpu.ndim == 2 else input_ids_cpu[-64:].tolist()
+
+    logger.error(
+        "[ContinuousReplay][MM] %s token/feature mismatch: token_id=%s tokens=%s features=%s "
+        "input_shape=%s grid_thw=%s per_row_counts=%s last_positions=%s tail_ids=%s raw_input_ids=%s",
+        modality,
+        int(token_id),
+        token_count,
+        int(feature_count),
+        tuple(input_ids_cpu.shape),
+        None if grid_thw is None else grid_thw.detach().to(device="cpu", dtype=torch.long).tolist(),
+        per_row_counts,
+        position_pairs[-16:],
+        tail_ids,
+        raw_ids,
+    )
+    logger.error(
+        "[ContinuousReplay][MM] full_%s_token_positions=%s",
+        modality,
+        position_pairs,
+    )
+
+
+def _resolve_multimodal_prompt_mask(
+    *,
+    input_ids: torch.Tensor,
+    prompt_positions_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    if prompt_positions_mask is None:
+        return torch.ones_like(input_ids, dtype=torch.bool)
+
+    mask = prompt_positions_mask.to(device=input_ids.device, dtype=torch.bool)
+    if tuple(mask.shape) != tuple(input_ids.shape):
+        raise RuntimeError(
+            "[ContinuousReplay][MM] prompt mask shape mismatch: "
+            f"input_ids.shape={tuple(input_ids.shape)} prompt_mask.shape={tuple(mask.shape)}"
+        )
+    return mask
+
+
+def _validate_multimodal_token_match(
+    *,
+    modality: str,
+    input_ids: torch.Tensor,
+    token_id: int,
+    feature_count: int,
+    grid_thw: torch.Tensor | None,
+    prompt_positions_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Validate multimodal token/feature parity and return the exact scatter mask."""
+
+    prompt_mask = _resolve_multimodal_prompt_mask(
+        input_ids=input_ids,
+        prompt_positions_mask=prompt_positions_mask,
+    )
+    mask = (input_ids == int(token_id)) & prompt_mask
+    token_count = int(mask.sum().item())
+    if token_count == feature_count:
+        return mask
+
+    _log_multimodal_mismatch_debug(
+        modality=modality,
+        input_ids=input_ids,
+        token_id=token_id,
+        feature_count=feature_count,
+        grid_thw=grid_thw,
+    )
+
+    raise ValueError(
+        f"{modality.capitalize()} features and {modality} tokens do not match: "
+        f"tokens: {token_count}, features {feature_count}"
+    )
+
+
+def _inject_latent_log_probs_into_rollout(
+    *,
+    curr_log_prob: list[float],
+    mask_row: np.ndarray,
+    latent_log_probs: np.ndarray,
+    request_id: str,
+) -> None:
+    true_positions = np.flatnonzero(mask_row)
+    if latent_log_probs.shape[0] != true_positions.size:
+        raise RuntimeError(
+            "Continuous replay latent log_prob mismatch for request_id="
+            f"{request_id}: latent_log_probs={latent_log_probs.shape[0]} active_positions={true_positions.size}"
+        )
+
+    if true_positions.size == 0:
+        return
+
+    max_position = int(true_positions.max())
+    if max_position >= len(curr_log_prob):
+        raise RuntimeError(
+            "Continuous replay latent log_prob position overflow for request_id="
+            f"{request_id}: max_position={max_position} rollout_log_probs={len(curr_log_prob)} "
+            f"active_positions={true_positions.size}"
+        )
+
+    for pos_idx, position in enumerate(true_positions.tolist()):
+        curr_log_prob[int(position)] = float(latent_log_probs[pos_idx])
+
+
+def _trim_request_trace_to_actual_response_length(
+    *,
+    hidden_row: np.ndarray,
+    latent_row: np.ndarray,
+    mask_row: np.ndarray,
+    latent_log_probs: np.ndarray | None,
+    actual_response_length: int,
+    request_id: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+    trimmed_mask = np.asarray(mask_row, dtype=np.bool_).reshape(-1)
+    if trimmed_mask.size > actual_response_length:
+        trimmed_mask = trimmed_mask[:actual_response_length]
+
+    kept_steps = int(trimmed_mask.sum())
+    hidden_steps = int(hidden_row.shape[0]) if hidden_row.ndim == 2 else 0
+    latent_steps = int(latent_row.shape[0]) if latent_row.ndim == 2 else 0
+    if hidden_steps < kept_steps or latent_steps < kept_steps:
+        raise RuntimeError(
+            "Continuous replay trace trim underflow for request_id="
+            f"{request_id}: kept_steps={kept_steps} hidden_steps={hidden_steps} latent_steps={latent_steps} "
+            f"actual_response_length={actual_response_length}"
+        )
+
+    trimmed_hidden = hidden_row[:kept_steps]
+    trimmed_latent = latent_row[:kept_steps]
+
+    if latent_log_probs is None:
+        return trimmed_hidden, trimmed_latent, trimmed_mask, None
+
+    trimmed_log_probs = np.asarray(latent_log_probs, dtype=np.float32).reshape(-1)
+    if trimmed_log_probs.shape[0] < kept_steps:
+        raise RuntimeError(
+            "Continuous replay latent log_prob trim underflow for request_id="
+            f"{request_id}: kept_steps={kept_steps} latent_log_probs={trimmed_log_probs.shape[0]} "
+            f"actual_response_length={actual_response_length}"
+        )
+    trimmed_log_probs = trimmed_log_probs[:kept_steps]
+    return trimmed_hidden, trimmed_latent, trimmed_mask, trimmed_log_probs
+
+
+@dataclass
+class ReplayBufferPool:
+    """Pre-allocated scratch buffers for continuous replay construction."""
+
+    replay_row_ids: torch.Tensor | None = None
+    hidden_buffer: torch.Tensor | None = None
+    latent_buffer: torch.Tensor | None = None
+    position_buffer: torch.Tensor | None = None
+    max_batch_size: int = 0
+    max_seq_length: int = 0
+    max_continuous_steps: int = 0
+    device: torch.device | None = None
+    lock: Lock = Lock()
+
+    def ensure_capacity(
+        self,
+        batch_size: int,
+        seq_length: int,
+        continuous_steps: int,
+        device: torch.device,
+        hidden_size: int,
+        dtype: torch.dtype,
+    ) -> None:
+        with self.lock:
+            if (
+                batch_size <= self.max_batch_size
+                and seq_length <= self.max_seq_length
+                and continuous_steps <= self.max_continuous_steps
+                and self.device == device
+                and self.hidden_buffer is not None
+                and self.hidden_buffer.dtype == dtype
+            ):
+                return
+
+            self.max_batch_size = max(batch_size, 1)
+            self.max_seq_length = max(seq_length, 1)
+            self.max_continuous_steps = max(continuous_steps, 1)
+            self.device = device
+
+            self.replay_row_ids = torch.full(
+                (self.max_batch_size, self.max_seq_length),
+                -1,
+                dtype=torch.long,
+                device=device,
+            )
+            self.hidden_buffer = torch.empty(
+                (self.max_continuous_steps, hidden_size),
+                dtype=dtype,
+                device=device,
+            )
+            self.latent_buffer = torch.empty(
+                (self.max_continuous_steps, hidden_size),
+                dtype=dtype,
+                device=device,
+            )
+            self.position_buffer = torch.empty(
+                (self.max_continuous_steps,),
+                dtype=torch.long,
+                device=device,
+            )
+
+
+_buffer_pool = ReplayBufferPool()
 
 
 class LatentVAE(nn.Module):
@@ -463,6 +696,10 @@ def _validate_request_trace(trace: dict, request_id: str, response_length: int) 
     latent_row = np.asarray(trace[CONTINUOUS_LATENT_KEY], dtype=np.float16)
     mask_row = np.asarray(trace[CONTINUOUS_MASK_KEY], dtype=np.bool_).reshape(-1)
 
+    # IMPORTANT: Track original shapes before reshaping to detect corruption
+    original_hidden_shape = hidden_row.shape
+    original_latent_shape = latent_row.shape
+
     if hidden_row.ndim == 1 and hidden_row.size > 0:
         hidden_row = hidden_row.reshape(1, -1)
     if latent_row.ndim == 1 and latent_row.size > 0:
@@ -473,10 +710,39 @@ def _validate_request_trace(trace: dict, request_id: str, response_length: int) 
     active_positions = int(mask_row.sum())
     hidden_steps = int(hidden_row.shape[0]) if hidden_row.ndim == 2 else 0
     latent_steps = int(latent_row.shape[0]) if latent_row.ndim == 2 else 0
+
+    # Detect shape corruption: reshape(1, -1) on 1D array with N elements creates (1, N)
+    # but we need (N, hidden_dim) for proper indexing
+    if hidden_row.ndim == 2 and hidden_row.shape[0] == 1 and active_positions > 1:
+        logger.warning(
+            "[ContinuousReplay] SHAPE WARNING for request_id=%s: "
+            "mask has %d active positions but hidden_row shape is %s (original: %s). "
+            "The reshape(1, -1) may have corrupted the data. Expected (%d, hidden_dim) got %s.",
+            request_id,
+            active_positions,
+            hidden_row.shape,
+            original_hidden_shape,
+            active_positions,
+            hidden_row.shape,
+        )
+    if latent_row.ndim == 2 and latent_row.shape[0] == 1 and active_positions > 1:
+        logger.warning(
+            "[ContinuousReplay] SHAPE WARNING for request_id=%s: "
+            "mask has %d active positions but latent_row shape is %s (original: %s). "
+            "The reshape(1, -1) may have corrupted the data. Expected (%d, latent_dim) got %s.",
+            request_id,
+            active_positions,
+            latent_row.shape,
+            original_latent_shape,
+            active_positions,
+            latent_row.shape,
+        )
+
     if hidden_steps != active_positions or latent_steps != active_positions:
         raise RuntimeError(
             "Continuous replay trace shape mismatch for request_id="
-            f"{request_id}: active_positions={active_positions} hidden_steps={hidden_steps} latent_steps={latent_steps}"
+            f"{request_id}: active_positions={active_positions} hidden_steps={hidden_steps} latent_steps={latent_steps} "
+            f"hidden_shape={hidden_row.shape} latent_shape={latent_row.shape}"
         )
 
     return hidden_row, latent_row, mask_row
@@ -491,6 +757,7 @@ def _build_qwen3vl_input_embeds_compat(
     pixel_values_videos: torch.Tensor | None,
     image_grid_thw: torch.Tensor | None,
     video_grid_thw: torch.Tensor | None,
+    prompt_positions_mask: torch.Tensor | None = None,
 ) -> dict:
     if embed_layer is None:
         raise RuntimeError("Continuous replay could not resolve Qwen3VL text embedding layer")
@@ -504,7 +771,24 @@ def _build_qwen3vl_input_embeds_compat(
         pixel_values = pixel_values.type(model.visual.dtype)
         image_embeds, deepstack_image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
         image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-        mask = input_ids == model.config.image_token_id
+        n_image_tokens = (input_ids == model.config.image_token_id).sum().item()
+        n_image_features = image_embeds.shape[0]
+        _replay_debug(
+            "[ContinuousReplay][MM] image insert input_ids=%s pixel_values=%s image_grid_thw=%s tokens=%s features=%s",
+            tuple(input_ids.shape),
+            tuple(pixel_values.shape),
+            None if image_grid_thw is None else tuple(image_grid_thw.shape),
+            int(n_image_tokens),
+            int(n_image_features),
+        )
+        mask = _validate_multimodal_token_match(
+            modality="image",
+            input_ids=input_ids,
+            token_id=model.config.image_token_id,
+            feature_count=n_image_features,
+            grid_thw=image_grid_thw,
+            prompt_positions_mask=prompt_positions_mask,
+        )
         image_mask = mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
@@ -512,7 +796,24 @@ def _build_qwen3vl_input_embeds_compat(
         pixel_values_videos = pixel_values_videos.type(model.visual.dtype)
         video_embeds, deepstack_video_embeds = model.visual(pixel_values_videos, grid_thw=video_grid_thw)
         video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-        mask = input_ids == model.config.video_token_id
+        n_video_tokens = (input_ids == model.config.video_token_id).sum().item()
+        n_video_features = video_embeds.shape[0]
+        _replay_debug(
+            "[ContinuousReplay][MM] video insert input_ids=%s pixel_values_videos=%s video_grid_thw=%s tokens=%s features=%s",
+            tuple(input_ids.shape),
+            tuple(pixel_values_videos.shape),
+            None if video_grid_thw is None else tuple(video_grid_thw.shape),
+            int(n_video_tokens),
+            int(n_video_features),
+        )
+        mask = _validate_multimodal_token_match(
+            modality="video",
+            input_ids=input_ids,
+            token_id=model.config.video_token_id,
+            feature_count=n_video_features,
+            grid_thw=video_grid_thw,
+            prompt_positions_mask=prompt_positions_mask,
+        )
         video_mask = mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
@@ -567,7 +868,7 @@ def _prepare_inputs_embeds(
     attention_mask: torch.Tensor | None,
     multi_modal_inputs: dict | None,
 ) -> tuple[dict, dict]:
-    global _REPLAY_CERT_LOGGED
+    global _REPLAY_CERT_LOGGED, _buffer_pool
     del attention_mask
     del multi_modal_inputs
     if not _has_continuous_replay_inputs(micro_batch):
@@ -586,16 +887,22 @@ def _prepare_inputs_embeds(
     latent_rows = _iter_object_array_rows(micro_batch.get(CONTINUOUS_LATENT_KEY))
     mask_rows = _iter_object_array_rows(micro_batch.get(CONTINUOUS_MASK_KEY))
 
-    replay_row_ids = torch.full(input_ids.shape, -1, dtype=torch.long, device=input_ids.device)
-    hidden_tensors = []
-    latent_tensors = []
-    next_row_id = 0
-    total_replaced_positions = 0
+    _replay_debug(
+        "[ContinuousReplay][Prepare] start batch=%s seq=%s response_len=%s hidden_size=%s",
+        int(input_ids.size(0)),
+        int(input_ids.size(1)),
+        int(response_length),
+        int(vae.hidden_size),
+    )
+
+    total_continuous_steps = 0
+    batch_data = []
     for batch_idx, (hidden_row, latent_row, mask_row) in enumerate(
         itertools.zip_longest(hidden_rows, latent_rows, mask_rows, fillvalue=None)
     ):
         if mask_row is None:
             continue
+
         mask_np = np.asarray(mask_row, dtype=np.bool_).reshape(-1)
         if mask_np.size == 0:
             continue
@@ -624,20 +931,73 @@ def _prepare_inputs_embeds(
         if n_steps == 0:
             continue
 
-        hidden_tensors.append(torch.as_tensor(hidden_np[:n_steps], device=input_ids.device, dtype=vae_dtype))
-        latent_tensors.append(torch.as_tensor(latent_np[:n_steps], device=input_ids.device, dtype=vae_dtype))
-        assign_positions = torch.as_tensor(true_positions[:n_steps] + response_start, device=input_ids.device, dtype=torch.long)
-        replay_row_ids[batch_idx, assign_positions] = torch.arange(
-            next_row_id,
-            next_row_id + n_steps,
+        _replay_debug(
+            "[ContinuousReplay][Prepare] sample=%s mask_len=%s active=%s hidden_shape=%s latent_shape=%s n_steps=%s response_start=%s first_pos=%s last_pos=%s",
+            batch_idx,
+            int(mask_np.size),
+            int(true_positions.size),
+            tuple(hidden_np.shape),
+            tuple(latent_np.shape),
+            int(n_steps),
+            int(response_start),
+            int(true_positions[0]) if true_positions.size > 0 else -1,
+            int(true_positions[n_steps - 1]) if n_steps > 0 else -1,
+        )
+        batch_data.append((batch_idx, hidden_np[:n_steps], latent_np[:n_steps], true_positions[:n_steps]))
+        total_continuous_steps += n_steps
+
+    if total_continuous_steps == 0:
+        return {}, {}
+
+    _buffer_pool.ensure_capacity(
+        batch_size=input_ids.size(0),
+        seq_length=input_ids.size(1),
+        continuous_steps=total_continuous_steps,
+        device=input_ids.device,
+        hidden_size=vae.hidden_size,
+        dtype=vae_dtype,
+    )
+
+    replay_row_ids = _buffer_pool.replay_row_ids[: input_ids.size(0), : input_ids.size(1)].fill_(-1)
+    hidden_buffer = _buffer_pool.hidden_buffer[:total_continuous_steps]
+    latent_buffer = _buffer_pool.latent_buffer[:total_continuous_steps]
+    position_buffer = _buffer_pool.position_buffer[:total_continuous_steps]
+
+    next_row_id = 0
+    total_replaced_positions = 0
+    for batch_idx, hidden_np, latent_np, true_positions in batch_data:
+        n_steps = hidden_np.shape[0]
+        start_idx = next_row_id
+        end_idx = next_row_id + n_steps
+        hidden_buffer[start_idx:end_idx] = torch.from_numpy(hidden_np).to(device=input_ids.device, dtype=vae_dtype)
+        latent_buffer[start_idx:end_idx] = torch.from_numpy(latent_np).to(device=input_ids.device, dtype=vae_dtype)
+        position_buffer[start_idx:end_idx] = torch.as_tensor(
+            true_positions + response_start,
             device=input_ids.device,
             dtype=torch.long,
         )
+        assign_positions = position_buffer[start_idx:end_idx]
+        replay_row_ids[batch_idx, assign_positions] = torch.arange(
+            start_idx,
+            end_idx,
+            device=input_ids.device,
+            dtype=torch.long,
+        )
+        _replay_debug(
+            "[ContinuousReplay][Prepare] assign sample=%s row_id_range=[%s,%s) seq_positions=[%s,%s]",
+            batch_idx,
+            int(start_idx),
+            int(end_idx),
+            int(assign_positions[0].item()) if n_steps > 0 else -1,
+            int(assign_positions[-1].item()) if n_steps > 0 else -1,
+        )
+
         next_row_id += n_steps
         total_replaced_positions += int(n_steps)
 
     if total_replaced_positions == 0:
         return {}, {}
+
     if not _REPLAY_CERT_LOGGED:
         logger.warning(
             "[ContinuousReplay] Actor replay active: batch=%s full_seq_len=%s response_len=%s continuous_positions=%s discrete_positions_preserved=true source=saved_rollout_latents",
@@ -649,14 +1009,33 @@ def _prepare_inputs_embeds(
         _REPLAY_CERT_LOGGED = True
 
     replay_state = {
-        "continuous_replay_row_ids": replay_row_ids,
-        "continuous_replay_hidden_states": torch.cat(hidden_tensors, dim=0),
-        "continuous_replay_latent_embeddings": torch.cat(latent_tensors, dim=0),
+        "continuous_replay_row_ids": replay_row_ids.clone(),
+        "continuous_replay_hidden_states": hidden_buffer[:next_row_id].clone(),
+        "continuous_replay_latent_embeddings": latent_buffer[:next_row_id].clone(),
+        "continuous_replay_prompt_positions_mask": (
+            torch.arange(input_ids.size(1), device=input_ids.device)
+            .unsqueeze(0)
+            .expand(input_ids.size(0), -1)
+            < response_start
+        ).clone(),
         "continuous_replay_latent_vae": vae,
     }
+    if _GRAD_FLOW_DEBUG:
+        replay_mask = replay_state["continuous_replay_row_ids"] >= 0
+        selected_row_ids = replay_state["continuous_replay_row_ids"][replay_mask]
+        _replay_debug(
+            "[ContinuousReplay][Prepare] done total_steps=%s replaced=%s replay_mask=%s row_id_min=%s row_id_max=%s latent_shape=%s",
+            int(next_row_id),
+            int(total_replaced_positions),
+            int(replay_mask.sum().item()),
+            int(selected_row_ids.min().item()) if selected_row_ids.numel() > 0 else -1,
+            int(selected_row_ids.max().item()) if selected_row_ids.numel() > 0 else -1,
+            tuple(replay_state["continuous_replay_latent_embeddings"].shape),
+        )
     return {
-        "continuous_replay_row_ids": replay_row_ids,
+        "continuous_replay_row_ids": replay_state["continuous_replay_row_ids"],
         "continuous_replay_latent_embeddings": replay_state["continuous_replay_latent_embeddings"],
+        "continuous_replay_prompt_positions_mask": replay_state["continuous_replay_prompt_positions_mask"],
     }, replay_state
 
 
@@ -702,6 +1081,14 @@ def _merge_continuous_policy_stats(
 
 def _compact_replay_model_kwargs_for_rmpad(replay_model_kwargs: dict, indices, dp_actor_mod) -> dict:
     compacted = {}
+    prompt_positions_mask = replay_model_kwargs.get("continuous_replay_prompt_positions_mask")
+    if prompt_positions_mask is not None:
+        prompt_positions_mask_rmpad = dp_actor_mod.index_first_axis(
+            dp_actor_mod.rearrange(prompt_positions_mask.unsqueeze(-1), "b s ... -> (b s) ..."),
+            indices,
+        ).transpose(0, 1)
+        compacted["continuous_replay_prompt_positions_mask"] = prompt_positions_mask_rmpad.squeeze(-1)
+
     replay_row_ids = replay_model_kwargs.get("continuous_replay_row_ids")
     if replay_row_ids is not None:
         replay_row_ids_rmpad = dp_actor_mod.index_first_axis(
@@ -733,6 +1120,7 @@ def _patch_verl_qwen3vl_inputs_embeds_support() -> None:
         pixel_values_videos: torch.Tensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
+        prompt_positions_mask: torch.Tensor | None = None,
     ):
         embed_layer = _resolve_input_embedding_layer(model)
         if embed_layer is None:
@@ -754,6 +1142,7 @@ def _patch_verl_qwen3vl_inputs_embeds_support() -> None:
             pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
+            prompt_positions_mask=prompt_positions_mask,
         )
 
     def _apply_continuous_replay_to_inputs_embeds(
@@ -765,14 +1154,39 @@ def _patch_verl_qwen3vl_inputs_embeds_support() -> None:
             return inputs_embeds
 
         row_ids = continuous_replay_row_ids.to(device=inputs_embeds.device)
+        if tuple(row_ids.shape) != tuple(inputs_embeds.shape[:-1]):
+            raise RuntimeError(
+                "[ContinuousReplay] inputs_embeds / row_ids shape mismatch: "
+                f"inputs_embeds.shape={tuple(inputs_embeds.shape)} "
+                f"row_ids.shape={tuple(row_ids.shape)} "
+                f"expected_row_id_shape={tuple(inputs_embeds.shape[:-1])}"
+            )
         replay_mask = row_ids >= 0
         if not torch.any(replay_mask):
             return inputs_embeds
 
         latent_embeddings = continuous_replay_latent_embeddings.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
         selected_row_ids = row_ids[replay_mask].to(dtype=torch.long)
+        _replay_debug(
+            "[ContinuousReplay][Inject] inputs=%s row_ids=%s mask_positions=%s latent_embeddings=%s selected_row_id_min=%s selected_row_id_max=%s",
+            tuple(inputs_embeds.shape),
+            tuple(row_ids.shape),
+            int(replay_mask.sum().item()),
+            tuple(latent_embeddings.shape),
+            int(selected_row_ids.min().item()) if selected_row_ids.numel() > 0 else -1,
+            int(selected_row_ids.max().item()) if selected_row_ids.numel() > 0 else -1,
+        )
+
         outputs = inputs_embeds.clone()
-        outputs[replay_mask] = latent_embeddings.index_select(0, selected_row_ids)
+        if replay_mask.sum().item() > 0:
+            selected_latents = latent_embeddings.index_select(0, selected_row_ids)
+            if int(replay_mask.sum().item()) != int(selected_latents.shape[0]):
+                raise RuntimeError(
+                    "[ContinuousReplay] replay assignment cardinality mismatch: "
+                    f"mask_positions={int(replay_mask.sum().item())} selected_latents={selected_latents.shape[0]} "
+                    f"inputs_embeds.shape={tuple(inputs_embeds.shape)} row_ids.shape={tuple(row_ids.shape)}"
+                )
+            outputs[replay_mask] = selected_latents
         return outputs
 
     @functools.wraps(original_base_forward)
@@ -788,6 +1202,7 @@ def _patch_verl_qwen3vl_inputs_embeds_support() -> None:
     ):
         continuous_replay_row_ids = kwargs.pop("continuous_replay_row_ids", None)
         continuous_replay_latent_embeddings = kwargs.pop("continuous_replay_latent_embeddings", None)
+        continuous_replay_prompt_positions_mask = kwargs.pop("continuous_replay_prompt_positions_mask", None)
         inputs_embeds = kwargs.pop("inputs_embeds", None)
 
         if inputs_embeds is None:
@@ -799,6 +1214,7 @@ def _patch_verl_qwen3vl_inputs_embeds_support() -> None:
                 pixel_values_videos=pixel_values_videos,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
+                prompt_positions_mask=continuous_replay_prompt_positions_mask,
             )
         else:
             input_kwargs = {
@@ -1215,6 +1631,10 @@ def apply_continuous_replay_patches() -> None:
         else:
             sampling_kwargs = kwargs
 
+        # Override logprobs parameter when calculate_log_probs is enabled
+        if self.config.calculate_log_probs:
+            sampling_kwargs["logprobs"] = 1  # Return logprobs for generated tokens
+
         lora_requests = None
         if self.lora_kwargs:
             lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
@@ -1257,28 +1677,40 @@ def apply_continuous_replay_patches() -> None:
                 for sample_id in range(len(output.outputs)):
                     response_ids = output.outputs[sample_id].token_ids
                     response.append(response_ids)
+                    actual_response_length = len(response_ids)
+                    latent_log_probs = None
+                    if sample_id == 0 and self.config.calculate_log_probs:
+                        latent_log_probs = np.asarray(
+                            trace.get(CONTINUOUS_LATENT_LOGPROB_KEY, np.empty((0,), dtype=np.float32)),
+                            dtype=np.float32,
+                        ).reshape(-1)
+                    if sample_id == 0:
+                        hidden_row_trimmed, latent_row_trimmed, mask_row_trimmed, latent_log_probs = (
+                            _trim_request_trace_to_actual_response_length(
+                                hidden_row=hidden_row,
+                                latent_row=latent_row,
+                                mask_row=mask_row,
+                                latent_log_probs=latent_log_probs,
+                                actual_response_length=actual_response_length,
+                                request_id=str(output.request_id),
+                            )
+                        )
                     if self.config.calculate_log_probs:
                         curr_log_prob = []
                         for i, logprob in enumerate(output.outputs[sample_id].logprobs):
                             curr_log_prob.append(logprob[response_ids[i]].logprob)
 
                     if sample_id == 0:
-                        continuous_hidden_states.append(hidden_row)
-                        continuous_latent_embeddings.append(latent_row)
-                        continuous_token_masks.append(mask_row)
+                        continuous_hidden_states.append(hidden_row_trimmed)
+                        continuous_latent_embeddings.append(latent_row_trimmed)
+                        continuous_token_masks.append(mask_row_trimmed)
                         if self.config.calculate_log_probs:
-                            latent_log_probs = np.asarray(
-                                trace.get(CONTINUOUS_LATENT_LOGPROB_KEY, np.empty((0,), dtype=np.float32)),
-                                dtype=np.float32,
-                            ).reshape(-1)
-                            true_positions = np.flatnonzero(mask_row)
-                            if latent_log_probs.shape[0] != true_positions.size:
-                                raise RuntimeError(
-                                    "Continuous replay latent log_prob mismatch for request_id="
-                                    f"{output.request_id}: latent_log_probs={latent_log_probs.shape[0]} active_positions={true_positions.size}"
-                                )
-                            for pos_idx in range(true_positions.size):
-                                curr_log_prob[int(true_positions[pos_idx])] = float(latent_log_probs[pos_idx])
+                            _inject_latent_log_probs_into_rollout(
+                                curr_log_prob=curr_log_prob,
+                                mask_row=mask_row_trimmed,
+                                latent_log_probs=latent_log_probs,
+                                request_id=str(output.request_id),
+                            )
                     else:
                         continuous_hidden_states.append(np.empty((0, 0), dtype=np.float16))
                         continuous_latent_embeddings.append(np.empty((0, 0), dtype=np.float16))

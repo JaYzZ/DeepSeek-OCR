@@ -172,7 +172,11 @@ def collect_trace_data(
     tokens = []
     if all_token_ids:
         for token_id in all_token_ids:
-            token_text = tokenizer.decode([token_id])[0]
+            token_text = tokenizer.decode(
+                [int(token_id)],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
             tokens.append({
                 'id': int(token_id),
                 'text': token_text,
@@ -180,12 +184,12 @@ def collect_trace_data(
 
     # Convert to numpy arrays
     hidden_states = None
-    if all_hidden_states:
-        hidden_states = np.array(all_hidden_states)
+    if all_hidden_states is not None and np.asarray(all_hidden_states).size > 0:
+        hidden_states = np.asarray(all_hidden_states)
 
     attention = None
-    if attention_weights:
-        attention = np.array(attention_weights)
+    if attention_weights is not None and np.asarray(attention_weights).size > 0:
+        attention = np.asarray(attention_weights)
 
     return {
         'tokens': tokens,

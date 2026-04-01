@@ -6,11 +6,13 @@ import importlib
 import functools
 import logging
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
 
 import torch.distributed as dist
+from omegaconf import open_dict
 from safetensors.torch import save_file
 
 from .continuous_replay import _restore_policy_latent_vae, apply_continuous_replay_patches
@@ -137,6 +139,7 @@ def _patch_ray_actor_runtime_env() -> None:
 
     compat_update_options._qwen3vl_compat_patch = True
     ray_class_with_init.update_options = compat_update_options
+
 
 def _patch_fsdp_checkpoint_manager() -> None:
     """Guard VERL FSDP checkpoint export from PEFT source-layout issues."""
@@ -290,6 +293,112 @@ def _patch_actor_checkpoint_save() -> None:
     compat_load_checkpoint._qwen3vl_compat_patch = True
     worker_cls.load_checkpoint = compat_load_checkpoint
 
+
+def _patch_fsdp_update_actor_metadata() -> None:
+    """Restore required actor update metadata when rollout recompute is bypassed.
+
+    With rollout_correction bypass enabled, VERL can skip the old_log_prob recompute
+    path that previously attached `meta_info["temperature"]`. The actor update path
+    still expects that field, so inject it from the authoritative worker config.
+    """
+
+    external_workers = importlib.import_module("verl.workers.fsdp_workers")
+    worker_cls = external_workers.ActorRolloutRefWorker
+    original_update_actor = worker_cls.update_actor
+
+    if getattr(original_update_actor, "_qwen3vl_compat_patch", False):
+        return
+
+    def compat_update_actor(self, data):
+        meta_info = getattr(data, "meta_info", None)
+        if meta_info is not None and "temperature" not in meta_info:
+            rollout_temperature = float(self.config.rollout.temperature)
+            meta_info["temperature"] = rollout_temperature
+            logger.warning(
+                "Injected missing actor update temperature metadata from rollout config: temperature=%s",
+                rollout_temperature,
+            )
+        return original_update_actor(self, data)
+
+    compat_update_actor = functools.wraps(original_update_actor)(compat_update_actor)
+    compat_update_actor.__dict__.update(original_update_actor.__dict__)
+    compat_update_actor._qwen3vl_compat_patch = True
+    worker_cls.update_actor = compat_update_actor
+
+
+def _patch_rollout_correction_helper() -> None:
+    """Allow runtime rollout_correction injection on structured OmegaConf configs."""
+
+    external_helper = importlib.import_module("verl.trainer.ppo.rollout_corr_helper")
+    original_apply_rollout_correction = external_helper.apply_rollout_correction
+
+    if getattr(original_apply_rollout_correction, "_qwen3vl_compat_patch", False):
+        return
+
+    def compat_apply_rollout_correction(
+        batch,
+        rollout_corr_config=None,
+        policy_loss_config=None,
+    ):
+        if "rollout_log_probs" not in batch.batch:
+            raise ValueError(
+                "bypass_mode=True requires rollout_log_probs in batch. "
+                "Ensure rollout worker is configured to calculate_log_probs=true."
+            )
+
+        batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
+
+        with open_dict(policy_loss_config):
+            policy_loss_config["rollout_correction"] = rollout_corr_config
+
+        use_policy_gradient = rollout_corr_config.get("use_policy_gradient", False)
+        if use_policy_gradient:
+            policy_loss_config["loss_mode"] = "rollout_correction"
+
+    compat_apply_rollout_correction = functools.wraps(original_apply_rollout_correction)(compat_apply_rollout_correction)
+    compat_apply_rollout_correction.__dict__.update(original_apply_rollout_correction.__dict__)
+    compat_apply_rollout_correction._qwen3vl_compat_patch = True
+    external_helper.apply_rollout_correction = compat_apply_rollout_correction
+
+
+def _patch_rlhf_dataset_message_builder() -> None:
+    """Allow RL datasets to carry already-structured multimodal message content."""
+
+    external_dataset = importlib.import_module("verl.utils.dataset.rl_dataset")
+    dataset_cls = external_dataset.RLHFDataset
+    original_build_messages = dataset_cls._build_messages
+
+    if getattr(original_build_messages, "_qwen3vl_compat_patch", False):
+        return
+
+    def compat_build_messages(self, example: dict):
+        messages: list = example.pop(self.prompt_key)
+
+        if self.image_key in example or self.video_key in example:
+            for message in messages:
+                content = message["content"]
+                if not isinstance(content, str):
+                    continue
+                content_list = []
+                segments = re.split("(<image>|<video>)", content)
+                segments = [item for item in segments if item != ""]
+                for segment in segments:
+                    if segment == "<image>":
+                        content_list.append({"type": "image"})
+                    elif segment == "<video>":
+                        content_list.append({"type": "video"})
+                    else:
+                        content_list.append({"type": "text", "text": segment})
+
+                message["content"] = content_list
+
+        return messages
+
+    compat_build_messages = functools.wraps(original_build_messages)(compat_build_messages)
+    compat_build_messages.__dict__.update(original_build_messages.__dict__)
+    compat_build_messages._qwen3vl_compat_patch = True
+    dataset_cls._build_messages = compat_build_messages
+
 def apply_runtime_compat_patches() -> None:
     """Apply repo-local compatibility patches for the active VERL stack."""
 
@@ -301,6 +410,9 @@ def apply_runtime_compat_patches() -> None:
     _patch_imported_runtime_aliases()
     _patch_ray_actor_runtime_env()
     _patch_fsdp_checkpoint_manager()
+    _patch_fsdp_update_actor_metadata()
+    _patch_rollout_correction_helper()
+    _patch_rlhf_dataset_message_builder()
 
     apply_continuous_replay_patches()
     _patch_actor_checkpoint_save()

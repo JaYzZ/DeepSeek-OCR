@@ -2240,7 +2240,7 @@ Examples:
             inference_files = {}
             explore_inference_files = {}
             run_benchmark = not args.explore
-            run_explore = True
+            run_explore = args.explore
 
             # Run inference
             if not args.skip_infer:

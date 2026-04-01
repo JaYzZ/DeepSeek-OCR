@@ -1,10 +1,10 @@
 custom_reward_function:
-  path: ${oc.env:DEEPSEEK_OCR_ROOT}/Qwen/scripts/deepvision_gspo_reward.py
+  path: ${oc.env:DEEPSEEK_OCR_ROOT}/Qwen/scripts/chimera_gspo_reward.py
   name: compute_score_batch
 
 data:
-  train_files: ${oc.env:TRAIN_FILE}
-  val_files: ${oc.env:VAL_FILE}
+  train_files: ${oc.env:TRAIN_FILE,/share/project/xiyan/sources/DeepSeek-OCR/Qwen/data/chimera_verl/train.parquet}
+  val_files: ${oc.env:VAL_FILE,/share/project/xiyan/sources/DeepSeek-OCR/Qwen/data/chimera_verl/val.parquet}
   gen_batch_size: ${oc.decode:${oc.env:GEN_BATCH_SIZE,${gpu_adapt:${trainer.n_gpus_per_node},32,64,128,256,128}}}
   train_batch_size: ${oc.decode:${oc.env:TRAIN_BATCH_SIZE,${gpu_adapt:${trainer.n_gpus_per_node},32,64,64,64,64}}}
   val_batch_size: ${oc.decode:${oc.env:VAL_BATCH_SIZE,64}}
@@ -100,7 +100,7 @@ trainer:
   critic_warmup: 0
   logger: ["console"]
   val_before_train: false
-  project_name: ${oc.env:PROJECT_NAME,qwen3vl-deepvision-gspo}
+  project_name: ${oc.env:PROJECT_NAME,qwen3vl-chimera-gspo}
   experiment_name: ${oc.env:EXPERIMENT_NAME,single_node}
   default_local_dir: ${oc.env:OUTPUT_DIR}
   n_gpus_per_node: ${oc.decode:${oc.env:GPUS_PER_NODE,8}}

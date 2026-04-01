@@ -4,97 +4,221 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Qwen3-VL Thinking Mode Visualization</title>
-    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="/static/styles.css?v=1">
     <script src="https://cdn.plot.ly/plotly-2.26.0.min.js"></script>
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1>Qwen3-VL Thinking Mode Visualization</h1>
-            <p class="subtitle">Interactive exploration of continuous latent autoregressive generation</p>
+    <div class="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <div class="header-left">
+                    <h1 class="title">
+                        <span class="icon">🧠</span>
+                        Qwen3-VL Thinking Mode
+                    </h1>
+                    <p class="subtitle">Interactive exploration of continuous latent autoregressive generation</p>
+                </div>
+                <div class="header-right">
+                    <div class="status-badge" id="serverStatus">
+                        <span class="status-dot"></span>
+                        <span class="status-text">Connecting...</span>
+                    </div>
+                </div>
+            </div>
         </header>
 
-        <div class="main-content">
-            <!-- Input Panel -->
-            <aside class="input-panel">
-                <h2>Input</h2>
+        <!-- Main Content -->
+        <div class="main-layout">
+            <!-- Sidebar -->
+            <aside class="sidebar">
+                <!-- Input Section -->
+                <section class="card token-section">
+                    <h2 class="card-title">
+                        <span class="icon">📝</span>
+                        Input
+                    </h2>
 
-                <div class="input-group">
-                    <label for="imageUpload">Upload Image</label>
-                    <input type="file" id="imageUpload" accept="image/*">
-                    <div id="imagePreview" class="image-preview">
-                        <img id="previewImg" src="" alt="Preview" style="display: none;">
+                    <!-- Image Upload -->
+                    <div class="form-group">
+                        <label class="form-label">
+                            <span class="icon">🖼️</span>
+                            Image <span class="optional">(optional)</span>
+                        </label>
+                        <div class="file-upload" id="fileUpload">
+                            <input type="file" id="imageInput" accept="image/*" hidden>
+                            <div class="file-upload-content" id="fileUploadContent">
+                                <span class="upload-icon">📤</span>
+                                <span class="upload-text">Click to upload or drag & drop</span>
+                                <span class="upload-hint">Supports JPG, PNG, GIF</span>
+                            </div>
+                            <div class="image-preview" id="imagePreview" style="display: none;">
+                                <img id="previewImage" src="" alt="Preview">
+                                <button class="remove-image" id="removeImage">×</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Text Input -->
+                    <div class="form-group">
+                        <label class="form-label" for="textInput">
+                            <span class="icon">💬</span>
+                            Question
+                        </label>
+                        <textarea
+                            id="textInput"
+                            class="textarea"
+                            rows="6"
+                            placeholder="Ask a question about the image (or enter any text prompt)..."
+                        >Describe the image</textarea>
+                        <div class="char-count">
+                            <span id="charCount">0</span> characters
+                        </div>
+                    </div>
+
+                    <!-- Action Buttons -->
+                    <div class="button-group">
+                        <button id="generateBtn" class="btn btn-primary" disabled>
+                            <span class="btn-icon">⚡</span>
+                            Generate
+                        </button>
+                        <button id="loadExampleBtn" class="btn btn-secondary">
+                            <span class="btn-icon">📋</span>
+                            Load Example
+                        </button>
+                    </div>
+                </section>
+
+                <!-- Model Info -->
+                <section class="card tsne-section">
+                    <h2 class="card-title">
+                        <span class="icon">⚙️</span>
+                        Model Info
+                    </h2>
+                    <div class="info-list">
+                        <div class="info-item">
+                            <span class="info-label">Checkpoint</span>
+                            <span class="info-value" id="checkpointInfo">Loading...</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">Thinking Mode</span>
+                            <span class="info-value" id="thinkingModeInfo">Loading...</span>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Generation Settings -->
+                <section class="card attention-section">
+                    <h2 class="card-title">
+                        <span class="icon">🎛️</span>
+                        Settings
+                    </h2>
+                    <div class="form-group">
+                        <label class="form-label" for="maxTokens">
+                            Max Tokens: <span id="maxTokensValue">8192</span>
+                        </label>
+                        <input
+                            type="range"
+                            id="maxTokens"
+                            class="slider"
+                            min="256"
+                            max="8192"
+                            step="128"
+                            value="8192"
+                        >
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="temperature">
+                            Temperature: <span id="temperatureValue">0.7</span>
+                        </label>
+                        <input
+                            type="range"
+                            id="temperature"
+                            class="slider"
+                            min="0"
+                            max="2"
+                            step="0.1"
+                            value="0.7"
+                        >
+                    </div>
+                </section>
+            </aside>
+
+            <!-- Main Visualization Area -->
+            <main class="main-content">
+                <!-- Progress Toast -->
+                <div class="toast" id="toast" style="display: none;">
+                    <div class="toast-content">
+                        <div class="toast-icon">⏳</div>
+                        <div class="toast-message" id="toastMessage">Generating...</div>
                     </div>
                 </div>
 
-                <div class="input-group">
-                    <label for="textInput">Question / Prompt</label>
-                    <textarea id="textInput" rows="5" placeholder="Enter your question here..."></textarea>
-                </div>
-
-                <div class="input-group">
-                    <button id="sendBtn" class="btn btn-primary" disabled>Generate</button>
-                    <button id="loadExampleBtn" class="btn btn-secondary">Load Example</button>
-                </div>
-
-                <div class="example-section">
-                    <label>
-                        <input type="checkbox" id="autoLoadExample">
-                        Auto-load Deepvision example on startup
-                    </label>
-                </div>
-
-                <div class="status-section">
-                    <h3>Status</h3>
-                    <div id="status" class="status">Ready</div>
-                    <div id="modelInfo" class="model-info"></div>
-                </div>
-            </aside>
-
-            <!-- Visualization Area -->
-            <main class="visualization-area">
                 <!-- Token Sequence -->
-                <section class="viz-section">
-                    <h2>Token Sequence</h2>
-                    <div id="tokenSequence" class="token-sequence">
-                        <p class="placeholder">Tokens will appear here after generation...</p>
+                <section class="card answer-section">
+                    <h2 class="card-title">
+                        <span class="icon">🎯</span>
+                        Token Sequence
+                        <span class="token-stats" id="tokenStats"></span>
+                    </h2>
+                    <div class="token-container" id="tokenContainer">
+                        <div class="empty-state">
+                            <span class="empty-icon">🔤</span>
+                            <p>Generate text to see token sequence</p>
+                        </div>
                     </div>
                 </section>
 
                 <!-- t-SNE Visualization -->
-                <section class="viz-section">
-                    <h2>t-SNE Visualization</h2>
-                    <div id="tsnePlot" class="plot-container">
-                        <p class="placeholder">t-SNE plot will appear here...</p>
+                <section class="card">
+                    <h2 class="card-title">
+                        <span class="icon">📊</span>
+                        t-SNE Projection
+                    </h2>
+                    <div class="plot-wrapper">
+                        <div class="plot-container" id="tsnePlot">
+                            <div class="empty-state">
+                                <span class="empty-icon">📈</span>
+                                <p>Generate text to see t-SNE visualization</p>
+                            </div>
+                        </div>
                     </div>
-                    <div class="legend">
-                        <span class="legend-item"><span class="dot red"></span> Image</span>
-                        <span class="legend-item"><span class="dot blue"></span> Question</span>
-                        <span class="legend-item"><span class="dot green"></span> Continuous</span>
-                        <span class="legend-item"><span class="dot orange"></span> Answer</span>
+                </section>
+
+                <!-- Generated Answer -->
+                <section class="card generated-answer-section">
+                    <h2 class="card-title">
+                        <span class="icon">✨</span>
+                        Generated Answer
+                    </h2>
+                    <div class="answer-container" id="answerContainer">
+                        <div class="empty-state">
+                            <span class="empty-icon">💭</span>
+                            <p>Your answer will appear here</p>
+                        </div>
                     </div>
                 </section>
 
                 <!-- Attention Heatmap -->
-                <section class="viz-section">
-                    <h2>Attention Heatmap</h2>
-                    <p class="hint">Click any token above to see its attention pattern</p>
-                    <div id="attentionPlot" class="plot-container">
-                        <p class="placeholder">Attention heatmap will appear here...</p>
-                    </div>
-                </section>
-
-                <!-- Answer -->
-                <section class="viz-section">
-                    <h2>Generated Answer</h2>
-                    <div id="answer" class="answer">
-                        <p class="placeholder">Answer will appear here...</p>
+                <section class="card attention-heatmap-section">
+                    <h2 class="card-title">
+                        <span class="icon">🔥</span>
+                        Attention Heatmap
+                        <span class="hint">Click any token to see its attention pattern</span>
+                    </h2>
+                    <div class="plot-wrapper">
+                        <div class="plot-container" id="attentionPlot">
+                            <div class="empty-state">
+                                <span class="empty-icon">🎨</span>
+                                <p>Generate text to see attention patterns</p>
+                            </div>
+                        </div>
                     </div>
                 </section>
             </main>
         </div>
     </div>
 
-    <script src="/static/main.js"></script>
+    <script src="/static/main.js?v=1"></script>
 </body>
 </html>

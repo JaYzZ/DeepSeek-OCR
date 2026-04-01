@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file
 
-from vllm_thinking.trace_store import record_request_step, reset_request_trace
+from vllm_thinking.trace_store import record_request_step, reset_request_trace, save_request_trace_to_file
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
@@ -22,6 +22,7 @@ _THINKING_DEBUG = os.environ.get("VLLM_THINKING_DEBUG", "0") == "1"
 _TARGET_PROB_IO_WARNED = False
 _VLLM_VAE_LOGGED = False
 _CONTINUOUS_AR_CERT_LOGGED = False
+_FORCED_THINK_END_LOGPROB_SYNC_LOGGED = False
 
 def _debug_log(msg: str):
     """Write debug message to stderr - visible in worker output."""
@@ -45,6 +46,76 @@ def _append_target_prob(record: dict):
         if not _TARGET_PROB_IO_WARNED:
             _TARGET_PROB_IO_WARNED = True
             logger.warning("[Thinking] Failed to write target prob trace to %s", target_prob_path)
+
+
+def _get_logprob_row(logits_for_trace: torch.Tensor | None, req_idx: int) -> torch.Tensor | None:
+    """Return the per-request logits row used to build sampled-token logprobs."""
+    if logits_for_trace is None:
+        return None
+    if logits_for_trace.ndim == 2:
+        return logits_for_trace[req_idx].float()
+    if logits_for_trace.ndim == 3:
+        return logits_for_trace[req_idx, -1, :].float()
+    return None
+
+
+def _sync_forced_token_logprobs(
+    result,
+    *,
+    req_idx: int,
+    forced_token_id: int,
+    logits_row: torch.Tensor | None,
+    req_id: str,
+) -> None:
+    """Keep ModelRunnerOutput token ids and logprobs aligned after token rewriting."""
+    global _FORCED_THINK_END_LOGPROB_SYNC_LOGGED
+
+    if getattr(result, "logprobs", None) is None:
+        return
+
+    logprobs = result.logprobs
+    cu_num_generated_tokens = logprobs.cu_num_generated_tokens
+    if cu_num_generated_tokens:
+        pos_idx = int(cu_num_generated_tokens[req_idx])
+    else:
+        pos_idx = req_idx
+
+    if pos_idx >= logprobs.logprob_token_ids.shape[0]:
+        logger.warning(
+            "[Thinking] Cannot sync forced token logprobs: req_id=%s req_idx=%s pos_idx=%s rows=%s",
+            req_id,
+            req_idx,
+            pos_idx,
+            int(logprobs.logprob_token_ids.shape[0]),
+        )
+        return
+
+    logprobs.logprob_token_ids[pos_idx, 0] = int(forced_token_id)
+
+    if logits_row is not None:
+        vocab_size = int(logits_row.shape[-1])
+        if 0 <= forced_token_id < vocab_size:
+            forced_logprob = float((logits_row[forced_token_id] - torch.logsumexp(logits_row, dim=-1)).item())
+            forced_rank = int((logits_row > logits_row[forced_token_id]).sum().item() + 1)
+            logprobs.logprobs[pos_idx, 0] = forced_logprob
+            logprobs.sampled_token_ranks[pos_idx] = forced_rank
+            if not _FORCED_THINK_END_LOGPROB_SYNC_LOGGED:
+                logger.warning(
+                    "[Thinking] Synced forced </think> token with rollout logprobs: req_id=%s token_id=%s rank=%s",
+                    req_id,
+                    forced_token_id,
+                    forced_rank,
+                )
+                _FORCED_THINK_END_LOGPROB_SYNC_LOGGED = True
+            return
+
+    if not _FORCED_THINK_END_LOGPROB_SYNC_LOGGED:
+        logger.warning(
+            "[Thinking] Forced </think> token without logits row; reused existing sampled-token logprob slot. req_id=%s token_id=%s",
+            req_id,
+            forced_token_id,
+        )
+        _FORCED_THINK_END_LOGPROB_SYNC_LOGGED = True
 
 
 def _get_thinking_token_ids():
@@ -623,6 +694,13 @@ def apply_thinking_mode_patch():
                     if i < len(sampled_tokens_list) and sampled_tokens_list[i]:
                         sampled_tokens_list[i][0] = _get_token_id('think_end')
                         sampled = sampled_tokens_list[i][0]
+                        _sync_forced_token_logprobs(
+                            result,
+                            req_idx=i,
+                            forced_token_id=int(sampled),
+                            logits_row=_get_logprob_row(logits_for_trace, i),
+                            req_id=str(req_id),
+                        )
                         req_pos = self.input_batch.num_tokens[ i ] - 1
                         if req_pos >= 0:
                             self.input_batch.token_ids_cpu[i, req_pos] = sampled
@@ -656,17 +734,58 @@ def apply_thinking_mode_patch():
                         bool(latent_logprob is not None),
                     )
                     _CONTINUOUS_AR_CERT_LOGGED = True
-                # Prepare all hidden states and token IDs for visualization
-                all_hidden_for_step = None
+                # Prepare per-generated-token data for visualization:
+                # - token embeddings (input embeddings for sampled tokens)
+                # - hidden states (final layer output)
+                # - VAE samples (latent embeddings for continuous tokens)
+                token_hidden_state_for_step = None
+                token_embedding_for_step = None
                 all_token_ids_for_step = []
 
-                if hidden_states is not None and i < hidden_states.shape[0]:
-                    # Extract all hidden states for this request from the batch
-                    all_hidden_for_step = hidden_states[i:i+1]  # Keep batch dim
+                if last_hidden is not None:
+                    # Store exactly one hidden-state vector per sampled token so
+                    # visualization stays aligned with the generated sequence.
+                    token_hidden_state_for_step = last_hidden
 
-                # Collect token IDs for this step
+                # Capture token embedding for the sampled token
                 if sampled is not None:
                     all_token_ids_for_step = [int(sampled)]
+                    try:
+                        # Get embedding matrix from model - try multiple paths for different model architectures
+                        embed_tokens = None
+
+                        # For Qwen3-VL: self.model.language_model.model.embed_tokens
+                        if hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'model') and hasattr(self.model.language_model.model, 'embed_tokens'):
+                            embed_tokens = self.model.language_model.model.embed_tokens.weight
+                            _debug_log(f"[DEBUG] Found embed_tokens at language_model.model.embed_tokens (Qwen3-VL)")
+                        # Try direct embed_tokens (most models)
+                        elif hasattr(self.model.model, 'embed_tokens'):
+                            embed_tokens = self.model.model.embed_tokens.weight
+                            _debug_log(f"[DEBUG] Found embed_tokens at self.model.model.embed_tokens")
+                        # Try language_model.model.embed_tokens (Qwen2-VL style)
+                        elif hasattr(self.model.model, 'language_model'):
+                            lm = self.model.model.language_model
+                            if hasattr(lm, 'model') and hasattr(lm.model, 'embed_tokens'):
+                                embed_tokens = lm.model.embed_tokens.weight
+                                _debug_log(f"[DEBUG] Found embed_tokens at model.language_model.model.embed_tokens")
+                            elif hasattr(lm, 'embed_tokens'):
+                                embed_tokens = lm.embed_tokens.weight
+                                _debug_log(f"[DEBUG] Found embed_tokens at model.language_model.embed_tokens")
+                        # Try llm_model.embed_tokens
+                        elif hasattr(self.model.model, 'llm_model') and hasattr(self.model.model.llm_model, 'embed_tokens'):
+                            embed_tokens = self.model.model.llm_model.embed_tokens.weight
+                            _debug_log(f"[DEBUG] Found embed_tokens at llm_model.embed_tokens")
+
+                        if embed_tokens is not None:
+                            token_emb = embed_tokens[sampled:sampled+1, :].detach().clone()
+                            if token_emb.dtype != torch.bfloat16:
+                                token_emb = token_emb.to(dtype=torch.bfloat16)
+                            token_embedding_for_step = token_emb
+                            _debug_log(f"[DEBUG] Captured token embedding for token_id={sampled}, shape={token_emb.shape}")
+                        else:
+                            _debug_log(f"[WARNING] Could not find embed_tokens in model structure")
+                    except Exception as e:
+                        _debug_log(f"[ERROR] sample_tokens: failed to extract token embedding: {e}")
 
                 record_request_step(
                     req_id,
@@ -674,9 +793,10 @@ def apply_thinking_mode_patch():
                     latent_embedding=latent_embedding,
                     latent_logprob=latent_logprob,
                     use_continuous_embedding=use_continuous_embedding,
-                    all_hidden_states=all_hidden_for_step,
+                    all_hidden_states=token_hidden_state_for_step,
                     all_token_ids=all_token_ids_for_step,
                     attention_weights=attention_weights,
+                    token_embeddings=token_embedding_for_step,
                 )
 
                 # vLLM's next decode step reads slot `num_computed_tokens`, which
@@ -693,6 +813,14 @@ def apply_thinking_mode_patch():
                     )
                 else:
                     _set_next_decode_embedding(self, i, token_pos, None)
+
+        # Save traces to file for cross-process visualization access
+        if os.environ.get("VLLM_STORE_VISUALIZATION_DATA", "0") == "1":
+            for req_id in batch_req_ids:
+                try:
+                    save_request_trace_to_file(req_id)
+                except Exception as e:
+                    logger.warning(f"[Thinking] Failed to save trace for {req_id}: {e}")
 
         return result
 

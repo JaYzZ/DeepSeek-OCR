@@ -955,6 +955,7 @@ if [ "$train_exit_code" -eq 0 ] && [ "$RUN_BENCHMARK" = "1" ]; then
         set +e
         QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" "$PYTHON_BIN" -u Qwen/evaluation/run_all_benchmarks.py \
             --start-server \
+            --explore \
             --benchmarks "$BENCHMARK_LIST" \
             --lora-path "$LATEST_CHECKPOINT" \
             --num-samples "$BENCHMARK_NUM_SAMPLES" \

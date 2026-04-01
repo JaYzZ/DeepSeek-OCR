@@ -1,21 +1,21 @@
 #!/bin/bash
 # Qwen3-VL Thinking Mode Visualization Server Startup Script
 
-# Default values - use checkpoint from plan
-CHECKPOINT="${CHECKPOINT:-Qwen/checkpoints/qwen3vl-2b/lora/r1_onevision_thinking/run_sota_1ep/checkpoint_latest}"
-BASE_MODEL="${BASE_MODEL:-/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking}"
+# Default values
+LORA_PATH="${LORA_PATH:-}"
+MODEL_PATH="${MODEL_PATH:-Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking}"
 PORT="${PORT:-8501}"
 HOST="${HOST:-0.0.0.0}"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --checkpoint)
-            CHECKPOINT="$2"
+        --lora-path)
+            LORA_PATH="$2"
             shift 2
             ;;
-        --base-model)
-            BASE_MODEL="$2"
+        --model-path)
+            MODEL_PATH="$2"
             shift 2
             ;;
         --port)
@@ -30,14 +30,14 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --checkpoint PATH    Path to LoRA checkpoint (default: Qwen/checkpoints/...)"
-            echo "  --base-model PATH    Path to base model (default: /share/.../Qwen3-VL-2B-Thinking)"
+            echo "  --lora-path PATH      Path to LoRA adapter (default: none)"
+            echo "  --model-path PATH     Path to base model (default: Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking)"
             echo "  --port PORT          Port to run server on (default: 8501)"
             echo "  --host HOST          Host to bind to (default: 0.0.0.0)"
             echo ""
             echo "Environment variables:"
-            echo "  CHECKPOINT           Same as --checkpoint"
-            echo "  BASE_MODEL           Same as --base-model"
+            echo "  LORA_PATH            Same as --lora-path"
+            echo "  MODEL_PATH           Same as --model-path"
             echo "  PORT                 Same as --port"
             echo "  HOST                 Same as --host"
             exit 0
@@ -51,29 +51,38 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Validate paths
-if [ ! -d "$CHECKPOINT" ]; then
-    echo "Error: Checkpoint not found: $CHECKPOINT"
+if [ ! -d "$MODEL_PATH" ]; then
+    echo "Error: Model not found: $MODEL_PATH"
     exit 1
 fi
 
-if [ ! -d "$BASE_MODEL" ]; then
-    echo "Error: Base model not found: $BASE_MODEL"
+if [ -n "$LORA_PATH" ] && [ ! -d "$LORA_PATH" ]; then
+    echo "Error: LoRA path not found: $LORA_PATH"
     exit 1
 fi
 
 echo "======================================"
 echo "Qwen3-VL Thinking Mode Visualization"
 echo "======================================"
-echo "Checkpoint: $CHECKPOINT"
-echo "Base Model: $BASE_MODEL"
+echo "Model: $MODEL_PATH"
+if [ -n "$LORA_PATH" ]; then
+    echo "LoRA: $LORA_PATH"
+fi
 echo "Server: http://$HOST:$PORT"
 echo "======================================"
 echo ""
 
 # Run the server
 cd "$(dirname "$0")"
-python app.py \
-    --checkpoint "$CHECKPOINT" \
-    --base-model "$BASE_MODEL" \
-    --port "$PORT" \
-    --host "$HOST"
+if [ -n "$LORA_PATH" ]; then
+    python app.py \
+        --model-path "$MODEL_PATH" \
+        --lora-path "$LORA_PATH" \
+        --port "$PORT" \
+        --host "$HOST"
+else
+    python app.py \
+        --model-path "$MODEL_PATH" \
+        --port "$PORT" \
+        --host "$HOST"
+fi

@@ -1,5 +1,16 @@
 #!/bin/bash
-# Single-node-first VERL GSPO launcher for DeepVision-103K with vLLM rollout and rule-based reward.
+# Single-node-first VERL GSPO launcher for Chimera with vLLM rollout and rule-based reward.
+#
+# This script trains Qwen3VL-2B-Thinking on Chimera dataset using:
+# - GSPO (Group Supervised Policy Optimization)
+# - Rule-based reward function (answer correctness checking)
+# - vLLM rollout for efficient generation
+# - No verifier required - uses ground truth answers directly
+#
+# Usage:
+#   bash Qwen/scripts/train_qwen3vl_chimera_gspo.sh
+#   bash Qwen/scripts/train_qwen3vl_chimera_gspo.sh [overlay_config.yaml]
+#   INIT_LORA_PATH=/path/to/sft/checkpoint bash Qwen/scripts/train_qwen3vl_chimera_gspo.sh
 
 set -euo pipefail
 
@@ -32,13 +43,16 @@ if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] && [[ "$VISIBLE_GPUS" =~ ^[0-9]+$ ]] && 
   export CUDA_VISIBLE_DEVICES
 fi
 
-PROJECT_BASE_CONFIG="${PROJECT_BASE_CONFIG:-$REPO_ROOT/Qwen/configs/rl/deepvision_gspo.yaml}"
+PROJECT_BASE_CONFIG="${PROJECT_BASE_CONFIG:-$REPO_ROOT/Qwen/configs/rl/chimera_gspo.yaml}"
 PROJECT_CONFIG="${PROJECT_CONFIG:-}"
 MODEL_PATH="${MODEL_PATH:-/share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking}"
-DATA_DIR="${DATA_DIR:-$REPO_ROOT/Qwen/data/deepvision_103k_verl}"
+CHIMERA_DATA_DIR="${CHIMERA_DATA_DIR:-/share/project/xiyan/huggingface/TianHongZXY/CHIMERA/Qwen3.5-397B}"
+CHIMERA_IMAGES_DIR="${CHIMERA_IMAGES_DIR:-$REPO_ROOT/Qwen/data/chimera_images}"
+TEXT_ONLY="${TEXT_ONLY:-false}"
+DATA_DIR="${DATA_DIR:-$REPO_ROOT/Qwen/data/chimera_verl}"
 TRAIN_FILE="${TRAIN_FILE:-$DATA_DIR/train.parquet}"
 VAL_FILE="${VAL_FILE:-$DATA_DIR/val.parquet}"
-OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/Qwen/checkpoints/qwen3vl-2b/verl/deepvision_gspo/run_${TIMESTAMP}}"
+OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/Qwen/checkpoints/qwen3vl-2b/verl/chimera_gspo/run_${TIMESTAMP}}"
 
 NNODES="${NNODES:-}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-}"
@@ -89,7 +103,7 @@ OVERLONG_LOG="${OVERLONG_LOG:-false}"
 
 LORA_RANK="${LORA_RANK:-32}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
-PROJECT_NAME="${PROJECT_NAME:-qwen3vl-deepvision-gspo}"
+PROJECT_NAME="${PROJECT_NAME:-qwen3vl-chimera-gspo}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-single_node_${TIMESTAMP}}"
 INIT_LORA_PATH="${INIT_LORA_PATH:-${LORA_ADAPTER_PATH:-}}"
 RESUME_MODE="${RESUME_MODE:-disable}"
@@ -97,9 +111,11 @@ RESUME_FROM_PATH="${RESUME_FROM_PATH:-}"
 
 if [ ! -f "$TRAIN_FILE" ] || [ ! -f "$VAL_FILE" ]; then
   cat >&2 <<EOF2
-DeepVision VERL parquet not found.
+Chimera VERL dataset not found.
 Build it first with:
-  $PYTHON_BIN Qwen/scripts/build_deepvision_verl_dataset.py
+  $PYTHON_BIN Qwen/scripts/build_chimera_verl_dataset.py --data-dir "$CHIMERA_DATA_DIR"
+
+This creates proper train/val splits (default: 99%/1%) from the Chimera parquet files.
 EOF2
   exit 1
 fi
@@ -147,6 +163,8 @@ exec > >(sanitize_log_stream | tee -a "$LOG_FILE") 2>&1
 export DEEPSEEK_OCR_ROOT="$REPO_ROOT"
 export MODEL_PATH
 export VLLM_MODEL_PATH="${VLLM_MODEL_PATH:-$MODEL_PATH}"
+export CHIMERA_IMAGES_DIR
+export TEXT_ONLY
 export TRAIN_FILE
 export VAL_FILE
 export OUTPUT_DIR
@@ -328,7 +346,7 @@ fi
 
 CMD+=("$@")
 
-printf 'Launching GSPO with output_dir=%s\n' "$OUTPUT_DIR"
+printf 'Launching Chimera GSPO with output_dir=%s\n' "$OUTPUT_DIR"
 printf 'Training log=%s\n' "$LOG_FILE"
 printf 'Visible GPUs=%s cuda_visible_devices=%s nnodes=%s tp=%s train=%s val=%s\n' "$VISIBLE_GPUS" "${CUDA_VISIBLE_DEVICES:-<unset>}" "$EFFECTIVE_NNODES" "$EFFECTIVE_ROLLOUT_TP_SIZE" "$TRAIN_FILE" "$VAL_FILE"
 printf 'Gen batch=%s train batch=%s rollout_n=%s loss_mode=%s reward_manager=%s\n' "$EFFECTIVE_GEN_BATCH_SIZE" "$EFFECTIVE_TRAIN_BATCH_SIZE" "$EFFECTIVE_ROLLOUT_N" 'gspo' 'dapo_batch'
@@ -346,5 +364,6 @@ printf 'Saved config snapshots: %s %s %s %s\n' \
   "${PROJECT_CONFIG:+$OUTPUT_DIR/$(basename "$PROJECT_CONFIG")}" \
   "$RESOLVED_CONFIG_FILE" \
   "$OUTPUT_DIR/launcher_effective_env.snapshot.txt"
+printf '\nChimera Data: Using custom dataset class (no pre-conversion needed)\n'
 
 exec "${CMD[@]}"

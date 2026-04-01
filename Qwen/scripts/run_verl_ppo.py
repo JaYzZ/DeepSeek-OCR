@@ -13,6 +13,26 @@ from omegaconf import OmegaConf
 from verl_compat import patch_runtime_env
 
 
+def _register_project_resolvers() -> None:
+    """Register repo-local OmegaConf resolvers used by project YAMLs."""
+
+    if not OmegaConf.has_resolver("gpu_adapt"):
+        OmegaConf.register_new_resolver(
+            "gpu_adapt",
+            lambda gpus, one, two, four, eight, fallback=None: (
+                one
+                if int(gpus) == 1
+                else two
+                if int(gpus) == 2
+                else four
+                if int(gpus) == 4
+                else eight
+                if int(gpus) == 8
+                else (fallback if fallback is not None else eight)
+            ),
+        )
+
+
 def _resolve_verl_ppo_config() -> Path:
     import verl
 
@@ -72,6 +92,16 @@ def _inject_runtime_env(config) -> None:
     runtime_env_dict = OmegaConf.to_container(runtime_env, resolve=False) if runtime_env is not None else {}
     patched_runtime_env = patch_runtime_env(runtime_env_dict)
     ray_init["runtime_env"] = OmegaConf.create(patched_runtime_env)
+
+
+def _normalize_rollout_correction_config(config) -> None:
+    """Keep rollout_correction under algorithm only; runtime patch injects it later."""
+
+    policy_loss_cfg = OmegaConf.select(config, "actor_rollout_ref.actor.policy_loss")
+    if policy_loss_cfg is None:
+        return
+    if "rollout_correction" in policy_loss_cfg:
+        del policy_loss_cfg["rollout_correction"]
 
 
 def _check_runtime_env(config) -> int:
@@ -275,6 +305,8 @@ def main() -> int:
 
     from verl.trainer.main_ppo import run_ppo
 
+    _register_project_resolvers()
+
     verl_ppo_config = _resolve_verl_ppo_config()
     config = OmegaConf.load(verl_ppo_config)
     for config_path in args.project_config:
@@ -283,6 +315,7 @@ def main() -> int:
         config = OmegaConf.merge(config, OmegaConf.from_dotlist(overrides))
 
     _normalize_ray_kwargs(config)
+    _normalize_rollout_correction_config(config)
     _inject_runtime_env(config)
     OmegaConf.resolve(config)
 

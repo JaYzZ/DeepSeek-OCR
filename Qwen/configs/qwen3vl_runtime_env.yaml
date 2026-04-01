@@ -34,12 +34,12 @@ vae_intermediate_size: 512
 
 ### curriculum
 curriculum_enable: 1
-curriculum_epochs: 0,1,2,3
-curriculum_loss_types: ce,ce+mse+ot,ce:0.1+vae_ce+vae+mse:0.1+ot:0.1,ce:0.5+vae_ce+vae:0.4+mse:0.4+ot:0.4
-curriculum_vae_trainable: 0,0,1,1
-curriculum_lora_trainable: 1,1,0,1
-curriculum_aux_source: hidden,hidden,hidden,hidden
-curriculum_latent_ce: 1,0,1,1
+curriculum_epochs: 0,1
+curriculum_loss_types: ce:0.1+vae_ce+vae+mse:0.1+ot:0.1,ce:0.5+vae_ce+vae:0.4+mse:0.4+ot:0.4
+curriculum_vae_trainable: 1,1
+curriculum_lora_trainable: 0,1
+curriculum_aux_source: hidden,hidden
+curriculum_latent_ce: 1,1
 
 ### backfill / transparent eval
 # Used by post-training backfill and transparent eval callbacks.

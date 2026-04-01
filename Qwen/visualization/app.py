@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import base64
 import errno
 import json
 import os
@@ -28,6 +29,7 @@ from typing import List, Dict, Any, Optional
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import numpy as np
 from tokenizers import AddedToken
@@ -47,12 +49,31 @@ def _env_flag_enabled(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _has_data(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, np.ndarray):
+        return value.size > 0
+    return len(value) > 0
+
+
+def _decode_token_text(tokenizer: Any, token_id: int) -> str:
+    return tokenizer.decode(
+        [int(token_id)],
+        skip_special_tokens=False,
+        clean_up_tokenization_spaces=False,
+    )
+
+
 # Set vLLM multiprocessing method BEFORE importing vLLM
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
+# Enable visualization data collection for the visualization server
+os.environ['VLLM_STORE_VISUALIZATION_DATA'] = '1'
 
 # Load runtime env before enabling plugins so YAML can control VLLM_THINKING.
 apply_runtime_env_for_thinking(repo_root=_REPO_ROOT)
-THINKING_MODE_ENABLED = _env_flag_enabled("VLLM_THINKING") or _env_flag_enabled("VLLM_FORCE_THINK")
+# Default to thinking mode enabled for this visualization app (can be disabled with VLLM_THINKING=0)
+THINKING_MODE_ENABLED = _env_flag_enabled("VLLM_THINKING", default="1") or _env_flag_enabled("VLLM_FORCE_THINK")
 if THINKING_MODE_ENABLED:
     existing_plugins = [p.strip() for p in os.environ.get("VLLM_PLUGINS", "").split(",") if p.strip()]
     if "vllm_thinking" not in existing_plugins:
@@ -77,13 +98,17 @@ except ImportError:
 
 app = FastAPI(title="Qwen3-VL Thinking Mode Visualization")
 
+# Mount static files directory
+static_dir = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
 # Import visualization utilities
 sys.path.insert(0, str(Path(__file__).parent))
 from utils.visualization_utils import compute_tsne, aggregate_attention, create_attention_heatmap_data, encode_image_to_base64
 
 # Import trace store utilities if thinking mode is enabled
 if THINKING_MODE_ENABLED:
-    from vllm_thinking.trace_store import get_latest_trace
+    from vllm_thinking.trace_store import get_latest_trace, get_request_trace
 
 # Global state
 llm = None
@@ -143,8 +168,8 @@ async def health():
     """Health check endpoint."""
     return {
         "status": "healthy",
-        "model": config.get("model_path"),
-        "lora": config.get("lora_path"),
+        "model_loaded": llm is not None,
+        "checkpoint_path": config.get("lora_path") or config.get("model_path"),
         "thinking_enabled": config.get("thinking_enabled", False),
     }
 
@@ -239,7 +264,7 @@ async def infer_vis(request: Dict[str, Any]):
         # Prepare messages from request
         text = request.get("text", "")
         image_base64 = request.get("image_base64")
-        max_tokens = request.get("max_tokens", 2048)
+        max_tokens = request.get("max_tokens", 8192)
         temperature = request.get("temperature", 0.7)
 
         messages = []
@@ -280,36 +305,100 @@ async def infer_vis(request: Dict[str, Any]):
 
         if THINKING_MODE_ENABLED:
             try:
-                trace = get_latest_trace()
-                if trace:
-                    # Extract tokens
-                    token_ids = output.outputs[0].token_ids
-                    for i, token_id in enumerate(token_ids):
-                        token_text = processor.tokenizer.decode([token_id])[0]
-                        trace_data["tokens"].append({
-                            'id': int(token_id),
-                            'text': token_text,
-                            'position': i,
-                        })
+                request_id = getattr(output, "request_id", None)
+                trace = get_request_trace(request_id) if request_id is not None else None
+                if trace is None:
+                    trace = get_latest_trace()
 
-                    # Extract hidden states and other data
-                    all_hidden_states = trace.get('all_hidden_states', [])
+                output_token_ids = list(output.outputs[0].token_ids)
+                token_ids = output_token_ids
+                if trace and _has_data(trace.get("all_token_ids", [])):
+                    trace_token_ids = list(trace.get("all_token_ids", []))
+                    # Only trust trace token ids when they are at least as complete
+                    # as the RequestOutput sequence for this request.
+                    if len(trace_token_ids) >= len(output_token_ids):
+                        token_ids = trace_token_ids
+
+                for i, token_id in enumerate(token_ids):
+                    token_text = _decode_token_text(processor.tokenizer, token_id)
+                    trace_data["tokens"].append({
+                        'id': int(token_id),
+                        'text': token_text,
+                        'position': i,
+                    })
+
+                if trace:
+                    # Extract hidden states, token embeddings, and latent embeddings
+                    token_hidden_states = trace.get('all_hidden_states', [])
+                    token_embeddings = trace.get('all_token_embeddings', [])
+                    latent_embeddings = trace.get('continuous_latent_embeddings', [])
                     continuous_mask = trace.get('continuous_token_mask', [])
                     attention_weights = trace.get('attention_weights', [])
 
-                    trace_data["continuous_mask"] = continuous_mask
+                    # Debug logging
+                    print(f"[DEBUG] token_hidden_states: {len(token_hidden_states) if _has_data(token_hidden_states) else 0} items")
+                    print(f"[DEBUG] token_embeddings: {len(token_embeddings) if _has_data(token_embeddings) else 0} items")
+                    print(f"[DEBUG] latent_embeddings: {len(latent_embeddings) if _has_data(latent_embeddings) else 0} items")
 
-                    # Compute t-SNE if hidden states available
-                    if all_hidden_states and len(all_hidden_states) > 0:
-                        hidden_array = np.array(all_hidden_states)
-                        if hidden_array.ndim == 3:
-                            hidden_array = hidden_array.reshape(-1, hidden_array.shape[-1])
-                        tsne_coords = compute_tsne(hidden_array)
-                        trace_data["tsne_coordinates"] = tsne_coords.tolist()
-                        trace_data["hidden_states"] = hidden_array.tolist()
+                    trace_data["continuous_mask"] = np.asarray(continuous_mask, dtype=np.bool_).tolist()
 
-                    if attention_weights:
-                        trace_data["attention_weights"] = np.array(attention_weights).tolist()
+                    # Compute t-SNE if we have any feature type available
+                    if _has_data(token_hidden_states) or _has_data(token_embeddings) or _has_data(latent_embeddings):
+                        # Prepare features for t-SNE: combine all three types
+                        # For each position, we'll have up to 3 feature vectors
+                        all_features = []
+                        feature_types = []  # 'token_emb', 'hidden_state', 'vae_sample'
+                        position_indices = []
+
+                        for i in range(len(trace_data["tokens"])):
+                            is_continuous = i < len(continuous_mask) and continuous_mask[i]
+
+                            # 1. Token embedding (if available)
+                            if _has_data(token_embeddings) and i < len(token_embeddings):
+                                te = np.asarray(token_embeddings[i])
+                                if te.ndim > 1:
+                                    te = te.reshape(-1)
+                                if te.size > 0:
+                                    all_features.append(te)
+                                    feature_types.append('token_emb')
+                                    position_indices.append(i)
+
+                            # 2. Hidden state (if available)
+                            if _has_data(token_hidden_states) and i < len(token_hidden_states):
+                                hs = np.asarray(token_hidden_states[i])
+                                if hs.ndim > 1:
+                                    hs = hs.reshape(-1)
+                                if hs.size > 0:
+                                    all_features.append(hs)
+                                    feature_types.append('hidden_state')
+                                    position_indices.append(i)
+
+                            # 3. VAE sample (only for continuous tokens)
+                            if is_continuous and _has_data(latent_embeddings):
+                                # Find the corresponding latent embedding
+                                latent_idx = sum(continuous_mask[:i])  # count continuous tokens before this position
+                                if latent_idx < len(latent_embeddings):
+                                    le = np.asarray(latent_embeddings[latent_idx])
+                                    if le.ndim > 1:
+                                        le = le.reshape(-1)
+                                    if le.size > 0:
+                                        all_features.append(le)
+                                        feature_types.append('vae_sample')
+                                        position_indices.append(i)
+
+                        if all_features:
+                            # Stack all features and compute t-SNE
+                            feature_matrix = np.vstack(all_features)
+                            tsne_coords = compute_tsne(feature_matrix)
+                            trace_data["tsne_coordinates"] = tsne_coords.tolist()
+                            trace_data["tsne_feature_types"] = feature_types
+                            trace_data["tsne_position_indices"] = position_indices
+                            print(f"[DEBUG] Computed t-SNE with {len(feature_types)} features: {feature_types[:10]}...")  # Show first 10
+                        else:
+                            print(f"[DEBUG] No features collected for t-SNE")
+
+                    if _has_data(attention_weights):
+                        trace_data["attention_weights"] = np.asarray(attention_weights).tolist()
 
             except Exception as e:
                 print(f"Warning: Failed to collect trace data: {e}")
@@ -321,6 +410,8 @@ async def infer_vis(request: Dict[str, Any]):
             "attention_weights": trace_data["attention_weights"],
             "continuous_mask": trace_data["continuous_mask"],
             "tsne_coordinates": trace_data["tsne_coordinates"],
+            "tsne_feature_types": trace_data.get("tsne_feature_types", []),
+            "tsne_position_indices": trace_data.get("tsne_position_indices", []),
             "token_metadata": {
                 "total_tokens": len(trace_data["tokens"]),
                 "continuous_tokens": sum(trace_data["continuous_mask"]),
@@ -458,13 +549,17 @@ def prepare_inputs_for_vllm(messages, processor):
         return text
 
 
-def resolve_model_path(model_path: str, lora_path: str | None) -> str:
+def resolve_model_path(model_path: str | None, lora_path: str | None) -> str:
     """Mirror backfill behavior: prefer adapter-declared base model for LoRA checkpoints."""
     if not lora_path:
+        if not model_path:
+            raise ValueError("Either --model-path or --lora-path must be provided")
         return model_path
 
     adapter_config_path = Path(lora_path) / "adapter_config.json"
     if not adapter_config_path.exists():
+        if not model_path:
+            raise ValueError(f"No adapter_config.json found in {lora_path}, and no --model-path provided")
         return model_path
 
     try:
@@ -475,11 +570,13 @@ def resolve_model_path(model_path: str, lora_path: str | None) -> str:
         return resolved
     except Exception as exc:
         print(f"Warning: failed to read {adapter_config_path}: {exc}")
+        if not model_path:
+            raise ValueError(f"Failed to read adapter_config.json from {lora_path}, and no --model-path provided")
         return model_path
 
 
 def load_model(
-    model_path: str,
+    model_path: str | None,
     tensor_parallel_size: int = 1,
     gpu_memory_utilization: float = 0.9,
     lora_path: str = None,
@@ -601,7 +698,7 @@ def load_model(
 
 def main():
     parser = argparse.ArgumentParser(description="Qwen3-VL Thinking Mode Visualization Server")
-    parser.add_argument("--model-path", type=str, required=True, help="Path to model")
+    parser.add_argument("--model-path", type=str, default="Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking", help="Path to model (auto-detected from --lora-path if not provided)")
     parser.add_argument("--port", type=int, default=8501, help="Server port")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
     parser.add_argument(

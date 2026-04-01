@@ -27,19 +27,33 @@ def compute_tsne(
     Returns:
         (seq_len, 2) t-SNE coordinates
     """
+    hidden_states = np.asarray(hidden_states)
+    if hidden_states.ndim != 2:
+        raise ValueError(f"hidden_states must be 2D, got shape {hidden_states.shape}")
+
+    num_samples = hidden_states.shape[0]
+    if num_samples == 0:
+        return np.empty((0, 2), dtype=np.float32)
+    if num_samples == 1:
+        return np.zeros((1, 2), dtype=np.float32)
+
     # Downsample if sequence is too long
-    if hidden_states.shape[0] > max_samples:
-        indices = np.linspace(0, hidden_states.shape[0] - 1, max_samples, dtype=int)
+    if num_samples > max_samples:
+        indices = np.linspace(0, num_samples - 1, max_samples, dtype=int)
         sample_hidden = hidden_states[indices]
     else:
         indices = None
         sample_hidden = hidden_states
 
+    effective_perplexity = min(float(perplexity), float(sample_hidden.shape[0] - 1))
+    if effective_perplexity < 1:
+        return np.zeros((num_samples, 2), dtype=np.float32)
+
     # Compute t-SNE
     tsne = TSNE(
         n_components=2,
-        perplexity=perplexity,
-        n_iter=n_iter,
+        perplexity=effective_perplexity,
+        max_iter=n_iter,
         random_state=random_state,
         init='pca',
         learning_rate='auto',
