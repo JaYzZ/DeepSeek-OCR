@@ -84,7 +84,7 @@ reward_model:
   reward_manager: dapo_batch
   reward_kwargs:
     overlong_buffer_cfg:
-      enable: ${oc.decode:${oc.env:ENABLE_OVERLONG_BUFFER,true}}
+      enable: ${oc.decode:${oc.env:ENABLE_OVERLONG_BUFFER,false}}
       len: ${oc.decode:${oc.env:OVERLONG_BUFFER_LEN,2000}}
       penalty_factor: ${oc.decode:${oc.env:OVERLONG_PENALTY_FACTOR,0.1}}
       log: ${oc.decode:${oc.env:OVERLONG_LOG,false}}

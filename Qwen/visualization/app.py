@@ -1,52 +1,72 @@
 #!/usr/bin/env python3
 """
-vLLM Server with Thinking Mode Enabled
+Transformers-based visualization server for Qwen3-VL checkpoints.
 
-A simple HTTP server that loads vLLM once and serves inference requests.
-Supports LoRA and continuous latent AR mode for thinking.
-
-Usage:
-    # Start server
-    python vllm_server.py --model /path/to/model --port 8016
-
-    # Query
-    curl -X POST http://localhost:8016/v1/chat/completions \
-        -H "Content-Type: application/json" \
-        -d '{"messages": [{"role": "user", "content": [{"type": "image", "image": "https://example.com/img.jpg"}, {"type": "text", "text": "What is in this image?"}]}]}'
+This server keeps the existing frontend contract intact while replacing the
+backend inference path with Hugging Face generation and tracing.
 """
+
+from __future__ import annotations
 
 import argparse
 import base64
 import errno
+import io
 import json
 import os
 import socket
 import sys
 import time
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Any
 
+import numpy as np
+import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image
 from pydantic import BaseModel
-import numpy as np
+import safetensors.torch
 from tokenizers import AddedToken
+from transformers import AutoModelForVision2Seq, AutoProcessor, AutoTokenizer
+
+try:
+    from peft import PeftModel
+except ImportError:  # pragma: no cover - environment-specific
+    PeftModel = None
 
 _REPO_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
-from Qwen.scripts.vllm_utils import (
-    apply_runtime_env_for_thinking,
-    infer_tensor_parallel_size,
-    normalize_checkpoint_name,
-    parse_cuda_visible_devices,
+from Qwen.scripts.vllm_utils import apply_runtime_env_for_thinking
+from Qwen.llamafactory.integration import LatentVAE
+
+sys.path.insert(0, str(Path(__file__).parent))
+from utils.visualization_utils import compute_tsne
+
+
+DEFAULT_MODEL_PATH = "Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking"
+DEFAULT_LORA_PATH = (
+    "Qwen/checkpoints/qwen3vl-2b/verl/chimera_gspo/"
+    "run_20260401_033750/global_step_20/actor/lora_adapter"
 )
+DEFAULT_VIS_MAX_TOKENS = int(os.environ.get("QWEN_VIS_DEFAULT_MAX_TOKENS", "8192"))
+MAX_VIS_MAX_TOKENS = int(os.environ.get("QWEN_VIS_MAX_TOKENS", "8192"))
+ATTENTION_MAX_TOKENS = int(os.environ.get("QWEN_VIS_ATTENTION_MAX_TOKENS", "512"))
+TSNE_MAX_FEATURE_POINTS = int(os.environ.get("QWEN_VIS_TSNE_MAX_FEATURE_POINTS", "1500"))
 
 
 def _env_flag_enabled(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _strip_trailing_think_prompt(prompt_text: str) -> str:
+    stripped = prompt_text.rstrip()
+    while stripped.endswith("<think>"):
+        stripped = stripped[:-len("<think>")].rstrip()
+    return stripped
 
 
 def _has_data(value: Any) -> bool:
@@ -65,118 +85,963 @@ def _decode_token_text(tokenizer: Any, token_id: int) -> str:
     )
 
 
-# Set vLLM multiprocessing method BEFORE importing vLLM
-os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
-# Enable visualization data collection for the visualization server
-os.environ['VLLM_STORE_VISUALIZATION_DATA'] = '1'
+def _resolve_device(model: torch.nn.Module) -> torch.device:
+    return next(model.parameters()).device
 
-# Load runtime env before enabling plugins so YAML can control VLLM_THINKING.
-apply_runtime_env_for_thinking(repo_root=_REPO_ROOT)
-# Default to thinking mode enabled for this visualization app (can be disabled with VLLM_THINKING=0)
-THINKING_MODE_ENABLED = _env_flag_enabled("VLLM_THINKING", default="1") or _env_flag_enabled("VLLM_FORCE_THINK")
-if THINKING_MODE_ENABLED:
-    existing_plugins = [p.strip() for p in os.environ.get("VLLM_PLUGINS", "").split(",") if p.strip()]
-    if "vllm_thinking" not in existing_plugins:
-        existing_plugins.append("vllm_thinking")
-    os.environ["VLLM_PLUGINS"] = ",".join(existing_plugins)
 
-    # Import thinking mode plugin BEFORE vLLM to apply patches.
-    from vllm_thinking.runner_patch import apply_thinking_mode_patch
-else:
-    apply_thinking_mode_patch = None
+def _unwrap_base_model(model: Any) -> Any:
+    return model
 
-from vllm import LLM, SamplingParams
-from transformers import AutoProcessor
 
-# Try to import LoRARequest
-try:
-    from vllm.v1.engine import LoRARequest
-    HAS_LORA_REQUEST = True
-except ImportError:
-    HAS_LORA_REQUEST = False
-    LoRARequest = None
+def _resolve_latent_vae_module(model: Any) -> Any:
+    visited: set[int] = set()
+    stack = [model]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in visited:
+            continue
+        visited.add(id(current))
+        vae = getattr(current, "latent_vae", None)
+        if vae is not None:
+            return vae
+        for attr in ("module", "model", "base_model"):
+            child = getattr(current, attr, None)
+            if child is not None and child is not current:
+                stack.append(child)
+    return None
 
-app = FastAPI(title="Qwen3-VL Thinking Mode Visualization")
 
-# Mount static files directory
-static_dir = Path(__file__).parent / "static"
-app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+def _resolve_multimodal_core(model: Any) -> Any:
+    current = model
+    visited: set[int] = set()
+    while True:
+        if hasattr(current, "get_placeholder_mask"):
+            return current
+        current_id = id(current)
+        if current_id in visited:
+            break
+        visited.add(current_id)
+        if hasattr(current, "base_model") and current.base_model is not current:
+            current = current.base_model
+            continue
+        if hasattr(current, "model") and current.model is not current:
+            current = current.model
+            continue
+        break
+    return model
 
-# Import visualization utilities
-sys.path.insert(0, str(Path(__file__).parent))
-from utils.visualization_utils import compute_tsne, aggregate_attention, create_attention_heatmap_data, encode_image_to_base64
 
-# Import trace store utilities if thinking mode is enabled
-if THINKING_MODE_ENABLED:
-    from vllm_thinking.trace_store import get_latest_trace, get_request_trace
+def _align_module_to_model_dtype_device(model: torch.nn.Module, module: torch.nn.Module) -> None:
+    ref_tensor = None
+    for param in model.parameters():
+        if torch.is_floating_point(param):
+            ref_tensor = param
+            break
+    if ref_tensor is None:
+        for buffer in model.buffers():
+            if torch.is_floating_point(buffer):
+                ref_tensor = buffer
+                break
+    if ref_tensor is not None:
+        module.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
 
-# Global state
-llm = None
-processor = None
-lora_request = None
-config = {}
+
+def _move_batch_to_device(batch: dict[str, Any], device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
+    moved: dict[str, Any] = {}
+    for key, value in batch.items():
+        if not torch.is_tensor(value):
+            moved[key] = value
+            continue
+        if value.dtype.is_floating_point:
+            moved[key] = value.to(device=device, dtype=dtype)
+        else:
+            moved[key] = value.to(device=device)
+    return moved
+
+
+def _load_image_from_value(value: Any) -> Image.Image:
+    if isinstance(value, Image.Image):
+        return value.convert("RGB")
+    if isinstance(value, bytes):
+        return Image.open(io.BytesIO(value)).convert("RGB")
+    if isinstance(value, str):
+        if value.startswith("file://"):
+            value = value[len("file://"):]
+        if value.startswith("data:image/"):
+            _, payload = value.split(",", 1)
+            return Image.open(io.BytesIO(base64.b64decode(payload))).convert("RGB")
+        if os.path.exists(value):
+            return Image.open(value).convert("RGB")
+        try:
+            return Image.open(io.BytesIO(base64.b64decode(value))).convert("RGB")
+        except Exception as exc:  # pragma: no cover - bad user input
+            raise ValueError("Unsupported image payload") from exc
+    raise ValueError(f"Unsupported image value type: {type(value)!r}")
+
+
+def _normalize_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[Image.Image]]:
+    normalized: list[dict[str, Any]] = []
+    images: list[Image.Image] = []
+
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            normalized.append({"role": message["role"], "content": content})
+            continue
+
+        if not isinstance(content, list):
+            raise ValueError("Message content must be a string or a list")
+
+        normalized_items: list[dict[str, Any]] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "text":
+                normalized_items.append({"type": "text", "text": item.get("text", "")})
+            elif item_type == "image":
+                image_value = item.get("image") or item.get("image_url")
+                if image_value is None:
+                    raise ValueError("Image item is missing `image` or `image_url`")
+                images.append(_load_image_from_value(image_value))
+                normalized_items.append({"type": "image"})
+            else:
+                raise ValueError(f"Unsupported content type: {item_type}")
+
+        normalized.append({"role": message["role"], "content": normalized_items})
+
+    return normalized, images
+
+
+def _prepare_batch(
+    messages: list[dict[str, Any]],
+    processor: Any,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[dict[str, Any], str]:
+    normalized_messages, images = _normalize_messages(messages)
+    prompt_text = processor.apply_chat_template(
+        normalized_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    if _env_flag_enabled("VLLM_FORCE_THINK"):
+        prompt_text += "<think>"
+    else:
+        prompt_text = _strip_trailing_think_prompt(prompt_text)
+
+    processor_kwargs: dict[str, Any] = {
+        "text": [prompt_text],
+        "padding": True,
+        "return_tensors": "pt",
+    }
+    if images:
+        processor_kwargs["images"] = images
+
+    batch = processor(**processor_kwargs)
+    return _move_batch_to_device(dict(batch), device=device, dtype=dtype), prompt_text
+
+
+def _ensure_runtime_tokens(tokenizer: Any, model: torch.nn.Module) -> None:
+    special_tokens = ["<latent>", "<think_sep>"]
+    added_count = 0
+
+    for token in special_tokens:
+        encoded = tokenizer.encode(token, add_special_tokens=False)
+        if len(encoded) > 1:
+            added_count += tokenizer.add_tokens([token], special_tokens=False)
+
+    for token in special_tokens:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        added = tokenizer.added_tokens_decoder.get(token_id)
+        if added is not None and getattr(added, "special", False):
+            tokenizer._tokenizer.add_tokens([AddedToken(token, special=False)])
+
+    if added_count > 0:
+        model.resize_token_embeddings(len(tokenizer))
+
+
+def _build_language_inputs(
+    model: Any,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    *,
+    pixel_values: torch.Tensor | None = None,
+    pixel_values_videos: torch.Tensor | None = None,
+    image_grid_thw: torch.Tensor | None = None,
+    video_grid_thw: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    causal_model = _unwrap_base_model(model)
+    mm_model = _resolve_multimodal_core(model)
+    inputs_embeds = causal_model.get_input_embeddings()(input_ids)
+
+    image_mask = None
+    video_mask = None
+    deepstack_image_embeds = None
+    deepstack_video_embeds = None
+
+    if pixel_values is not None:
+        image_embeds, deepstack_image_embeds = mm_model.get_image_features(pixel_values, image_grid_thw)
+        image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+        image_mask, _ = mm_model.get_placeholder_mask(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            image_features=image_embeds,
+        )
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+    if pixel_values_videos is not None:
+        video_embeds, deepstack_video_embeds = mm_model.get_video_features(pixel_values_videos, video_grid_thw)
+        video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+        _, video_mask = mm_model.get_placeholder_mask(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            video_features=video_embeds,
+        )
+        inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+    visual_pos_masks = None
+    deepstack_visual_embeds = None
+    if image_mask is not None and video_mask is not None:
+        image_mask = image_mask[..., 0]
+        video_mask = video_mask[..., 0]
+        visual_pos_masks = image_mask | video_mask
+        deepstack_visual_embeds = []
+        image_mask_joint = image_mask[visual_pos_masks]
+        video_mask_joint = video_mask[visual_pos_masks]
+        for img_embed, vid_embed in zip(deepstack_image_embeds, deepstack_video_embeds):
+            embed_joint = img_embed.new_zeros(visual_pos_masks.sum(), img_embed.shape[-1]).to(img_embed.device)
+            embed_joint[image_mask_joint, :] = img_embed
+            embed_joint[video_mask_joint, :] = vid_embed
+            deepstack_visual_embeds.append(embed_joint)
+    elif image_mask is not None:
+        visual_pos_masks = image_mask[..., 0]
+        deepstack_visual_embeds = deepstack_image_embeds
+    elif video_mask is not None:
+        visual_pos_masks = video_mask[..., 0]
+        deepstack_visual_embeds = deepstack_video_embeds
+
+    rope_attention_mask = attention_mask
+    if rope_attention_mask is not None and rope_attention_mask.ndim == 4:
+        rope_attention_mask = torch.diagonal(rope_attention_mask[:, 0], dim1=1, dim2=2)
+        if rope_attention_mask.dtype.is_floating_point:
+            rope_attention_mask = rope_attention_mask / torch.finfo(rope_attention_mask.dtype).min
+            rope_attention_mask = (1.0 - rope_attention_mask).int()
+
+    position_ids, rope_deltas = mm_model.get_rope_index(
+        input_ids,
+        image_grid_thw,
+        video_grid_thw,
+        attention_mask=rope_attention_mask,
+    )
+    mm_model.rope_deltas = rope_deltas
+
+    return {
+        "inputs_embeds": inputs_embeds,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "visual_pos_masks": visual_pos_masks,
+        "deepstack_visual_embeds": deepstack_visual_embeds,
+    }
+
+
+def _append_attention_row(matrix: np.ndarray, row: np.ndarray) -> np.ndarray:
+    row = np.asarray(row, dtype=np.float32).reshape(-1)
+    if matrix.size == 0:
+        return row.reshape(1, 1)
+
+    prev_len = matrix.shape[0]
+    new_len = row.shape[0]
+    expanded = np.zeros((new_len, new_len), dtype=np.float32)
+    expanded[:prev_len, :prev_len] = matrix
+    expanded[new_len - 1, :new_len] = row
+    return expanded
+
+
+def _align_analysis_lengths(analysis: dict[str, Any]) -> dict[str, Any]:
+    token_count = len(analysis["tokens"])
+
+    if _has_data(analysis.get("token_embeddings")):
+        analysis["token_embeddings"] = np.asarray(analysis["token_embeddings"], dtype=np.float32)[:token_count]
+
+    if _has_data(analysis.get("hidden_states")):
+        analysis["hidden_states"] = np.asarray(analysis["hidden_states"], dtype=np.float32)[:token_count]
+
+    continuous_mask = list(analysis.get("continuous_mask", []))
+    if len(continuous_mask) < token_count:
+        continuous_mask.extend([False] * (token_count - len(continuous_mask)))
+    analysis["continuous_mask"] = continuous_mask[:token_count]
+
+    attention_weights = analysis.get("attention_weights")
+    if _has_data(attention_weights):
+        attention_array = np.asarray(attention_weights, dtype=np.float32)
+        analysis["attention_weights"] = attention_array[:token_count, :token_count]
+
+    vision_embeddings = []
+    for item in analysis.get("vision_embeddings", []):
+        position = int(item["position"])
+        if position < token_count:
+            vision_embeddings.append(item)
+    analysis["vision_embeddings"] = vision_embeddings
+
+    return analysis
+
+
+def _extract_image_token_metadata(
+    vision_embeddings: list[dict[str, Any]],
+    image_grid_thw: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    image_token_positions = [int(item["position"]) for item in vision_embeddings]
+    image_grid = None
+    if image_grid_thw is not None and torch.is_tensor(image_grid_thw) and image_grid_thw.numel() >= 3:
+        first_grid = image_grid_thw[0].detach().cpu().tolist()
+        image_grid = [int(first_grid[0]), int(first_grid[1]), int(first_grid[2])]
+    return {
+        "image_token_positions": image_token_positions,
+        "image_grid_thw": image_grid,
+    }
+
+
+def _load_vae_checkpoint_if_available(model: Any, model_path: str | None, lora_path: str | None) -> None:
+    vae = _resolve_latent_vae_module(model)
+    if vae is None:
+        return
+
+    candidate_paths: list[Path] = []
+    for base in (lora_path, model_path):
+        if not base:
+            continue
+        base_path = Path(base)
+        if base_path.is_dir():
+            candidate_paths.append(base_path / "vae.safetensors")
+
+    for checkpoint_path in candidate_paths:
+        if not checkpoint_path.exists():
+            continue
+        vae_state_dict = safetensors.torch.load_file(str(checkpoint_path))
+        vae.load_state_dict(vae_state_dict, strict=True)
+        print(f"[INFO] Loaded latent VAE from {checkpoint_path}", flush=True)
+        return
+
+
+def _ensure_latent_vae_module(model: Any, model_path: str | None, lora_path: str | None) -> None:
+    if _resolve_latent_vae_module(model) is not None:
+        return
+
+    candidate_paths: list[Path] = []
+    for base in (lora_path, model_path):
+        if not base:
+            continue
+        base_path = Path(base)
+        if base_path.is_dir():
+            candidate_paths.append(base_path / "vae.safetensors")
+
+    if not any(path.exists() for path in candidate_paths):
+        return
+
+    hidden_size = getattr(model.config, "hidden_size", None)
+    if hidden_size is None:
+        text_config = getattr(model.config, "text_config", None)
+        hidden_size = getattr(text_config, "hidden_size", None)
+    if hidden_size is None:
+        raise RuntimeError("Unable to resolve hidden_size for latent VAE creation")
+    hidden_size = int(hidden_size)
+    intermediate_size = int(os.environ.get("QWEN3VL_VAE_INTERMEDIATE_SIZE", "512"))
+    vae = LatentVAE(hidden_size=hidden_size, intermediate_size=intermediate_size, deterministic=False)
+    _align_module_to_model_dtype_device(model, vae)
+    model.register_module("latent_vae", vae)
+    print(
+        f"[INFO] Created latent VAE module for visualization: hidden_size={hidden_size} intermediate_size={intermediate_size}",
+        flush=True,
+    )
+
+
+def _prompt_has_unclosed_think(token_ids: list[int]) -> bool:
+    think_start_id = int(os.environ.get("QWEN3VL_THINKING_START_ID", "151667"))
+    think_end_id = int(os.environ.get("QWEN3VL_THINKING_END_ID", "151668"))
+    depth = 0
+    for token_id in token_ids:
+        if token_id == think_start_id:
+            depth += 1
+        elif token_id == think_end_id and depth > 0:
+            depth -= 1
+    return depth > 0
+
+
+def _apply_repetition_penalty_(logits: torch.Tensor, seen_token_ids: list[int], repetition_penalty: float) -> torch.Tensor:
+    if repetition_penalty == 1.0 or not seen_token_ids:
+        return logits
+    penalty = float(repetition_penalty)
+    if penalty <= 0.0:
+        return logits
+
+    unique_token_ids = torch.tensor(
+        sorted(set(int(token_id) for token_id in seen_token_ids)),
+        device=logits.device,
+        dtype=torch.long,
+    )
+    selected = logits.index_select(dim=-1, index=unique_token_ids)
+    adjusted = torch.where(selected < 0, selected * penalty, selected / penalty)
+    logits = logits.clone()
+    logits.scatter_(dim=-1, index=unique_token_ids, src=adjusted)
+    return logits
+
+
+def _sample_token_id(
+    logits: torch.Tensor,
+    *,
+    seen_token_ids: list[int],
+    temperature: float,
+    top_p: float,
+    repetition_penalty: float,
+) -> int:
+    step_logits = logits.reshape(-1).float()
+    step_logits = _apply_repetition_penalty_(step_logits, seen_token_ids, repetition_penalty)
+
+    temp = float(temperature)
+    nucleus_p = float(top_p)
+    if temp <= 0.0:
+        return int(step_logits.argmax(dim=-1).item())
+
+    step_logits = step_logits / max(temp, 1e-5)
+    probs = torch.softmax(step_logits, dim=-1)
+
+    if 0.0 < nucleus_p < 1.0:
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        sorted_mask = cumulative_probs > nucleus_p
+        sorted_mask[1:] = sorted_mask[:-1].clone()
+        sorted_mask[0] = False
+        filtered_probs = sorted_probs.masked_fill(sorted_mask, 0.0)
+        filtered_sum = filtered_probs.sum()
+        if torch.isfinite(filtered_sum) and filtered_sum.item() > 0:
+            filtered_probs = filtered_probs / filtered_sum
+            sampled_offset = torch.multinomial(filtered_probs, num_samples=1)
+            return int(sorted_indices[sampled_offset].item())
+
+    sampled_token = torch.multinomial(probs, num_samples=1)
+    return int(sampled_token.item())
+
+
+def _format_response_text_for_display(text: str) -> str:
+    if _env_flag_enabled("VLLM_FORCE_THINK"):
+        return text
+    if text.startswith("<think>") and "</think>" in text:
+        return text.split("</think>", 1)[1].lstrip()
+    return text
+
+
+def _generate_with_adaptive_thinking_trace(
+    model: Any,
+    tokenizer: Any,
+    batch: dict[str, Any],
+    *,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    repetition_penalty: float,
+    collect_attention: bool,
+) -> tuple[str, dict[str, Any]]:
+    causal_model = _unwrap_base_model(model)
+    embed_fn = causal_model.get_input_embeddings()
+    lm_head = causal_model.lm_head
+    core_model = _resolve_multimodal_core(model)
+    device = _resolve_device(model)
+    latent_vae = _resolve_latent_vae_module(model)
+
+    think_start_id = int(os.environ.get("QWEN3VL_THINKING_START_ID", "151667"))
+    think_end_id = int(os.environ.get("QWEN3VL_THINKING_END_ID", "151668"))
+    max_thinking_steps = int(os.environ.get("QWEN3VL_MAX_THINKING_STEPS", str(max_new_tokens // 2 if max_new_tokens > 1 else 1)))
+    min_continuous_steps = max(0, int(os.environ.get("MIN_CONTINUOUS_STEPS", "0")))
+
+    input_ids = batch["input_ids"]
+    prompt_len = int(input_ids.shape[1])
+    full_attention_mask = torch.ones_like(input_ids, device=device)
+    language_inputs = _build_language_inputs(
+        causal_model,
+        input_ids,
+        full_attention_mask,
+        pixel_values=batch.get("pixel_values"),
+        pixel_values_videos=batch.get("pixel_values_videos"),
+        image_grid_thw=batch.get("image_grid_thw"),
+        video_grid_thw=batch.get("video_grid_thw"),
+    )
+
+    with torch.inference_mode():
+        prompt_outputs = core_model(
+            input_ids=input_ids,
+            attention_mask=language_inputs["attention_mask"],
+            position_ids=None,
+            inputs_embeds=None,
+            pixel_values=batch.get("pixel_values"),
+            pixel_values_videos=batch.get("pixel_values_videos"),
+            image_grid_thw=batch.get("image_grid_thw"),
+            video_grid_thw=batch.get("video_grid_thw"),
+            output_attentions=collect_attention,
+            return_dict=True,
+            use_cache=True,
+        )
+
+    prompt_token_ids = input_ids[0].detach().cpu().tolist()
+    token_ids = list(prompt_token_ids)
+    token_embedding_matrix = embed_fn.weight.detach()
+    token_embeddings_rows = [row for row in language_inputs["inputs_embeds"][0].detach().float().cpu().numpy()]
+    hidden_state_rows = [row for row in prompt_outputs.last_hidden_state[0].detach().float().cpu().numpy()]
+    continuous_mask = [False] * prompt_len
+    generated_token_ids: list[int] = []
+    latent_embedding_rows: list[np.ndarray] = []
+
+    last_layer_attention = np.empty((0, 0), dtype=np.float32)
+    if collect_attention and prompt_outputs.attentions:
+        last_layer_attention = prompt_outputs.attentions[-1][0].detach().float().mean(dim=0).cpu().numpy()
+
+    vision_embeddings: list[dict[str, Any]] = []
+    visual_mask = language_inputs["visual_pos_masks"]
+    if visual_mask is not None:
+        visual_positions = torch.nonzero(visual_mask[0], as_tuple=False).flatten().tolist()
+        for position in visual_positions:
+            vision_embeddings.append(
+                {
+                    "position": int(position),
+                    "embedding": np.asarray(token_embeddings_rows[position], dtype=np.float32),
+                }
+            )
+
+    kv_cache = prompt_outputs.past_key_values
+    state = "continuous" if _prompt_has_unclosed_think(prompt_token_ids) else "discrete"
+    thinking_steps = 0
+    current_hidden = prompt_outputs.last_hidden_state[:, -1:, :]
+    current_attn_row = (
+        prompt_outputs.attentions[-1][0].detach().float().mean(dim=0)[-1]
+        if collect_attention and getattr(prompt_outputs, "attentions", None)
+        else None
+    )
+
+    def _record_step(
+        token_id: int,
+        token_embed: torch.Tensor,
+        hidden: torch.Tensor,
+        attn_row: torch.Tensor | None,
+        *,
+        is_continuous: bool,
+        latent_embed: torch.Tensor | None,
+    ) -> None:
+        nonlocal last_layer_attention
+        token_ids.append(int(token_id))
+        generated_token_ids.append(int(token_id))
+        token_embeddings_rows.append(token_embed[0, 0].detach().float().cpu().numpy())
+        hidden_state_rows.append(hidden[0, 0].detach().float().cpu().numpy())
+        continuous_mask.append(bool(is_continuous))
+        if latent_embed is not None:
+            latent_embedding_rows.append(latent_embed[0, 0].detach().float().cpu().numpy())
+        if collect_attention and attn_row is not None:
+            last_layer_attention = _append_attention_row(last_layer_attention, attn_row.detach().float().cpu().numpy())
+
+    with torch.inference_mode():
+        while len(generated_token_ids) < max_new_tokens:
+            next_token = _sample_token_id(
+                lm_head(current_hidden),
+                seen_token_ids=token_ids,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+            )
+            token_tensor = torch.tensor([[next_token]], dtype=torch.long, device=device)
+            token_embed = token_embedding_matrix[next_token:next_token + 1].unsqueeze(0).to(
+                device=current_hidden.device,
+                dtype=current_hidden.dtype,
+            )
+
+            mode_after_step = state
+            if THINKING_MODE_ENABLED:
+                if state == "discrete" and next_token == think_start_id:
+                    mode_after_step = "continuous"
+                    thinking_steps = 0
+                elif state == "continuous":
+                    forced_exit = thinking_steps >= max_thinking_steps
+                    natural_exit = next_token == think_end_id and thinking_steps >= min_continuous_steps
+                    if forced_exit or natural_exit:
+                        mode_after_step = "discrete"
+                        thinking_steps = 0
+
+            next_input_ids = token_tensor
+            next_input_embeds = None
+            latent_embed = None
+            if mode_after_step == "continuous":
+                latent_embed = current_hidden
+                if latent_vae is not None:
+                    if next(latent_vae.parameters()).device != current_hidden.device or next(latent_vae.parameters()).dtype != current_hidden.dtype:
+                        latent_vae = latent_vae.to(device=current_hidden.device, dtype=current_hidden.dtype)
+                    vae_dist = latent_vae.forward(current_hidden, temperature=1.0)
+                    latent_embed = vae_dist.rsample()
+                next_input_ids = None
+                next_input_embeds = latent_embed
+                thinking_steps += 1
+
+            _record_step(
+                next_token,
+                token_embed,
+                current_hidden,
+                current_attn_row,
+                is_continuous=(mode_after_step == "continuous"),
+                latent_embed=latent_embed if mode_after_step == "continuous" else None,
+            )
+
+            state = mode_after_step
+            if state != "continuous" and next_token == tokenizer.eos_token_id:
+                break
+
+            cache_position = torch.tensor([prompt_len + len(generated_token_ids) - 1], dtype=torch.long, device=device)
+            decode_attention_mask = torch.ones(
+                (1, prompt_len + len(generated_token_ids)),
+                dtype=torch.long,
+                device=device,
+            )
+            outputs = core_model(
+                input_ids=next_input_ids,
+                inputs_embeds=next_input_embeds,
+                attention_mask=decode_attention_mask,
+                past_key_values=kv_cache,
+                cache_position=cache_position,
+                use_cache=True,
+                output_attentions=collect_attention,
+                return_dict=True,
+            )
+            kv_cache = outputs.past_key_values
+            current_hidden = outputs.last_hidden_state[:, -1:, :]
+            current_attn_row = (
+                outputs.attentions[-1][0].detach().float().mean(dim=0)[0]
+                if collect_attention and getattr(outputs, "attentions", None)
+                else None
+            )
+
+    tokens = []
+    for position, token_id in enumerate(token_ids):
+        tokens.append(
+            {
+                "id": int(token_id),
+                "text": _decode_token_text(tokenizer, token_id),
+                "position": position,
+            }
+        )
+
+    response_text = tokenizer.decode(
+        generated_token_ids,
+        skip_special_tokens=False,
+        clean_up_tokenization_spaces=False,
+    )
+
+    analysis = {
+        "tokens": tokens,
+        "token_embeddings": np.asarray(token_embeddings_rows, dtype=np.float32),
+        "hidden_states": np.asarray(hidden_state_rows, dtype=np.float32),
+        "attention_weights": last_layer_attention,
+        "vision_embeddings": vision_embeddings,
+        "continuous_mask": continuous_mask,
+        "prompt_token_count": prompt_len,
+        "completion_token_count": len(generated_token_ids),
+        "latent_embeddings": np.asarray(latent_embedding_rows, dtype=np.float32) if latent_embedding_rows else None,
+        "image_token_metadata": _extract_image_token_metadata(
+            vision_embeddings,
+            batch.get("image_grid_thw"),
+        ),
+    }
+    return _format_response_text_for_display(response_text), _align_analysis_lengths(analysis)
+
+
+def _collect_sequence_analysis(
+    model: Any,
+    tokenizer: Any,
+    generated_sequences: torch.Tensor,
+    generation_batch: dict[str, Any],
+    *,
+    collect_attention: bool,
+) -> dict[str, Any]:
+    full_input_ids = generated_sequences
+    full_attention_mask = torch.ones_like(full_input_ids, device=full_input_ids.device)
+
+    language_inputs = _build_language_inputs(
+        model,
+        full_input_ids,
+        full_attention_mask,
+        pixel_values=generation_batch.get("pixel_values"),
+        pixel_values_videos=generation_batch.get("pixel_values_videos"),
+        image_grid_thw=generation_batch.get("image_grid_thw"),
+        video_grid_thw=generation_batch.get("video_grid_thw"),
+    )
+
+    with torch.inference_mode():
+        outputs = model.language_model(
+            input_ids=None,
+            inputs_embeds=language_inputs["inputs_embeds"],
+            attention_mask=language_inputs["attention_mask"],
+            position_ids=language_inputs["position_ids"],
+            visual_pos_masks=language_inputs["visual_pos_masks"],
+            deepstack_visual_embeds=language_inputs["deepstack_visual_embeds"],
+            output_attentions=collect_attention,
+            output_hidden_states=True,
+            return_dict=True,
+            use_cache=False,
+        )
+
+    token_ids = full_input_ids[0].detach().cpu().tolist()
+    token_embeddings = language_inputs["inputs_embeds"][0].detach().float().cpu().numpy()
+    hidden_states = outputs.hidden_states[-1][0].detach().float().cpu().numpy()
+
+    last_layer_attention = None
+    if collect_attention and outputs.attentions:
+        last_layer_attention = outputs.attentions[-1][0].detach().float().mean(dim=0).cpu().numpy()
+
+    vision_embeddings: list[dict[str, Any]] = []
+    visual_mask = language_inputs["visual_pos_masks"]
+    if visual_mask is not None:
+        visual_positions = torch.nonzero(visual_mask[0], as_tuple=False).flatten().tolist()
+        for position in visual_positions:
+            vision_embeddings.append(
+                {
+                    "position": int(position),
+                    "embedding": token_embeddings[position].astype(np.float32),
+                }
+            )
+
+    tokens = []
+    for position, token_id in enumerate(token_ids):
+        tokens.append(
+            {
+                "id": int(token_id),
+                "text": _decode_token_text(tokenizer, token_id),
+                "position": position,
+            }
+        )
+
+    return _align_analysis_lengths({
+        "tokens": tokens,
+        "token_embeddings": token_embeddings,
+        "hidden_states": hidden_states,
+        "attention_weights": last_layer_attention,
+        "vision_embeddings": vision_embeddings,
+        "continuous_mask": [False] * len(tokens),
+        "image_token_metadata": _extract_image_token_metadata(
+            vision_embeddings,
+            generation_batch.get("image_grid_thw"),
+        ),
+    })
+
+
+def _build_tsne_payload(
+    tokens: list[dict[str, Any]],
+    token_embeddings: np.ndarray | None,
+    hidden_states: np.ndarray | None,
+    latent_embeddings: np.ndarray | None,
+    vision_embeddings: list[dict[str, Any]],
+    continuous_mask: list[bool],
+    model_config: Any,
+) -> tuple[list[list[float]] | None, list[str], list[int]]:
+    if not _has_data(token_embeddings) and not _has_data(hidden_states) and not _has_data(latent_embeddings) and not vision_embeddings:
+        return None, [], []
+
+    vision_pos_to_embedding = {item["position"]: np.asarray(item["embedding"]).reshape(-1) for item in vision_embeddings}
+
+    all_features: list[np.ndarray] = []
+    feature_types: list[str] = []
+    position_indices: list[int] = []
+
+    for idx, token in enumerate(tokens):
+        is_true_visual_token = token["position"] in vision_pos_to_embedding
+
+        if is_true_visual_token:
+            all_features.append(vision_pos_to_embedding[token["position"]])
+            feature_types.append("image_token")
+            position_indices.append(idx)
+
+        if _has_data(token_embeddings) and idx < len(token_embeddings):
+            emb = np.asarray(token_embeddings[idx]).reshape(-1)
+            if emb.size > 0:
+                all_features.append(emb)
+                feature_types.append("image_token" if is_true_visual_token else "token_emb")
+                position_indices.append(idx)
+
+        if _has_data(hidden_states) and idx < len(hidden_states):
+            hs = np.asarray(hidden_states[idx]).reshape(-1)
+            if hs.size > 0:
+                all_features.append(hs)
+                feature_types.append("image_token" if is_true_visual_token else "hidden_state")
+                position_indices.append(idx)
+
+        if idx < len(continuous_mask) and continuous_mask[idx] and _has_data(latent_embeddings):
+            latent_idx = sum(1 for flag in continuous_mask[:idx + 1] if flag) - 1
+            if 0 <= latent_idx < len(latent_embeddings):
+                latent = np.asarray(latent_embeddings[latent_idx]).reshape(-1)
+                if latent.size > 0:
+                    all_features.append(latent)
+                    feature_types.append("vae_sample")
+                    position_indices.append(idx)
+
+    if not all_features:
+        return None, [], []
+
+    if len(all_features) > TSNE_MAX_FEATURE_POINTS:
+        sample_indices = np.linspace(0, len(all_features) - 1, TSNE_MAX_FEATURE_POINTS, dtype=int)
+        all_features = [all_features[idx] for idx in sample_indices]
+        feature_types = [feature_types[idx] for idx in sample_indices]
+        position_indices = [position_indices[idx] for idx in sample_indices]
+
+    feature_matrix = np.vstack(all_features)
+    tsne_coords = compute_tsne(feature_matrix)
+    return tsne_coords.tolist(), feature_types, position_indices
 
 
 class ChatMessage(BaseModel):
     role: str
-    content: Any  # Can be string or list of dicts
+    content: Any
 
 
 class ChatCompletionRequest(BaseModel):
-    messages: List[ChatMessage]
+    messages: list[ChatMessage]
     temperature: float = 0.0
-    max_tokens: int = 8192
+    max_tokens: int = DEFAULT_VIS_MAX_TOKENS
     top_p: float = 1.0
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
     stream: bool = False
 
 
-def run_llm_generation(
-    messages: List[Dict[str, Any]],
+app = FastAPI(title="Qwen3-VL Thinking Mode Visualization")
+static_dir = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+apply_runtime_env_for_thinking(repo_root=_REPO_ROOT)
+THINKING_MODE_ENABLED = _env_flag_enabled("VLLM_THINKING", default="1") or _env_flag_enabled("VLLM_FORCE_THINK")
+
+model = None
+processor = None
+tokenizer = None
+config: dict[str, Any] = {}
+
+
+def resolve_model_path(model_path: str | None, lora_path: str | None) -> str:
+    if not lora_path:
+        if not model_path:
+            raise ValueError("Either --model-path or --lora-path must be provided")
+        return model_path
+
+    adapter_config_path = Path(lora_path) / "adapter_config.json"
+    if not adapter_config_path.exists():
+        if not model_path:
+            raise ValueError(f"No adapter_config.json found in {lora_path}")
+        return model_path
+
+    with open(adapter_config_path, "r", encoding="utf-8") as handle:
+        adapter_config = json.load(handle)
+    return adapter_config.get("base_model_name_or_path") or model_path
+
+
+def load_model(
+    model_path: str | None,
+    *,
+    lora_path: str | None,
+    gpu_memory_utilization: float,
+) -> None:
+    global model, processor, tokenizer, config
+
+    resolved_model_path = resolve_model_path(model_path, lora_path)
+    print(f"\n{'=' * 80}")
+    print("Loading Hugging Face model...")
+    print(f"{'=' * 80}")
+    print(f"Model: {resolved_model_path}")
+    if lora_path:
+        print(f"LoRA: {lora_path}")
+    print(f"{'=' * 80}\n")
+
+    start_time = time.time()
+    load_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+    processor = AutoProcessor.from_pretrained(resolved_model_path, trust_remote_code=True)
+    tokenizer = getattr(processor, "tokenizer", None) or AutoTokenizer.from_pretrained(
+        resolved_model_path,
+        trust_remote_code=True,
+    )
+    model = AutoModelForVision2Seq.from_pretrained(
+        resolved_model_path,
+        trust_remote_code=True,
+        torch_dtype=load_dtype,
+        device_map="auto" if torch.cuda.is_available() else "cpu",
+    )
+    _ensure_runtime_tokens(tokenizer, model)
+
+    if lora_path:
+        if PeftModel is None:
+            raise RuntimeError("peft is required to load LoRA adapters")
+        model = PeftModel.from_pretrained(model, lora_path)
+
+    model.eval()
+    setattr(model, "tokenizer", tokenizer)
+    _ensure_latent_vae_module(model, resolved_model_path, lora_path)
+    _load_vae_checkpoint_if_available(model, resolved_model_path, lora_path)
+    print(f"Loaded model in {time.time() - start_time:.2f}s", flush=True)
+
+    config = {
+        "backend": "hf",
+        "model_path": resolved_model_path,
+        "requested_model_path": model_path,
+        "lora_path": lora_path,
+        "thinking_enabled": THINKING_MODE_ENABLED,
+    }
+
+
+def run_generation(
+    messages: list[dict[str, Any]],
     *,
     temperature: float,
     max_tokens: int,
-    top_p: float = 1.0,
-    presence_penalty: float = 0.0,
-    repetition_penalty: float = 1.0,
-):
-    global llm, processor, lora_request
-
-    vllm_input = prepare_inputs_for_vllm(messages, processor)
-    sampling_params = SamplingParams(
-        max_tokens=max_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        presence_penalty=presence_penalty,
-        repetition_penalty=repetition_penalty,
-        stop_token_ids=[151643, 151645],
-        skip_special_tokens=False,
+    top_p: float,
+    repetition_penalty: float,
+) -> tuple[str, dict[str, Any]]:
+    if model is None or processor is None or tokenizer is None:
+        raise RuntimeError("Model is not loaded")
+    effective_max_tokens = max(1, min(int(max_tokens), MAX_VIS_MAX_TOKENS))
+    device = _resolve_device(model)
+    model_dtype = next(param.dtype for param in model.parameters() if torch.is_floating_point(param))
+    batch, _ = _prepare_batch(messages, processor, device=device, dtype=model_dtype)
+    collect_attention = effective_max_tokens <= ATTENTION_MAX_TOKENS
+    response_text, analysis = _generate_with_adaptive_thinking_trace(
+        model,
+        tokenizer,
+        batch,
+        max_new_tokens=effective_max_tokens,
+        temperature=float(temperature),
+        top_p=float(top_p),
+        repetition_penalty=float(repetition_penalty),
+        collect_attention=collect_attention,
     )
-    outputs = llm.generate(
-        [vllm_input],
-        sampling_params=sampling_params,
-        lora_request=lora_request,
+    tsne_coordinates, tsne_feature_types, tsne_position_indices = _build_tsne_payload(
+        analysis["tokens"],
+        analysis.get("token_embeddings"),
+        analysis.get("hidden_states"),
+        analysis.get("latent_embeddings"),
+        analysis.get("vision_embeddings", []),
+        analysis.get("continuous_mask", []),
+        getattr(model, "config", None),
     )
-    output = outputs[0]
-    response_text = output.outputs[0].text
-    return output, response_text
+    analysis["tsne_coordinates"] = tsne_coordinates
+    analysis["tsne_feature_types"] = tsne_feature_types
+    analysis["tsne_position_indices"] = tsne_position_indices
+    return response_text, analysis
 
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
     return {
         "status": "healthy",
-        "model_loaded": llm is not None,
+        "model_loaded": model is not None,
         "checkpoint_path": config.get("lora_path") or config.get("model_path"),
+        "backend": config.get("backend"),
         "thinking_enabled": config.get("thinking_enabled", False),
     }
 
 
 @app.get("/v1/models")
 async def list_models():
-    """OpenAI-compatible model listing."""
     model_id = Path(config.get("requested_model_path") or config.get("model_path") or "unknown").name
     return {
         "object": "list",
@@ -192,265 +1057,143 @@ async def list_models():
 
 @app.get("/stats")
 async def stats():
-    """Get server statistics."""
     return {
+        "backend": config.get("backend"),
         "model_path": config.get("model_path"),
         "lora_path": config.get("lora_path"),
-        "tensor_parallel_size": config.get("tensor_parallel_size"),
-        "gpu_memory_utilization": config.get("gpu_memory_utilization"),
         "thinking_enabled": config.get("thinking_enabled", False),
     }
 
 
-# ============================================================================
-# Visualization-specific endpoints
-# ============================================================================
-
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    """Serve the main visualization interface."""
-    static_dir = Path(__file__).parent / "static"
     index_path = static_dir / "index.html"
-    with open(index_path, 'r') as f:
-        return HTMLResponse(content=f.read())
+    with open(index_path, "r", encoding="utf-8") as handle:
+        return HTMLResponse(content=handle.read())
 
 
 @app.get("/api/example")
 async def get_example():
-    """Get default deepvision example."""
-    # Load first example from deepvision data
     deepvision_path = _REPO_ROOT / "Qwen/data/deepvision_103k_sft.jsonl"
-    if deepvision_path.exists():
-        with open(deepvision_path, 'r') as f:
-            first_line = f.readline()
-            example = json.loads(first_line)
-
-        # Extract image and question
-        image_path = example.get("images", [None])[0]
-        messages = example.get("messages", [])
-        question = ""
-        for msg in messages:
-            if msg.get("role") == "user":
-                content = msg.get("content", "")
-                # Remove <image> tag if present
-                question = content.replace("<image>\n", "")
-                break
-
-        # Encode image to base64
-        image_base64 = None
-        if image_path and Path(image_path).exists():
-            with open(image_path, 'rb') as f:
-                image_bytes = f.read()
-            image_base64 = base64.b64encode(image_bytes).decode('utf-8')
-
-        return {
-            "image_base64": image_base64,
-            "question": question,
-            "answer": messages[-1].get("content", "") if messages else "",
-        }
-    else:
+    if not deepvision_path.exists():
         raise HTTPException(status_code=404, detail="Deepvision data file not found")
+
+    with open(deepvision_path, "r", encoding="utf-8") as handle:
+        example = json.loads(handle.readline())
+
+    image_path = example.get("images", [None])[0]
+    messages = example.get("messages", [])
+    question = ""
+    for message in messages:
+        if message.get("role") == "user":
+            question = message.get("content", "").replace("<image>\n", "")
+            break
+
+    image_base64 = None
+    if image_path and Path(image_path).exists():
+        with open(image_path, "rb") as handle:
+            image_base64 = base64.b64encode(handle.read()).decode("utf-8")
+
+    return {
+        "image_base64": image_base64,
+        "question": question,
+        "answer": messages[-1].get("content", "") if messages else "",
+    }
 
 
 @app.post("/api/infer")
-async def infer_vis(request: Dict[str, Any]):
-    """Run inference with thinking mode and return visualization data."""
-    global llm, processor, lora_request
-
-    if llm is None:
+async def infer_vis(request: dict[str, Any]):
+    if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     try:
-        # Prepare messages from request
         text = request.get("text", "")
         image_base64 = request.get("image_base64")
-        max_tokens = request.get("max_tokens", 8192)
+        requested_max_tokens = int(request.get("max_tokens", DEFAULT_VIS_MAX_TOKENS))
+        max_tokens = max(1, min(requested_max_tokens, MAX_VIS_MAX_TOKENS))
         temperature = request.get("temperature", 0.7)
+        start_time = time.time()
 
-        messages = []
+        messages: list[dict[str, Any]]
         if image_base64:
-            # For vLLM, use the image directly as bytes
-            import io
-            from PIL import Image
-            image_bytes = base64.b64decode(image_base64)
-            image = Image.open(io.BytesIO(image_bytes))
-            messages.append({
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": text},
-                ],
-            })
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image_base64},
+                        {"type": "text", "text": text},
+                    ],
+                }
+            ]
         else:
-            messages.append({
-                "role": "user",
-                "content": text,
-            })
+            messages = [{"role": "user", "content": text}]
 
-        # Run inference
-        output, response_text = run_llm_generation(
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
+        print(
+            f"[infer] start prompt_chars={len(text)} image={bool(image_base64)} "
+            f"requested_max_tokens={requested_max_tokens} effective_max_tokens={max_tokens}",
+            flush=True,
         )
 
-        # Collect trace data for visualization
-        trace_data = {
-            "tokens": [],
-            "hidden_states": None,
-            "attention_weights": None,
-            "continuous_mask": [],
-            "tsne_coordinates": None,
-        }
+        response_text, analysis = run_generation(
+            messages,
+            temperature=float(temperature),
+            max_tokens=int(max_tokens),
+            top_p=1.0,
+            repetition_penalty=1.0,
+        )
 
-        if THINKING_MODE_ENABLED:
-            try:
-                request_id = getattr(output, "request_id", None)
-                trace = get_request_trace(request_id) if request_id is not None else None
-                if trace is None:
-                    trace = get_latest_trace()
+        tsne_coordinates = analysis.get("tsne_coordinates")
+        tsne_feature_types = analysis.get("tsne_feature_types", [])
+        tsne_position_indices = analysis.get("tsne_position_indices", [])
 
-                output_token_ids = list(output.outputs[0].token_ids)
-                token_ids = output_token_ids
-                if trace and _has_data(trace.get("all_token_ids", [])):
-                    trace_token_ids = list(trace.get("all_token_ids", []))
-                    # Only trust trace token ids when they are at least as complete
-                    # as the RequestOutput sequence for this request.
-                    if len(trace_token_ids) >= len(output_token_ids):
-                        token_ids = trace_token_ids
-
-                for i, token_id in enumerate(token_ids):
-                    token_text = _decode_token_text(processor.tokenizer, token_id)
-                    trace_data["tokens"].append({
-                        'id': int(token_id),
-                        'text': token_text,
-                        'position': i,
-                    })
-
-                if trace:
-                    # Extract hidden states, token embeddings, and latent embeddings
-                    token_hidden_states = trace.get('all_hidden_states', [])
-                    token_embeddings = trace.get('all_token_embeddings', [])
-                    latent_embeddings = trace.get('continuous_latent_embeddings', [])
-                    continuous_mask = trace.get('continuous_token_mask', [])
-                    attention_weights = trace.get('attention_weights', [])
-
-                    # Debug logging
-                    print(f"[DEBUG] token_hidden_states: {len(token_hidden_states) if _has_data(token_hidden_states) else 0} items")
-                    print(f"[DEBUG] token_embeddings: {len(token_embeddings) if _has_data(token_embeddings) else 0} items")
-                    print(f"[DEBUG] latent_embeddings: {len(latent_embeddings) if _has_data(latent_embeddings) else 0} items")
-
-                    trace_data["continuous_mask"] = np.asarray(continuous_mask, dtype=np.bool_).tolist()
-
-                    # Compute t-SNE if we have any feature type available
-                    if _has_data(token_hidden_states) or _has_data(token_embeddings) or _has_data(latent_embeddings):
-                        # Prepare features for t-SNE: combine all three types
-                        # For each position, we'll have up to 3 feature vectors
-                        all_features = []
-                        feature_types = []  # 'token_emb', 'hidden_state', 'vae_sample'
-                        position_indices = []
-
-                        for i in range(len(trace_data["tokens"])):
-                            is_continuous = i < len(continuous_mask) and continuous_mask[i]
-
-                            # 1. Token embedding (if available)
-                            if _has_data(token_embeddings) and i < len(token_embeddings):
-                                te = np.asarray(token_embeddings[i])
-                                if te.ndim > 1:
-                                    te = te.reshape(-1)
-                                if te.size > 0:
-                                    all_features.append(te)
-                                    feature_types.append('token_emb')
-                                    position_indices.append(i)
-
-                            # 2. Hidden state (if available)
-                            if _has_data(token_hidden_states) and i < len(token_hidden_states):
-                                hs = np.asarray(token_hidden_states[i])
-                                if hs.ndim > 1:
-                                    hs = hs.reshape(-1)
-                                if hs.size > 0:
-                                    all_features.append(hs)
-                                    feature_types.append('hidden_state')
-                                    position_indices.append(i)
-
-                            # 3. VAE sample (only for continuous tokens)
-                            if is_continuous and _has_data(latent_embeddings):
-                                # Find the corresponding latent embedding
-                                latent_idx = sum(continuous_mask[:i])  # count continuous tokens before this position
-                                if latent_idx < len(latent_embeddings):
-                                    le = np.asarray(latent_embeddings[latent_idx])
-                                    if le.ndim > 1:
-                                        le = le.reshape(-1)
-                                    if le.size > 0:
-                                        all_features.append(le)
-                                        feature_types.append('vae_sample')
-                                        position_indices.append(i)
-
-                        if all_features:
-                            # Stack all features and compute t-SNE
-                            feature_matrix = np.vstack(all_features)
-                            tsne_coords = compute_tsne(feature_matrix)
-                            trace_data["tsne_coordinates"] = tsne_coords.tolist()
-                            trace_data["tsne_feature_types"] = feature_types
-                            trace_data["tsne_position_indices"] = position_indices
-                            print(f"[DEBUG] Computed t-SNE with {len(feature_types)} features: {feature_types[:10]}...")  # Show first 10
-                        else:
-                            print(f"[DEBUG] No features collected for t-SNE")
-
-                    if _has_data(attention_weights):
-                        trace_data["attention_weights"] = np.asarray(attention_weights).tolist()
-
-            except Exception as e:
-                print(f"Warning: Failed to collect trace data: {e}")
+        elapsed = time.time() - start_time
+        print(
+            f"[infer] done completion_tokens={analysis['completion_token_count']} "
+            f"total_tokens={len(analysis['tokens'])} elapsed_s={elapsed:.2f}",
+            flush=True,
+        )
 
         return {
             "answer": response_text,
-            "tokens": trace_data["tokens"],
-            "hidden_states": trace_data["hidden_states"],
-            "attention_weights": trace_data["attention_weights"],
-            "continuous_mask": trace_data["continuous_mask"],
-            "tsne_coordinates": trace_data["tsne_coordinates"],
-            "tsne_feature_types": trace_data.get("tsne_feature_types", []),
-            "tsne_position_indices": trace_data.get("tsne_position_indices", []),
+            "tokens": analysis["tokens"],
+            "hidden_states": None,
+            "attention_weights": analysis["attention_weights"].tolist() if _has_data(analysis["attention_weights"]) else None,
+            "continuous_mask": analysis["continuous_mask"],
+            "tsne_coordinates": tsne_coordinates,
+            "tsne_feature_types": tsne_feature_types,
+            "tsne_position_indices": tsne_position_indices,
             "token_metadata": {
-                "total_tokens": len(trace_data["tokens"]),
-                "continuous_tokens": sum(trace_data["continuous_mask"]),
+                "total_tokens": len(analysis["tokens"]),
+                "continuous_tokens": sum(1 for flag in analysis["continuous_mask"] if flag),
+                "prompt_token_count": analysis["prompt_token_count"],
+                "image_token_positions": analysis.get("image_token_metadata", {}).get("image_token_positions", []),
+                "image_grid_thw": analysis.get("image_token_metadata", {}).get("image_grid_thw"),
             },
         }
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
-
+    except Exception as exc:
+        print(f"[infer] failed: {exc}", flush=True)
+        raise HTTPException(status_code=500, detail=f"Inference error: {exc}") from exc
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
-    """Chat completion endpoint."""
-    global llm, processor, lora_request
-
-    if llm is None:
+    if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
+    if request.stream:
+        raise HTTPException(status_code=501, detail="Streaming is not implemented for the HF backend")
+
     try:
-        # Convert messages to vLLM format
-        messages = [{"role": m.role, "content": m.content} for m in request.messages]
-        output, response_text = run_llm_generation(
+        messages = [{"role": message.role, "content": message.content} for message in request.messages]
+        response_text, analysis = run_generation(
             messages,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            top_p=request.top_p,
-            presence_penalty=request.presence_penalty,
-            repetition_penalty=request.repetition_penalty,
+            temperature=float(request.temperature),
+            max_tokens=int(request.max_tokens),
+            top_p=float(request.top_p),
+            repetition_penalty=float(request.repetition_penalty),
         )
-
-        # DEBUG: Print raw output to see if thinking tokens exist (only if VLLM_DEBUG=1)
-        if os.environ.get("VLLM_DEBUG", "0") == "1":
-            print(f"[DEBUG] Raw response_text: {repr(response_text[:500])}")
-
         return {
-            "id": "chatcmpl-" + str(int(time.time())),
+            "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": config.get("model_path"),
@@ -459,325 +1202,68 @@ async def chat_completions(request: ChatCompletionRequest):
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": response_text
+                        "content": response_text,
                     },
-                    "finish_reason": "stop"
+                    "finish_reason": "stop",
                 }
             ],
             "usage": {
-                "prompt_tokens": output.prompt_token_ids,
-                "completion_tokens": len(output.outputs[0].token_ids),
-                "total_tokens": len(output.prompt_token_ids) + len(output.outputs[0].token_ids)
-            }
+                "prompt_tokens": analysis["prompt_token_count"],
+                "completion_tokens": analysis["completion_token_count"],
+                "total_tokens": analysis["prompt_token_count"] + analysis["completion_token_count"],
+            },
         }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/v1/completions")
-async def completions(request: Dict):
-    """Legacy completion endpoint."""
+async def completions(_: dict[str, Any]):
     raise HTTPException(status_code=501, detail="Use /v1/chat/completions instead")
 
 
-def prepare_inputs_for_vllm(messages, processor):
-    """Prepare messages for vLLM input."""
-    # Use processor to convert messages to tokenizer format
-    # This handles image URLs, base64, etc.
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    # Manually add generation prompt as per repo's common practice
-    text = text + "<|im_start|>assistant\n"
-    if _env_flag_enabled("VLLM_FORCE_THINK"):
-        text = text + "<think>"
-
-    # Extract media from messages and, if provided, preserve benchmark-specific
-    # min/max pixel constraints (MathVision/RealWorldQA/etc).
-    images = []
-    videos = []
-    min_pixels = None
-    max_pixels = None
-    for msg in messages:
-        content = msg.get("content", [])
-        if isinstance(content, list):
-            for item in content:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("type") == "image":
-                    img = item.get("image")
-                    if img:
-                        # ODinW jobs may emit "file:///abs/path". vLLM/HF processors generally
-                        # expect a plain filesystem path for local files.
-                        if isinstance(img, str) and img.startswith("file://"):
-                            img = img[len("file://"):]
-                        images.append(img)
-                    # Preserve any per-image resolution constraints if present.
-                    if min_pixels is None and "min_pixels" in item:
-                        min_pixels = item.get("min_pixels")
-                    if max_pixels is None and "max_pixels" in item:
-                        max_pixels = item.get("max_pixels")
-                elif item.get("type") == "video":
-                    vid = item.get("video")
-                    if vid:
-                        if isinstance(vid, str) and vid.startswith("file://"):
-                            vid = vid[len("file://"):]
-                        videos.append(vid)
-
-    if images:
-        # Multi-modal input
-        if min_pixels is None:
-            min_pixels = getattr(processor.image_processor, "min_pixels", 28 * 28 * 256)
-        if max_pixels is None:
-            max_pixels = getattr(processor.image_processor, "max_pixels", 28 * 28 * 2048)
-
-        mm_data = {}
-        if images:
-            mm_data["image"] = images
-        if videos:
-            mm_data["video"] = videos
-
-        return {
-            "prompt": text,
-            "multi_modal_data": mm_data,
-            "mm_processor_kwargs": {
-                "min_pixels": min_pixels,
-                "max_pixels": max_pixels,
-            },
-        }
-    else:
-        # Text only
-        return text
-
-
-def resolve_model_path(model_path: str | None, lora_path: str | None) -> str:
-    """Mirror backfill behavior: prefer adapter-declared base model for LoRA checkpoints."""
-    if not lora_path:
-        if not model_path:
-            raise ValueError("Either --model-path or --lora-path must be provided")
-        return model_path
-
-    adapter_config_path = Path(lora_path) / "adapter_config.json"
-    if not adapter_config_path.exists():
-        if not model_path:
-            raise ValueError(f"No adapter_config.json found in {lora_path}, and no --model-path provided")
-        return model_path
-
-    try:
-        with open(adapter_config_path, "r", encoding="utf-8") as f:
-            adapter_config = json.load(f)
-        resolved = adapter_config.get("base_model_name_or_path") or model_path
-        print(f"Detected LoRA adapter. Using base model: {resolved}")
-        return resolved
-    except Exception as exc:
-        print(f"Warning: failed to read {adapter_config_path}: {exc}")
-        if not model_path:
-            raise ValueError(f"Failed to read adapter_config.json from {lora_path}, and no --model-path provided")
-        return model_path
-
-
-def load_model(
-    model_path: str | None,
-    tensor_parallel_size: int = 1,
-    gpu_memory_utilization: float = 0.9,
-    lora_path: str = None,
-    lora_name: str = "default",
-):
-    """Load vLLM model."""
-    global llm, processor, lora_request, config
-    resolved_model_path = resolve_model_path(model_path, lora_path)
-
-    print(f"\n{'='*80}")
-    print(f"Loading vLLM model...")
-    print(f"{'='*80}")
-    print(f"Model: {resolved_model_path}")
-    print(f"Tensor parallel: {tensor_parallel_size}")
-    print(f"GPU memory: {gpu_memory_utilization}")
-    if lora_path:
-        print(f"LoRA: {lora_path}")
-    print(f"{'='*80}\n")
-
-    start_time = time.time()
-
-    # ============================================================================
-    # CRITICAL: Add special tokens for latent thinking BEFORE loading vLLM
-    # ============================================================================
-    from transformers import AutoTokenizer
-
-    # Load tokenizer and add special tokens
-    tokenizer_with_special_tokens = AutoTokenizer.from_pretrained(
-        resolved_model_path, trust_remote_code=True
-    )
-
-    # Ensure <latent>/<think_sep> are single tokens for inference.
-    # Use regular added tokens (not "special") so they are generated/displayed
-    # like <think> and </think>.
-    special_tokens = ["<latent>", "<think_sep>"]
-    added_count = 0
-    for token in special_tokens:
-        encoded = tokenizer_with_special_tokens.encode(token, add_special_tokens=False)
-        if len(encoded) > 1:
-            num_added = tokenizer_with_special_tokens.add_tokens([token], special_tokens=False)
-            added_count += num_added
-
-    # If checkpoint tokenizer marks these as special, demote them at runtime.
-    # vLLM generation then treats them like regular tokens.
-    for token in special_tokens:
-        token_id = tokenizer_with_special_tokens.convert_tokens_to_ids(token)
-        added = tokenizer_with_special_tokens.added_tokens_decoder.get(token_id)
-        if added is not None and getattr(added, "special", False):
-            tokenizer_with_special_tokens._tokenizer.add_tokens([AddedToken(token, special=False)])
-            print(f"Demoted special token to regular token at runtime: {token} (ID {token_id})")
-
-    if added_count > 0:
-        print(f"Added {added_count} regular thinking tokens to tokenizer")
-
-    # Always export unified token IDs used by both training and vLLM plugin.
-    for token in special_tokens:
-        token_id = tokenizer_with_special_tokens.convert_tokens_to_ids(token)
-        print(f"  {token} -> ID {token_id}")
-        if token == "<latent>":
-            os.environ["QWEN3VL_LATENT_TOKEN_ID"] = str(token_id)
-        elif token == "<think_sep>":
-            os.environ["QWEN3VL_THINKING_SEP_ID"] = str(token_id)
-
-    # Apply thinking mode patch only when explicitly enabled.
-    if THINKING_MODE_ENABLED and apply_thinking_mode_patch is not None:
-        apply_thinking_mode_patch()
-
-    # Load processor
-    processor = AutoProcessor.from_pretrained(
-        resolved_model_path,
-        trust_remote_code=True
-    )
-
-    # Build kwargs
-    llm_kwargs = {
-        "model": resolved_model_path,
-        "tensor_parallel_size": tensor_parallel_size,
-        "gpu_memory_utilization": gpu_memory_utilization,
-        "trust_remote_code": True,
-        "max_model_len": 128000,
-        "limit_mm_per_prompt": {"image": 10},
-        "enforce_eager": os.environ.get("VLLM_ENFORCE_EAGER", "0") == "1",
-        "disable_custom_all_reduce": True, # Key to the distributed inference with mode change
-    }
-
-    # Add LoRA config if path provided
-    if lora_path:
-        llm_kwargs["enable_lora"] = True
-        # Note: vLLM LoRA config needs proper setup
-
-    # Load model
-    llm = LLM(**llm_kwargs)
-
-    # Create LoRA request
-    effective_lora_name = lora_name
-    if lora_path and lora_name == "default":
-        effective_lora_name = normalize_checkpoint_name(lora_path)
-
-    if HAS_LORA_REQUEST and lora_path:
-        lora_request = LoRARequest(
-            lora_name=effective_lora_name,
-            lora_int_id=1,
-            lora_path=lora_path,
-        )
-
-    load_time = time.time() - start_time
-    print(f"\n✓ Model loaded in {load_time:.2f}s")
-
-    # Store config
-    config = {
-        "model_path": resolved_model_path,
-        "requested_model_path": model_path,
-        "lora_path": lora_path,
-        "tensor_parallel_size": tensor_parallel_size,
-        "gpu_memory_utilization": gpu_memory_utilization,
-        "thinking_enabled": THINKING_MODE_ENABLED,
-    }
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Qwen3-VL Thinking Mode Visualization Server")
-    parser.add_argument("--model-path", type=str, default="Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking", help="Path to model (auto-detected from --lora-path if not provided)")
+    parser = argparse.ArgumentParser(description="Qwen3-VL visualization server")
+    parser.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH, help="Path to base model")
     parser.add_argument("--port", type=int, default=8501, help="Server port")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
-    parser.add_argument(
-        "--tensor-parallel-size",
-        type=int,
-        default=0,
-        help="Tensor parallel size. Use 0 to auto-infer from CUDA_VISIBLE_DEVICES.",
-    )
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="GPU memory utilization")
-    parser.add_argument("--lora-path", type=str, default=None, help="LoRA adapter path")
-    parser.add_argument("--lora-name", type=str, default="default", help="LoRA adapter name")
-
+    parser.add_argument("--tensor-parallel-size", type=int, default=0, help="Retained for CLI compatibility")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="Retained for CLI compatibility")
+    parser.add_argument("--lora-path", type=str, default=DEFAULT_LORA_PATH, help="LoRA adapter path")
+    parser.add_argument("--lora-name", type=str, default="default", help="Retained for CLI compatibility")
     args = parser.parse_args()
 
-    visible_gpus = parse_cuda_visible_devices(os.environ.get("CUDA_VISIBLE_DEVICES"))
-    resolved_tp = (
-        infer_tensor_parallel_size(os.environ.get("CUDA_VISIBLE_DEVICES"), fallback=1)
-        if args.tensor_parallel_size <= 0
-        else args.tensor_parallel_size
-    )
-    print(f"CUDA_VISIBLE_DEVICES: {','.join(visible_gpus) if visible_gpus else 'not set'}")
-    print(f"Tensor parallel (resolved): {resolved_tp}")
+    del args.tensor_parallel_size
+    del args.lora_name
 
-    # Auto-find free port if default is taken
-    def find_free_port(start_port):
+    def find_free_port(start_port: int) -> int:
         for port in range(start_port, start_port + 100):
             try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    s.bind(('', port))
-                    s.listen(1)
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.bind(("", port))
+                    sock.listen(1)
                     return port
-            except OSError as e:
-                if e.errno == errno.EADDRINUSE:
+            except OSError as exc:
+                if exc.errno == errno.EADDRINUSE:
                     continue
                 raise
         return start_port
 
-    # Check if port is available, auto-select if not
     original_port = args.port
     args.port = find_free_port(args.port)
     if args.port != original_port:
         print(f"Port {original_port} in use, auto-selected port: {args.port}")
 
-    # Set LoRA checkpoint path (for VAE loading via thinking plugin)
-    if args.lora_path:
-        os.environ["VLLM_LORA_CHECKPOINT_PATH"] = args.lora_path
-        print(f"Set VLLM_LORA_CHECKPOINT_PATH={args.lora_path}")
-
-    # Check VAE file exists
-    vae_file = None
-    if args.lora_path:
-        vae_file = os.path.join(args.lora_path, "vae.safetensors")
-        if not os.path.exists(vae_file):
-            vae_file = os.path.join(args.lora_path, "vae.pt")
-        if not os.path.exists(vae_file):
-            # Try in model path too
-            vae_file = os.path.join(args.model_path, "vae.safetensors")
-            if not os.path.exists(vae_file):
-                vae_file = os.path.join(args.model_path, "vae.pt")
-        if vae_file and os.path.exists(vae_file):
-            print(f"Found VAE weights: {vae_file}")
-        else:
-            print(f"WARNING: No VAE weights found in {args.lora_path} or {args.model_path}")
-
-    # Load model
     load_model(
         model_path=args.model_path,
-        tensor_parallel_size=resolved_tp,
-        gpu_memory_utilization=args.gpu_memory_utilization,
         lora_path=args.lora_path,
-        lora_name=args.lora_name,
+        gpu_memory_utilization=args.gpu_memory_utilization,
     )
 
-    # Start server
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"Starting server at http://{args.host}:{args.port}")
-    print(f"{'='*80}\n")
-
+    print(f"{'=' * 80}\n")
     uvicorn.run(app, host=args.host, port=args.port)
 
 

@@ -71,7 +71,8 @@ def run_vllm_inference(
             "MathVision": "MathVision/run_mathv.py",
             "MMMU": "mmmu/run_mmmu.py",
             "RealWorldQA": "RealWorldQA/run_realworldqa.py",
-            "ODinW-13": "ODinW-13/run_odinw.py"
+            "ODinW-13": "ODinW-13/run_odinw.py",
+            "M3CoT": "M3CoT/run_m3cot.py",
         }
 
         if benchmark not in benchmark_scripts:
@@ -95,7 +96,8 @@ def run_vllm_inference(
         datasets = {
             "MathVision": "MathVision",
             "MMMU": "MMMU_DEV_VAL",
-            "RealWorldQA": "RealWorldQA"
+            "RealWorldQA": "RealWorldQA",
+            "M3CoT": "M3CoT",
         }
         if benchmark in datasets:
             cmd.extend(["--dataset", datasets[benchmark]])
@@ -104,7 +106,7 @@ def run_vllm_inference(
         if num_samples > 0:
             if benchmark == "ODinW-13":
                 cmd.extend(["--limit", str(num_samples)])
-            elif benchmark in ("MathVision", "MMMU", "RealWorldQA"):
+            elif benchmark in ("MathVision", "MMMU", "RealWorldQA", "M3CoT"):
                 cmd.extend(["--num-samples", str(num_samples)])
 
         env = os.environ.copy()

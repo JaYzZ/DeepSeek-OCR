@@ -13,7 +13,9 @@ const state = {
     tsneCoordinates: null,
     tsneFeatureTypes: [],
     tsnePositionIndices: [],
+    tokenMetadata: {},
     selectedTokenIndex: null,
+    selectedImageCoord: null,
     isGenerating: false,
     serverConnected: false,
     settings: {
@@ -37,6 +39,7 @@ const elements = {
     imageInput: document.getElementById('imageInput'),
     imagePreview: document.getElementById('imagePreview'),
     previewImage: document.getElementById('previewImage'),
+    imageClickMarker: document.getElementById('imageClickMarker'),
     removeImage: document.getElementById('removeImage'),
     textInput: document.getElementById('textInput'),
     charCount: document.getElementById('charCount'),
@@ -82,6 +85,7 @@ function setupEventListeners() {
     elements.fileUploadContent.addEventListener('click', () => elements.imageInput.click());
     elements.imageInput.addEventListener('change', handleImageUpload);
     elements.removeImage.addEventListener('click', removeImage);
+    elements.previewImage.addEventListener('click', handlePreviewImageClick);
 
     // Text input
     elements.textInput.addEventListener('input', handleTextInput);
@@ -222,6 +226,10 @@ async function handleGenerate() {
         state.tsneCoordinates = data.tsne_coordinates || null;
         state.tsneFeatureTypes = data.tsne_feature_types || [];
         state.tsnePositionIndices = data.tsne_position_indices || [];
+        state.tokenMetadata = data.token_metadata || {};
+        state.selectedTokenIndex = null;
+        state.selectedImageCoord = null;
+        updateImageClickMarker();
 
         // Render visualizations
         renderAnswer(data.answer);
@@ -259,6 +267,8 @@ function processImageFile(file) {
         elements.previewImage.src = e.target.result;
         elements.imagePreview.style.display = 'block';
         elements.fileUploadContent.style.display = 'none';
+        state.selectedImageCoord = null;
+        updateImageClickMarker();
         updateGenerateButton();
     };
     reader.readAsDataURL(file);
@@ -271,6 +281,9 @@ function removeImage(event) {
     elements.previewImage.src = '';
     elements.imagePreview.style.display = 'none';
     elements.fileUploadContent.style.display = 'block';
+    state.selectedImageCoord = null;
+    state.tokenMetadata = {};
+    updateImageClickMarker();
     updateGenerateButton();
 }
 
@@ -325,9 +338,26 @@ function renderTokens() {
 
     elements.tokenContainer.classList.remove('has-empty-state');
     elements.tokenContainer.innerHTML = '';
-    const continuousCount = state.continuousMask.filter(Boolean).length;
+    const promptTokenCount = Number(state.tokenMetadata?.prompt_token_count || 0);
+    const visibleStart = Math.max(0, Math.min(promptTokenCount, state.tokens.length));
+    const visibleTokens = state.tokens.slice(visibleStart);
+    const visibleContinuousMask = state.continuousMask.slice(visibleStart);
+    const continuousCount = visibleContinuousMask.filter(Boolean).length;
 
-    state.tokens.forEach((token, index) => {
+    if (visibleTokens.length === 0) {
+        elements.tokenContainer.classList.add('has-empty-state');
+        elements.tokenContainer.innerHTML = `
+            <div class="empty-state">
+                <span class="empty-icon">🔤</span>
+                <p>No generated tokens yet</p>
+            </div>
+        `;
+        elements.tokenStats.textContent = '';
+        return;
+    }
+
+    visibleTokens.forEach((token, visibleIndex) => {
+        const index = visibleStart + visibleIndex;
         const tokenEl = document.createElement('span');
         tokenEl.className = 'token';
         tokenEl.textContent = token.text || `[${token.id}]`;
@@ -345,7 +375,7 @@ function renderTokens() {
         elements.tokenContainer.appendChild(tokenEl);
     });
 
-    elements.tokenStats.textContent = `(${state.tokens.length} total, ${continuousCount} continuous)`;
+    elements.tokenStats.textContent = `(${visibleTokens.length} generated, ${continuousCount} continuous)`;
 }
 
 function handleTokenClick(index) {
@@ -354,6 +384,7 @@ function handleTokenClick(index) {
     // Toggle selection: if clicking same token, deselect
     if (state.selectedTokenIndex === index) {
         state.selectedTokenIndex = null;
+        state.selectedImageCoord = null;
         console.log('[handleTokenClick] Deselecting token');
     } else {
         state.selectedTokenIndex = index;
@@ -368,8 +399,60 @@ function handleTokenClick(index) {
     // Update visualizations
     renderAttention();
     highlightTSNEPoint(state.selectedTokenIndex);
+    updateImageClickMarker();
 
     console.log('[handleTokenClick] Finished, new selectedTokenIndex:', state.selectedTokenIndex);
+}
+
+function updateImageClickMarker() {
+    if (!elements.imageClickMarker) return;
+    if (!state.selectedImageCoord || !state.imageData) {
+        elements.imageClickMarker.style.display = 'none';
+        return;
+    }
+
+    elements.imageClickMarker.style.display = 'block';
+    elements.imageClickMarker.style.left = `${state.selectedImageCoord.xPercent * 100}%`;
+    elements.imageClickMarker.style.top = `${state.selectedImageCoord.yPercent * 100}%`;
+}
+
+function getImageTokenIndexFromClick(xPercent, yPercent) {
+    const positions = state.tokenMetadata?.image_token_positions;
+    const grid = state.tokenMetadata?.image_grid_thw;
+    if (!Array.isArray(positions) || positions.length === 0 || !Array.isArray(grid) || grid.length < 3) {
+        return null;
+    }
+
+    const [t, h, w] = grid;
+    const totalRows = Math.max(1, (t || 1) * (h || 1));
+    const totalCols = Math.max(1, w || 1);
+    const row = Math.min(totalRows - 1, Math.max(0, Math.floor(yPercent * totalRows)));
+    const col = Math.min(totalCols - 1, Math.max(0, Math.floor(xPercent * totalCols)));
+    const flatIndex = row * totalCols + col;
+    if (flatIndex < 0 || flatIndex >= positions.length) {
+        return null;
+    }
+    return positions[flatIndex];
+}
+
+function handlePreviewImageClick(event) {
+    if (!state.imageData) return;
+
+    const rect = elements.previewImage.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+
+    const xPercent = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+    const yPercent = Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height));
+    const tokenIndex = getImageTokenIndexFromClick(xPercent, yPercent);
+
+    console.log('[imageClick]', { xPercent, yPercent, tokenIndex });
+
+    state.selectedImageCoord = { xPercent, yPercent };
+    updateImageClickMarker();
+
+    if (tokenIndex !== null) {
+        highlightTSNEPoint(tokenIndex);
+    }
 }
 
 function renderTSNE() {
@@ -404,6 +487,7 @@ function renderTSNE() {
             token_emb: { color: '#3b82f6', symbol: 'circle', name: 'Token Embedding' },
             hidden_state: { color: '#f97316', symbol: 'diamond', name: 'Hidden State' },
             vae_sample: { color: '#22c55e', symbol: 'star', name: 'VAE Sample' },
+            image_token: { color: '#a855f7', symbol: 'square', name: 'Image Token' },
         };
 
         state.tsneCoordinates.forEach((coord, i) => {
@@ -441,11 +525,11 @@ function renderTSNE() {
             name: data.name,
             text: data.text,
             marker: {
-                size: 10,
+                size: data.name === 'Image Token' ? 7 : 10,
                 color: data.color,
                 symbol: data.symbol,
                 line: { width: 1.5, color: 'white' },
-                opacity: 1.0,
+                opacity: data.name === 'Image Token' ? 0.6 : 1.0,
             },
             hoverinfo: 'text+x+y',
             customdata: data.indices,
@@ -642,7 +726,7 @@ function highlightTSNEPoint(index) {
         plotData.forEach((trace) => {
             if (!trace.name || !trace.name.includes('highlight')) {
                 const update = {
-                    'marker.opacity': Array(trace.x.length).fill(1.0),
+                    'marker.opacity': Array(trace.x.length).fill(trace.name === 'Image Token' ? 0.6 : 1.0),
                 };
                 Plotly.restyle(elements.tsnePlot, update, [plotData.indexOf(trace)]);
             }
@@ -696,19 +780,19 @@ function highlightTSNEPoint(index) {
         });
 
         if (selectedX.length > 0) {
-            highlightTraces.push({
-                x: selectedX,
-                y: selectedY,
+                highlightTraces.push({
+                    x: selectedX,
+                    y: selectedY,
                 mode: 'markers',
                 type: 'scatter',
                 name: `${trace.name} (highlight)`,
                 text: selectedText,
-                marker: {
-                    size: 20,
-                    color: trace.marker.color,
-                    symbol: trace.marker.symbol,
-                    line: { width: 1.5, color: 'white' },
-                    opacity: 1.0,
+                    marker: {
+                    size: trace.name === 'Image Token' ? 14 : 20,
+                        color: trace.marker.color,
+                        symbol: trace.marker.symbol,
+                        line: { width: 1.5, color: 'white' },
+                        opacity: 1.0,
                 },
                 hoverinfo: 'text+x+y',
                 showlegend: false,

@@ -298,6 +298,7 @@ body {
     border-radius: var(--border-radius-sm);
     overflow: hidden;
     background: var(--bg-tertiary);
+    cursor: crosshair;
 }
 
 .image-preview img {
@@ -306,6 +307,19 @@ body {
     max-height: 300px;
     object-fit: contain;
     display: block;
+}
+
+.image-click-marker {
+    position: absolute;
+    width: 16px;
+    height: 16px;
+    border: 2px solid #ffffff;
+    background: rgba(168, 85, 247, 0.9);
+    border-radius: 999px;
+    box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.28);
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    z-index: 2;
 }
 
 .remove-image {
@@ -648,6 +662,10 @@ body {
 
 .legend-dot.vae-sample {
     background: #22c55e;
+}
+
+.legend-dot.image-token {
+    background: #a855f7;
 }
 
 /* Answer Container */

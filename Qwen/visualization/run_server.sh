@@ -74,14 +74,15 @@ echo ""
 
 # Run the server
 cd "$(dirname "$0")"
+PYTHON_BIN="/share/project/xiyan/envs/ocrflow/bin/python"
 if [ -n "$LORA_PATH" ]; then
-    python app.py \
+    "$PYTHON_BIN" app.py \
         --model-path "$MODEL_PATH" \
         --lora-path "$LORA_PATH" \
         --port "$PORT" \
         --host "$HOST"
 else
-    python app.py \
+    "$PYTHON_BIN" app.py \
         --model-path "$MODEL_PATH" \
         --port "$PORT" \
         --host "$HOST"

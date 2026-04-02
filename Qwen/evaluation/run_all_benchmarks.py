@@ -13,6 +13,7 @@ Usage:
 import os
 import sys
 import json
+import io
 import argparse
 import subprocess
 import shutil
@@ -25,11 +26,13 @@ import requests
 import threading
 import concurrent.futures
 import random
+import base64
 from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
+from PIL import Image
 from transformers import AutoProcessor
 import pandas as pd
 
@@ -51,6 +54,38 @@ LOCAL_JUDGE_DEFAULT_MODEL = "/share/project/xiyan/huggingface/Qwen/Qwen2.5-VL-7B
 EXPLORE_TEMPERATURE = 0.7
 EXPLORE_MAX_TOKENS = 8192
 EXPLORE_N = 8
+
+
+def _sanitize_json_value(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        if "bytes" in value and isinstance(value["bytes"], (bytes, bytearray)):
+            with Image.open(io.BytesIO(value["bytes"])) as img:
+                rgb_img = img.convert("RGB")
+                buffer = io.BytesIO()
+                rgb_img.save(buffer, format="JPEG")
+            return base64.b64encode(buffer.getvalue()).decode("utf-8")
+        if "path" in value and isinstance(value["path"], str):
+            return {"path": value["path"]}
+        return {str(k): _sanitize_json_value(v) for k, v in value.items()}
+    if isinstance(value, (bytes, bytearray)):
+        return base64.b64encode(value).decode("utf-8")
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json_value(v) for v in value]
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    return str(value)
 
 
 def _get_runtime_yaml_value(key: str, default):
@@ -222,6 +257,7 @@ def _get_inference_file(run_dir: str, benchmark: str) -> str | None:
         "MMMU": ["mmmu_inference.jsonl"],
         "MathVision": ["mathvision_inference.jsonl"],
         "RealWorldQA": ["realworldqa_inference.jsonl"],
+        "M3CoT": ["m3cot_inference.jsonl"],
         "ODinW-13": ["odinw_inference.jsonl"],
     }.get(benchmark, [])
     for name in candidates:
@@ -358,7 +394,7 @@ def _log_managed_process_failure(
 
 
 def requires_judge(benchmark: str) -> bool:
-    return benchmark != "ODinW-13"
+    return benchmark not in {"ODinW-13", "M3CoT"}
 
 
 def run_unified_inference(
@@ -595,6 +631,12 @@ def run_server_inference(
             dump_image as realworldqa_dump_image,
         )
         from Qwen.evaluation.RealWorldQA.run_realworldqa import build_realworldqa_prompt
+        from Qwen.evaluation.M3CoT.dataset_utils import (
+            load_dataset as load_m3cot_dataset,
+            deterministic_limit as limit_m3cot_dataset,
+            dump_image as m3cot_dump_image,
+        )
+        from Qwen.evaluation.M3CoT.run_m3cot import build_m3cot_prompt
 
         # Load processor
         model_path = server_info.get("model", QWEN3_VL_2B_THINKING)
@@ -614,6 +656,7 @@ def run_server_inference(
         "MathVision": {"dataset": "MathVision", "load_func": load_mathv_dataset, "prompt_func": build_mathv_prompt, "dump_image": mathv_dump_image},
         "MMMU": {"dataset": "MMMU_DEV_VAL", "load_func": load_mmmu_dataset, "prompt_func": build_mmmu_prompt, "dump_image": mmmu_dump_image},
         "RealWorldQA": {"dataset": "RealWorldQA", "load_func": load_realworldqa_dataset, "prompt_func": build_realworldqa_prompt, "dump_image": realworldqa_dump_image},
+        "M3CoT": {"dataset": "M3CoT", "load_func": load_m3cot_dataset, "prompt_func": build_m3cot_prompt, "dump_image": m3cot_dump_image},
         # ODinW is handled by calling its own benchmark script in API mode.
         "ODinW-13": {"dataset": None, "load_func": None, "prompt_func": None, "dump_image": None},
     }
@@ -677,6 +720,9 @@ def run_server_inference(
             traceback.print_exc()
             continue
 
+        if benchmark == "M3CoT":
+            data = limit_m3cot_dataset(data, num_samples if num_samples > 0 else None)
+
         # Normalize data to a list of row-like dicts for consistent iteration.
         # Pandas DataFrame iteration yields column names, so avoid `for x in df`.
         if hasattr(data, "to_dict") and hasattr(data, "iterrows"):
@@ -734,7 +780,7 @@ def run_server_inference(
         request_tasks: List[Tuple[int, object, List[dict], dict]] = []
         for idx, row in tqdm(enumerate(rows), total=len(rows), desc=f"{benchmark} build"):
             try:
-                if benchmark in ("MathVision", "MMMU"):
+                if benchmark in ("MathVision", "MMMU", "M3CoT"):
                     messages = prompt_func(row, dump_image_func, dataset_name)
                 elif benchmark == "RealWorldQA":
                     messages = prompt_func(row, dump_image_func, default_min_pixels, default_max_pixels)
@@ -813,6 +859,7 @@ def run_server_inference(
 
                     primary = candidate_results[0]
                     row_dict = row.to_dict() if hasattr(row, "to_dict") else dict(row)
+                    row_dict = _sanitize_json_value(row_dict)
                     out = {
                         "question_id": idx,
                         "annotation": row_dict,
@@ -958,6 +1005,13 @@ def run_inference(
             "use_num_samples": True,
             "limit_at_eval": True      # Keep optional eval limiting as well
         },
+        "M3CoT": {
+            "script": "M3CoT/run_m3cot.py",
+            "dataset": "M3CoT",
+            "output": "m3cot_inference.jsonl",
+            "use_num_samples": True,
+            "limit_at_eval": False
+        },
         "ODinW-13": {
             "script": "ODinW-13/run_odinw.py",
             "dataset": None,
@@ -1009,7 +1063,7 @@ def run_inference(
     env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
 
     # Set LOCAL_API_URL and --api-url for benchmark scripts that support it
-    benchmarks_with_api_url = ["MathVision", "MMMU", "RealWorldQA", "ODinW-13"]
+    benchmarks_with_api_url = ["MathVision", "MMMU", "RealWorldQA", "ODinW-13", "M3CoT"]
     if server_url and benchmark in benchmarks_with_api_url:
         api_full_url = f"{server_url}/v1/chat/completions"
         env["LOCAL_API_URL"] = api_full_url
@@ -1135,6 +1189,14 @@ def run_evaluation(
             "limit_at_eval": True,   # Need to limit during evaluation
             "eval_model": "gpt-4o",
         },
+        "M3CoT": {
+            "script": "M3CoT/run_m3cot.py",
+            "dataset": "M3CoT",
+            "output": "m3cot_eval_result.json",
+            "result_key": None,
+            "limit_at_eval": False,
+            "eval_model": None,
+        },
         "ODinW-13": {
             "script": "ODinW-13/run_odinw.py",
             "dataset": None,
@@ -1155,9 +1217,9 @@ def run_evaluation(
     output_file = normalize_run_path(Path(run_dir) / config["output"])
 
     # Always use the local judge server selected by the driver for judge-based benchmarks.
-    if benchmark != "ODinW-13" and not judge_url:
+    if requires_judge(benchmark) and not judge_url:
         judge_url = os.environ.get("JUDGE_SERVER_URL")
-    if benchmark != "ODinW-13" and not judge_url:
+    if requires_judge(benchmark) and not judge_url:
         print(f"Error: Local judge URL not configured for {benchmark}")
         return False, ""
 
@@ -1169,8 +1231,8 @@ def run_evaluation(
         "--output-file", output_file,
     ]
 
-    # Add API args only for benchmarks that use JUDGE server (not ODinW-13 which uses COCO eval)
-    if benchmark != "ODinW-13":
+    # Add API args only for benchmarks that use JUDGE server.
+    if requires_judge(benchmark):
         cmd.extend(["--api-type", "custom"])
         cmd.extend(["--api-url", judge_url])
         if config.get("eval_model"):
@@ -1305,8 +1367,8 @@ def parse_benchmark_results(benchmark: str, result_file: str) -> Dict:
             else:
                 return {"error": "No accuracy column found", "raw": df.to_dict()}
 
-        elif benchmark in ["MMMU", "RealWorldQA"]:
-            # MMMU and RealWorldQA output JSON with accuracy
+        elif benchmark in ["MMMU", "RealWorldQA", "M3CoT"]:
+            # MMMU, RealWorldQA, and M3CoT output JSON with accuracy
             with open(result_file, 'r') as f:
                 data = json.load(f)
             acc = data.get("overall_accuracy", 0.0)
@@ -1333,6 +1395,7 @@ def _normalize_benchmark_name(benchmark: str) -> str:
         "real-world-qa": "RealWorldQA",
         "mathvision": "MathVision",
         "mmmu": "MMMU",
+        "m3cot": "M3CoT",
         "odinw-13": "ODinW-13",
         "odinw13": "ODinW-13",
     }
@@ -1603,8 +1666,14 @@ def generate_summary(run_dir: str, results: Dict[str, Dict]) -> str:
     except Exception:
         pass
 
-    with open(summary_file, 'w') as f:
-        f.write(f"# Comprehensive Evaluation Summary\n\n")
+    mode = "a" if os.path.exists(summary_file) else "w"
+    with open(summary_file, mode, encoding="utf-8") as f:
+        if mode == "w":
+            f.write("# Comprehensive Evaluation Summary\n\n")
+        else:
+            f.write("\n\n---\n\n")
+
+        f.write(f"## Run {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         f.write(f"**Date**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         f.write(f"**Run Directory**: `{run_dir}`\n\n")
 
@@ -1642,6 +1711,24 @@ def generate_summary(run_dir: str, results: Dict[str, Dict]) -> str:
             elif "accuracy" in result:
                 f.write(f"**Accuracy**: {result['accuracy']:.2f}%\n\n")
                 if "raw" in result and isinstance(result["raw"], dict):
+                    if "by_domain" in result["raw"] and isinstance(result["raw"]["by_domain"], dict):
+                        f.write("**Accuracy by Domain**:\n\n")
+                        for domain, stats in result["raw"]["by_domain"].items():
+                            if isinstance(stats, dict):
+                                acc_val = stats.get("accuracy", stats.get("acc", 0.0))
+                                try:
+                                    acc_val = float(acc_val)
+                                    if 0.0 <= acc_val <= 1.0:
+                                        acc_val *= 100.0
+                                    correct = stats.get("correct")
+                                    total = stats.get("total")
+                                    if correct is not None and total is not None:
+                                        f.write(f"- {domain}: {acc_val:.2f}% ({correct}/{total})\n")
+                                    else:
+                                        f.write(f"- {domain}: {acc_val:.2f}%\n")
+                                except Exception:
+                                    f.write(f"- {domain}: {stats}\n")
+                        f.write("\n")
                     if "accuracy_by_split" in result["raw"]:
                         f.write("**Accuracy by Split**:\n\n")
                         for split, acc in result["raw"]["accuracy_by_split"].items():
