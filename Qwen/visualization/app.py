@@ -131,6 +131,24 @@ def _resolve_multimodal_core(model: Any) -> Any:
     return model
 
 
+def _set_attention_implementation(model: Any, implementation: str) -> None:
+    visited: set[int] = set()
+    stack = [model]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in visited:
+            continue
+        visited.add(id(current))
+        setter = getattr(current, "set_attn_implementation", None)
+        if callable(setter):
+            setter(implementation)
+            return
+        for attr in ("module", "model", "base_model"):
+            child = getattr(current, attr, None)
+            if child is not None and child is not current:
+                stack.append(child)
+
+
 def _align_module_to_model_dtype_device(model: torch.nn.Module, module: torch.nn.Module) -> None:
     ref_tensor = None
     for param in model.parameters():
@@ -389,13 +407,19 @@ def _align_analysis_lengths(analysis: dict[str, Any]) -> dict[str, Any]:
 
 def _extract_image_token_metadata(
     vision_embeddings: list[dict[str, Any]],
+    model_config: Any,
     image_grid_thw: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     image_token_positions = [int(item["position"]) for item in vision_embeddings]
     image_grid = None
     if image_grid_thw is not None and torch.is_tensor(image_grid_thw) and image_grid_thw.numel() >= 3:
         first_grid = image_grid_thw[0].detach().cpu().tolist()
-        image_grid = [int(first_grid[0]), int(first_grid[1]), int(first_grid[2])]
+        spatial_merge_size = int(getattr(getattr(model_config, "vision_config", None), "spatial_merge_size", 1) or 1)
+        image_grid = [
+            int(first_grid[0]),
+            max(1, int(first_grid[1]) // spatial_merge_size),
+            max(1, int(first_grid[2]) // spatial_merge_size),
+        ]
     return {
         "image_token_positions": image_token_positions,
         "image_grid_thw": image_grid,
@@ -743,6 +767,7 @@ def _generate_with_adaptive_thinking_trace(
         "latent_embeddings": np.asarray(latent_embedding_rows, dtype=np.float32) if latent_embedding_rows else None,
         "image_token_metadata": _extract_image_token_metadata(
             vision_embeddings,
+            getattr(model, "config", None),
             batch.get("image_grid_thw"),
         ),
     }
@@ -823,6 +848,7 @@ def _collect_sequence_analysis(
         "continuous_mask": [False] * len(tokens),
         "image_token_metadata": _extract_image_token_metadata(
             vision_embeddings,
+            getattr(model, "config", None),
             generation_batch.get("image_grid_thw"),
         ),
     })
@@ -974,6 +1000,7 @@ def load_model(
             raise RuntimeError("peft is required to load LoRA adapters")
         model = PeftModel.from_pretrained(model, lora_path)
 
+    _set_attention_implementation(model, "eager")
     model.eval()
     setattr(model, "tokenizer", tokenizer)
     _ensure_latent_vae_module(model, resolved_model_path, lora_path)

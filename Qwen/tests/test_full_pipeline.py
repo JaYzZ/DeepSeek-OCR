@@ -294,3 +294,53 @@ def test_should_save_vae_checkpoint_respects_active_loss_spec(monkeypatch):
 
     monkeypatch.setenv("QWEN3VL_LOSS_TYPE", "ce+vae_ce+vae:0.4+mse:0.4+ot:0.4")
     assert lfi._should_save_vae_checkpoint() is True
+
+
+def test_unbalanced_sinkhorn_prefers_selective_matches_over_full_average():
+    cost_matrix = torch.tensor(
+        [
+            [0.0, 1.0, 1.0],
+            [1.0, 0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    loss, transport = lfi._compute_unbalanced_sinkhorn_cost(
+        cost_matrix=cost_matrix,
+        epsilon=0.1,
+        tau=1.0,
+        num_iters=20,
+    )
+
+    assert transport.shape == cost_matrix.shape
+    assert torch.isfinite(loss)
+    assert float(loss.item()) < float(cost_matrix.mean().item())
+
+
+def test_ot_sample_loss_is_more_selective_than_pairwise_average(monkeypatch):
+    monkeypatch.setenv("QWEN3VL_OT_SAMPLE_K", "none")
+    monkeypatch.setenv("QWEN3VL_OT_EPSILON", "0.1")
+    monkeypatch.setenv("QWEN3VL_OT_TAU", "1.0")
+    monkeypatch.setenv("QWEN3VL_OT_SINKHORN_ITERS", "20")
+
+    pred_tokens = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    target_tokens = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [-1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    loss, cost_matrix = lfi._compute_ot_sample_loss(pred_tokens, target_tokens)
+
+    assert cost_matrix.shape == (2, 3)
+    assert torch.isfinite(loss)
+    assert float(loss.item()) < float(cost_matrix.mean().item())

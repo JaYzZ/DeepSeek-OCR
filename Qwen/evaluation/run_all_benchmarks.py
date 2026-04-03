@@ -258,6 +258,7 @@ def _get_inference_file(run_dir: str, benchmark: str) -> str | None:
         "MathVision": ["mathvision_inference.jsonl"],
         "RealWorldQA": ["realworldqa_inference.jsonl"],
         "M3CoT": ["m3cot_inference.jsonl"],
+        "ScienceQA": ["scienceqa_inference.jsonl"],
         "ODinW-13": ["odinw_inference.jsonl"],
     }.get(benchmark, [])
     for name in candidates:
@@ -394,7 +395,7 @@ def _log_managed_process_failure(
 
 
 def requires_judge(benchmark: str) -> bool:
-    return benchmark not in {"ODinW-13", "M3CoT"}
+    return benchmark not in {"ODinW-13", "M3CoT", "ScienceQA"}
 
 
 def run_unified_inference(
@@ -637,6 +638,12 @@ def run_server_inference(
             dump_image as m3cot_dump_image,
         )
         from Qwen.evaluation.M3CoT.run_m3cot import build_m3cot_prompt
+        from Qwen.evaluation.ScienceQA.dataset_utils import (
+            load_dataset as load_scienceqa_dataset,
+            deterministic_limit as limit_scienceqa_dataset,
+            dump_image as scienceqa_dump_image,
+        )
+        from Qwen.evaluation.ScienceQA.run_scienceqa import build_scienceqa_prompt
 
         # Load processor
         model_path = server_info.get("model", QWEN3_VL_2B_THINKING)
@@ -657,6 +664,7 @@ def run_server_inference(
         "MMMU": {"dataset": "MMMU_DEV_VAL", "load_func": load_mmmu_dataset, "prompt_func": build_mmmu_prompt, "dump_image": mmmu_dump_image},
         "RealWorldQA": {"dataset": "RealWorldQA", "load_func": load_realworldqa_dataset, "prompt_func": build_realworldqa_prompt, "dump_image": realworldqa_dump_image},
         "M3CoT": {"dataset": "M3CoT", "load_func": load_m3cot_dataset, "prompt_func": build_m3cot_prompt, "dump_image": m3cot_dump_image},
+        "ScienceQA": {"dataset": "ScienceQA", "load_func": load_scienceqa_dataset, "prompt_func": build_scienceqa_prompt, "dump_image": scienceqa_dump_image},
         # ODinW is handled by calling its own benchmark script in API mode.
         "ODinW-13": {"dataset": None, "load_func": None, "prompt_func": None, "dump_image": None},
     }
@@ -722,6 +730,8 @@ def run_server_inference(
 
         if benchmark == "M3CoT":
             data = limit_m3cot_dataset(data, num_samples if num_samples > 0 else None)
+        if benchmark == "ScienceQA":
+            data = limit_scienceqa_dataset(data, num_samples if num_samples > 0 else None)
 
         # Normalize data to a list of row-like dicts for consistent iteration.
         # Pandas DataFrame iteration yields column names, so avoid `for x in df`.
@@ -780,7 +790,7 @@ def run_server_inference(
         request_tasks: List[Tuple[int, object, List[dict], dict]] = []
         for idx, row in tqdm(enumerate(rows), total=len(rows), desc=f"{benchmark} build"):
             try:
-                if benchmark in ("MathVision", "MMMU", "M3CoT"):
+                if benchmark in ("MathVision", "MMMU", "M3CoT", "ScienceQA"):
                     messages = prompt_func(row, dump_image_func, dataset_name)
                 elif benchmark == "RealWorldQA":
                     messages = prompt_func(row, dump_image_func, default_min_pixels, default_max_pixels)
@@ -1012,6 +1022,13 @@ def run_inference(
             "use_num_samples": True,
             "limit_at_eval": False
         },
+        "ScienceQA": {
+            "script": "ScienceQA/run_scienceqa.py",
+            "dataset": "ScienceQA",
+            "output": "scienceqa_inference.jsonl",
+            "use_num_samples": True,
+            "limit_at_eval": False
+        },
         "ODinW-13": {
             "script": "ODinW-13/run_odinw.py",
             "dataset": None,
@@ -1063,7 +1080,7 @@ def run_inference(
     env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
 
     # Set LOCAL_API_URL and --api-url for benchmark scripts that support it
-    benchmarks_with_api_url = ["MathVision", "MMMU", "RealWorldQA", "ODinW-13", "M3CoT"]
+    benchmarks_with_api_url = ["MathVision", "MMMU", "RealWorldQA", "ODinW-13", "M3CoT", "ScienceQA"]
     if server_url and benchmark in benchmarks_with_api_url:
         api_full_url = f"{server_url}/v1/chat/completions"
         env["LOCAL_API_URL"] = api_full_url
@@ -1193,6 +1210,14 @@ def run_evaluation(
             "script": "M3CoT/run_m3cot.py",
             "dataset": "M3CoT",
             "output": "m3cot_eval_result.json",
+            "result_key": None,
+            "limit_at_eval": False,
+            "eval_model": None,
+        },
+        "ScienceQA": {
+            "script": "ScienceQA/run_scienceqa.py",
+            "dataset": "ScienceQA",
+            "output": "scienceqa_eval_result.json",
             "result_key": None,
             "limit_at_eval": False,
             "eval_model": None,
@@ -1367,8 +1392,8 @@ def parse_benchmark_results(benchmark: str, result_file: str) -> Dict:
             else:
                 return {"error": "No accuracy column found", "raw": df.to_dict()}
 
-        elif benchmark in ["MMMU", "RealWorldQA", "M3CoT"]:
-            # MMMU, RealWorldQA, and M3CoT output JSON with accuracy
+        elif benchmark in ["MMMU", "RealWorldQA", "M3CoT", "ScienceQA"]:
+            # MMMU, RealWorldQA, M3CoT, and ScienceQA output JSON with accuracy
             with open(result_file, 'r') as f:
                 data = json.load(f)
             acc = data.get("overall_accuracy", 0.0)
@@ -1396,6 +1421,9 @@ def _normalize_benchmark_name(benchmark: str) -> str:
         "mathvision": "MathVision",
         "mmmu": "MMMU",
         "m3cot": "M3CoT",
+        "scienceqa": "ScienceQA",
+        "science_qa": "ScienceQA",
+        "science-qa": "ScienceQA",
         "odinw-13": "ODinW-13",
         "odinw13": "ODinW-13",
     }
@@ -2175,14 +2203,14 @@ Examples:
     parser.add_argument(
         "--server-temperature",
         type=float,
-        default=0.0,
-        help="Sampling temperature for server-mode inference (default: 0.0)"
+        default=1.0,
+        help="Sampling temperature for server-mode inference (default: 1.0)"
     )
     parser.add_argument(
         "--server-top-p",
         type=float,
-        default=1.0,
-        help="Top-p for server-mode inference (default: 1.0)"
+        default=0.95,
+        help="Top-p for server-mode inference (default: 0.95)"
     )
     parser.add_argument(
         "--server-n",

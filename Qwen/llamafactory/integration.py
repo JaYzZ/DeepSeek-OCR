@@ -3459,6 +3459,140 @@ def _compute_contrastive_loss(
     return loss
 
 
+def _get_ot_sample_k() -> Optional[int]:
+    sample_k_raw = os.environ.get("QWEN3VL_OT_SAMPLE_K", "16")
+    sample_k = None
+    if isinstance(sample_k_raw, str):
+        if sample_k_raw.strip().lower() in ("none", "null", "off", "disable", "disabled"):
+            sample_k = None
+        else:
+            try:
+                sample_k = int(sample_k_raw)
+            except ValueError:
+                sample_k = 16
+    elif isinstance(sample_k_raw, int):
+        sample_k = sample_k_raw
+    return sample_k
+
+
+def _sample_ot_tokens(
+    pred_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    sample_k: Optional[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if sample_k is None or sample_k <= 0:
+        return pred_tokens, target_tokens
+
+    if pred_tokens.shape[0] > sample_k:
+        idx = torch.randperm(pred_tokens.shape[0], device=pred_tokens.device)[:sample_k]
+        pred_tokens = pred_tokens[idx]
+    if target_tokens.shape[0] > sample_k:
+        idx = torch.randperm(target_tokens.shape[0], device=target_tokens.device)[:sample_k]
+        target_tokens = target_tokens[idx]
+    return pred_tokens, target_tokens
+
+
+def _kl_positive(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    eps = torch.finfo(x.dtype).tiny
+    x_safe = x.clamp_min(eps)
+    y_safe = y.clamp_min(eps)
+    return (x_safe * (torch.log(x_safe) - torch.log(y_safe)) - x_safe + y_safe).sum()
+
+
+def _compute_unbalanced_sinkhorn_cost(
+    cost_matrix: torch.Tensor,
+    epsilon: float,
+    tau: float,
+    num_iters: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if cost_matrix.ndim != 2:
+        raise ValueError(f"cost_matrix must be 2D, got shape={tuple(cost_matrix.shape)}")
+    if cost_matrix.shape[0] == 0 or cost_matrix.shape[1] == 0:
+        raise ValueError(f"cost_matrix must be non-empty, got shape={tuple(cost_matrix.shape)}")
+    if epsilon <= 0:
+        raise ValueError(f"epsilon must be > 0, got {epsilon}")
+    if tau <= 0:
+        raise ValueError(f"tau must be > 0, got {tau}")
+    if num_iters <= 0:
+        raise ValueError(f"num_iters must be > 0, got {num_iters}")
+
+    device = cost_matrix.device
+    dtype = cost_matrix.dtype
+    n_pred, n_target = cost_matrix.shape
+
+    a = torch.full((n_pred,), 1.0 / n_pred, device=device, dtype=dtype)
+    b = torch.full((n_target,), 1.0 / n_target, device=device, dtype=dtype)
+    log_a = torch.log(a)
+    log_b = torch.log(b)
+    log_k = -cost_matrix / epsilon
+
+    exponent = tau / (tau + epsilon)
+    log_u = torch.zeros_like(a)
+    log_v = torch.zeros_like(b)
+
+    for _ in range(num_iters):
+        log_kv = torch.logsumexp(log_k + log_v.unsqueeze(0), dim=1)
+        log_u = exponent * (log_a - log_kv)
+        log_ktu = torch.logsumexp(log_k.transpose(0, 1) + log_u.unsqueeze(0), dim=1)
+        log_v = exponent * (log_b - log_ktu)
+
+    log_transport = log_u.unsqueeze(1) + log_k + log_v.unsqueeze(0)
+    transport = torch.exp(log_transport)
+    reference = a.unsqueeze(1) * b.unsqueeze(0)
+    source_mass = transport.sum(dim=1)
+    target_mass = transport.sum(dim=0)
+
+    objective = (
+        (transport * cost_matrix).sum()
+        + epsilon * _kl_positive(transport, reference)
+        + tau * _kl_positive(source_mass, a)
+        + tau * _kl_positive(target_mass, b)
+    )
+    return objective, transport
+
+
+def _compute_ot_sample_loss(
+    pred_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    lm_head: nn.Module = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    sample_k = _get_ot_sample_k()
+    pred_tokens, target_tokens = _sample_ot_tokens(pred_tokens, target_tokens, sample_k)
+
+    if lm_head is not None:
+        e = lm_head.weight.data
+        e = e / torch.linalg.vector_norm(e, ord=2, dim=1, keepdim=True)
+        e = e.to(device=pred_tokens.device, dtype=pred_tokens.dtype)
+
+        pred_logits = pred_tokens @ e.t()
+        target_logits = target_tokens @ e.t()
+
+        q_theta = F.softmax(pred_logits, dim=-1)
+        p = F.softmax(target_logits, dim=-1)
+
+        pred_repr = q_theta @ e
+        target_repr = p @ e
+
+        pred_norm = F.normalize(pred_repr, dim=-1)
+        target_norm = F.normalize(target_repr, dim=-1)
+        cost_matrix = 1.0 - torch.mm(pred_norm, target_norm.t())
+    else:
+        pred_norm = F.normalize(pred_tokens, dim=-1)
+        target_norm = F.normalize(target_tokens, dim=-1)
+        cost_matrix = 1.0 - torch.mm(pred_norm, target_norm.t())
+
+    epsilon = float(os.environ.get("QWEN3VL_OT_EPSILON", "0.1"))
+    tau = float(os.environ.get("QWEN3VL_OT_TAU", "1.0"))
+    num_iters = int(os.environ.get("QWEN3VL_OT_SINKHORN_ITERS", "8"))
+    loss, _transport = _compute_unbalanced_sinkhorn_cost(
+        cost_matrix=cost_matrix,
+        epsilon=epsilon,
+        tau=tau,
+        num_iters=num_iters,
+    )
+    return loss, cost_matrix
+
+
 def _compute_ot_loss(
     hidden_states: torch.Tensor,
     latent_supervision: List[List[torch.Tensor]],
@@ -3467,20 +3601,9 @@ def _compute_ot_loss(
 ) -> Optional[torch.Tensor]:
     """Compute OT loss on shifted autoregressive hidden states.
 
-    KEY INSIGHT: OT works with distributions of DIFFERENT sizes - no matching needed!
-
-    For two distributions:
-    - Q (predictions): [N, D]  - any size
-    - P (targets): [M, D]     - any size (can be different!)
-
-    Cost matrix: C[i,j] = 1 - cos(Q[i], P[j])  # [N, M] - rectangular!
-
-    DEMD with uniform Q, P:
-        DEMD = Q^T @ C @ P
-             = (1/N) * Σ_i (1/M) * Σ_j C[i,j]
-             = (1/(N*M)) * Σ_i Σ_j (1 - cos(Q[i], P[j]))
-
-    This naturally handles varied lengths without truncation/padding!
+    Uses an unbalanced entropic Sinkhorn objective on a rectangular cosine cost
+    matrix, so predicted latent states and image supervision tokens can have
+    different cardinalities without forced one-to-one alignment.
 
     NOTE: No positional bias needed! ViT-encoded latents already contain spatial
     information in their feature representations. Pure semantic OT naturally respects
@@ -3497,21 +3620,6 @@ def _compute_ot_loss(
     """
     device = hidden_states.device
     dtype = hidden_states.dtype
-    # Optional token sampling for OT approximation (default: 16)
-    # Set QWEN3VL_OT_SAMPLE_K=0 or "none" to disable sampling (full OT).
-    sample_k_raw = os.environ.get("QWEN3VL_OT_SAMPLE_K", "16")
-    sample_k = None
-    if isinstance(sample_k_raw, str):
-        if sample_k_raw.strip().lower() in ("none", "null", "off", "disable", "disabled"):
-            sample_k = None
-        else:
-            try:
-                sample_k = int(sample_k_raw)
-            except ValueError:
-                sample_k = 16
-    elif isinstance(sample_k_raw, int):
-        sample_k = sample_k_raw
-
     # Debug logging (first call only)
     if not hasattr(_compute_ot_loss, '_logged'):
         if _is_rank0():
@@ -3560,72 +3668,18 @@ def _compute_ot_loss(
                 _compute_ot_loss._logged_no_supervision = True
             continue
 
-        # NO length matching for OT - let N and M be naturally different!
-        N = sample_hidden.shape[0]  # Number of predicted tokens
-        M = target_tokens.shape[0]  # Number of target tokens (can differ!)
-
-        # Move to device
-        pred_tokens = sample_hidden.to(device=device, dtype=dtype)          # [N, D]
-
-        # Optional sampling to reduce OT cost
-        if sample_k is not None and sample_k > 0:
-            if N > sample_k:
-                idx = torch.randperm(N, device=device)[:sample_k]
-                pred_tokens = pred_tokens[idx]
-                N = pred_tokens.shape[0]
-            if M > sample_k:
-                idx = torch.randperm(M, device=device)[:sample_k]
-                target_tokens = target_tokens[idx]
-                M = target_tokens.shape[0]
-
-        # NOTE: N and M can be DIFFERENT! Cost matrix will be [N, M] rectangular.
-
-        # Compute semantic cost matrix (RECTANGULAR: [N, M])
-        # C[i,j] = 1 - cos(pred[i], target[j])
-        if lm_head is not None:
-            # True EMO: Project to vocabulary space
-            E = lm_head.weight.data  # [vocab_size, hidden_dim]
-            E = E / torch.linalg.vector_norm(E, ord=2, dim=1, keepdim=True)
-            E = E.to(device=device, dtype=dtype)
-
-            pred_logits = pred_tokens @ E.t()      # [N, vocab_size]
-            target_logits = target_tokens @ E.t()  # [M, vocab_size]
-
-            Q_θ = F.softmax(pred_logits, dim=-1)      # [N, vocab_size]
-            P = F.softmax(target_logits, dim=-1)      # [M, vocab_size]
-
-            pred_repr = Q_θ @ E      # [N, hidden_dim]
-            target_repr = P @ E      # [M, hidden_dim]
-
-            # Semantic cost: [N, M] (rectangular!)
-            pred_repr_norm = F.normalize(pred_repr, dim=-1)
-            target_repr_norm = F.normalize(target_repr, dim=-1)
-            semantic_sim = torch.mm(pred_repr_norm, target_repr_norm.t())  # [N, M]
-            cost_matrix = 1.0 - semantic_sim
-        else:
-            # Direct hidden space (default, more efficient)
-            pred_norm = F.normalize(pred_tokens, dim=-1)  # [N, D]
-            target_norm = F.normalize(target_tokens, dim=-1)  # [M, D]
-            semantic_sim = torch.mm(pred_norm, target_norm.t())  # [N, M]
-            cost_matrix = 1.0 - semantic_sim
-
-        # DEMD with uniform distributions over DIFFERENT sizes:
-        # Q: uniform over N tokens → [1/N, ..., 1/N]  (size N)
-        # P: uniform over M tokens → [1/M, ..., 1/M]  (size M)
-        #
-        # DEMD = Q^T @ C @ P
-        #      = Σ_i (Q[i] * Σ_j (P[j] * C[i,j]))
-        #      = (1/N) * Σ_i (1/M) * Σ_j C[i,j]
-        #      = (1/(N*M)) * Σ_i Σ_j C[i,j]
-        #      = mean(cost_matrix)
-
-        sample_ot_loss = cost_matrix.mean()  # Average over N×M rectangular matrix
+        pred_tokens = sample_hidden.to(device=device, dtype=dtype)
+        sample_ot_loss, cost_matrix = _compute_ot_sample_loss(
+            pred_tokens=pred_tokens,
+            target_tokens=target_tokens,
+            lm_head=lm_head,
+        )
         ot_losses.append(sample_ot_loss)
 
         # Collect statistics
         stats["num_valid_samples"] += 1
-        stats["total_pred_tokens"] += N
-        stats["total_target_tokens"] += M
+        stats["total_pred_tokens"] += cost_matrix.shape[0]
+        stats["total_target_tokens"] += cost_matrix.shape[1]
         stats["cost_stats"].append((
             cost_matrix.min().item(),
             cost_matrix.max().item(),
@@ -4009,41 +4063,16 @@ def _compute_post_vae_loss(
                 pooled_targets.append(torch.cat([target_mean, target_max], dim=0))
                 continue
 
-            pred_for_ot = pred_tokens
-            target_for_ot = target_tokens
-            sample_k_raw = os.environ.get("QWEN3VL_OT_SAMPLE_K", "16")
-            sample_k = None
-            if isinstance(sample_k_raw, str):
-                if sample_k_raw.strip().lower() not in ("none", "null", "off", "disable", "disabled"):
-                    try:
-                        sample_k = int(sample_k_raw)
-                    except ValueError:
-                        sample_k = 16
-            elif isinstance(sample_k_raw, int):
-                sample_k = sample_k_raw
-
-            n_pred = pred_for_ot.shape[0]
-            n_target = target_for_ot.shape[0]
-            if sample_k is not None and sample_k > 0:
-                if n_pred > sample_k:
-                    idx = torch.randperm(n_pred, device=device)[:sample_k]
-                    pred_for_ot = pred_for_ot[idx]
-                    n_pred = pred_for_ot.shape[0]
-                if n_target > sample_k:
-                    idx = torch.randperm(n_target, device=device)[:sample_k]
-                    target_for_ot = target_for_ot[idx]
-                    n_target = target_for_ot.shape[0]
-
-            pred_norm = F.normalize(pred_for_ot, dim=-1)
-            target_norm = F.normalize(target_for_ot, dim=-1)
-            cost_matrix = 1.0 - torch.mm(pred_norm, target_norm.t())
-            sample_loss = cost_matrix.mean()
+            sample_loss, cost_matrix = _compute_ot_sample_loss(
+                pred_tokens=pred_tokens,
+                target_tokens=target_tokens,
+            )
             sample_losses.append(sample_loss)
 
             assert stats is not None
             stats["num_valid_samples"] += 1
-            stats["total_pred_tokens"] += n_pred
-            stats["total_target_tokens"] += n_target
+            stats["total_pred_tokens"] += cost_matrix.shape[0]
+            stats["total_target_tokens"] += cost_matrix.shape[1]
             stats["cost_stats"].append((
                 cost_matrix.min().item(),
                 cost_matrix.max().item(),
