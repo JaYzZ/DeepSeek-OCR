@@ -1,5 +1,5 @@
 ### model
-# Native Qwen3-VL-2B-Thinking with latent supervision for R1-OneVision training.
+# Qwen3-VL-2B-Thinking with latent supervision for R1-OneVision training.
 #
 # Sequence format:
 # - Assistant target is `<think><latent>...<think_sep>... </think>{answer}`.
@@ -23,14 +23,14 @@
 # Hidden-state losses:
 # - `mse/repa` compare shifted hidden states against `latent_ground_truth`.
 # - `ot/nce` compare shifted hidden states to `latent_supervision`.
-# - `vae` enables the latent VAE and an auxiliary `pred_embed_forward` CE pass
-#   that reuses the same supervision region/targets as the main CE path.
+# - `vae` enables the latent VAE on the shifted prev-hidden -> next-latent path.
+# - `vae_ce` optionally adds the auxiliary `pred_embed_forward` CE pass.
 #
 # Key differences from OCRVL / DPSK-based setups:
-# - Native Qwen3-VL vision tower, no OCRVL wrapper or DPSK encoder in this run.
+# - Qwen3-VL vision tower, no OCRVL wrapper or DPSK encoder in this run.
 # - Question text stays in the normal chat sequence.
 # - Direct hidden-state supervision, no reverse projection head.
-model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking
+model_name_or_path: /share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking
 add_special_tokens: "<latent>,<think_sep>"
 image_max_pixels: 262144
 video_max_pixels: 16384
@@ -59,19 +59,22 @@ freeze_vision_tower: true
 # - `cot_chunk_token_ids`: one tokenized CoT chunk per latent step, used when
 #   `latent_ce_token=0`
 # - `num_latent_steps`: number of thinking chunks (`<think_sep>` count + 1)
-dataset: qwen3vl_r1_onevision_thinking
+# Unified latent SFT: always train on both R1-OneVision and encoded DeepVision-103K.
+dataset: r1_onevision_thinking,deepvision_thinking
 dataset_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/data
 template: qwen3vl_latent
 cutoff_len: 8192
 max_samples: null
 streaming: false
 packing: false
+mix_strategy: concat
+overwrite_cache: false
 preprocessing_num_workers: 8
 dataloader_num_workers: 8
 dataloader_prefetch_factor: 8
 
 ### output
-output_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/qwen3vl-2b/lora/r1_onevision_thinking
+output_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/qwen3vl-2b/lora/r1ov_deepvision_thinking
 logging_steps: 10
 save_steps: 500
 plot_loss: true
@@ -81,7 +84,7 @@ report_to: none
 log_level: info
 use_swanlab: true
 swanlab_mode: cloud
-swanlab_project: qwen3vl-r1-onevision
+swanlab_project: qwen3vl-r1ov-deepvision
 
 ### train
 per_device_train_batch_size: 32

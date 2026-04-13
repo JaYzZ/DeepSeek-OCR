@@ -13,18 +13,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+source "$SCRIPT_DIR/qwen3vl_common.sh"
 source "$SCRIPT_DIR/train_qwen3vl_dataset_mix.sh"
 
-# Required python interpreter (OCRFlow env)
-PYTHON_BIN="$REPO_ROOT/../../envs/ocrflow/bin/python"
-if [ ! -x "$PYTHON_BIN" ]; then
-  echo "❌ Python not found or not executable: $PYTHON_BIN" >&2
-  echo "   Please ensure OCRFlow env exists at: $REPO_ROOT/../../envs/ocrflow" >&2
-  exit 1
-fi
+PYTHON_BIN="$(qwen3vl_require_python_bin "$REPO_ROOT")"
 
 # Default config
-DEFAULT_CONFIG="$REPO_ROOT/Qwen/configs/qwen3vl_native_r1onevision_thinking.yaml"
+DEFAULT_CONFIG="$REPO_ROOT/Qwen/configs/qwen3vl_r1onevision_thinking.yaml"
 DEFAULT_RUNTIME_ENV_CONFIG="$REPO_ROOT/Qwen/configs/qwen3vl_runtime_env.yaml"
 
 CONFIG_PATH="${1:-$DEFAULT_CONFIG}"
@@ -41,117 +36,20 @@ fi
 # Derive model path from config (used for HF_MODULES_CACHE if present)
 MODEL_PATH="$(grep -E '^model_name_or_path:' "$CONFIG_PATH" | head -n 1 | awk '{print $2}')"
 
-# ============================================================================
-# Export config values as environment variables for Python callbacks
-# ============================================================================
-# Helper to read a yaml key (supports dotted paths, e.g. "runtime.backfill_enable")
-_get_yaml_value() {
-    local file_path="$1"
-    local key="$2"
-    local default_value="${3:-}"
-    "$PYTHON_BIN" - "$file_path" "$key" "$default_value" <<'PY'
-import sys
-from pathlib import Path
-import yaml
-
-file_path, key, default_value = sys.argv[1], sys.argv[2], sys.argv[3]
-try:
-    data = yaml.safe_load(Path(file_path).read_text()) or {}
-except Exception:
-    print(default_value)
-    raise SystemExit(0)
-
-value = data
-for part in key.split("."):
-    if isinstance(value, dict) and part in value:
-        value = value[part]
-    else:
-        value = default_value
-        break
-
-if value is None:
-    value = default_value
-if isinstance(value, bool):
-    print("1" if value else "0")
-else:
-    print(str(value))
-PY
-}
-
 _get_main_config() {
-    _get_yaml_value "$CONFIG_PATH" "$1" "${2:-}"
+    qwen3vl_get_yaml_value "$PYTHON_BIN" "$CONFIG_PATH" "$1" "${2:-}"
 }
 
 _get_runtime_config() {
-    _get_yaml_value "$QWEN3VL_RUNTIME_ENV_CONFIG" "$1" "${2:-}"
+    qwen3vl_get_yaml_value "$PYTHON_BIN" "$QWEN3VL_RUNTIME_ENV_CONFIG" "$1" "${2:-}"
 }
 
 _set_env_from_runtime() {
-    local env_name="$1"
-    local runtime_key="$2"
-    local default_value="$3"
-    local current_value="${!env_name:-}"
-    if [[ -n "$current_value" ]]; then
-        export "$env_name=$current_value"
-    else
-        export "$env_name=$(_get_runtime_config "$runtime_key" "$default_value")"
-    fi
+    qwen3vl_export_env_from_yaml "$PYTHON_BIN" "$QWEN3VL_RUNTIME_ENV_CONFIG" "$1" "$2" "$3"
 }
 
 _set_env_from_main() {
-    local env_name="$1"
-    local main_key="$2"
-    local default_value="$3"
-    local current_value="${!env_name:-}"
-    if [[ -n "$current_value" ]]; then
-        export "$env_name=$current_value"
-    else
-        export "$env_name=$(_get_main_config "$main_key" "$default_value")"
-    fi
-}
-
-_resolve_master_port() {
-    "$PYTHON_BIN" - "${MASTER_PORT:-}" <<'PY'
-import socket
-import sys
-
-preferred = sys.argv[1].strip()
-
-def is_free(port: int) -> bool:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.bind(("", port))
-        return True
-    except OSError:
-        return False
-    finally:
-        sock.close()
-
-if not preferred:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("", 0))
-    print(sock.getsockname()[1])
-    sock.close()
-    raise SystemExit(0)
-
-port = max(1, min(int(preferred), 65535))
-while port <= 65535:
-    if is_free(port):
-        print(port)
-        raise SystemExit(0)
-    port += 1
-
-raise SystemExit("No available TCP port found.")
-PY
-}
-
-_snapshot_run_configs() {
-    local dest_dir="$1"
-    local config_dest="$dest_dir/$(basename "$CONFIG_PATH")"
-    local runtime_dest="$dest_dir/$(basename "$QWEN3VL_RUNTIME_ENV_CONFIG")"
-
-    cp -f "$CONFIG_PATH" "$config_dest"
-    cp -f "$QWEN3VL_RUNTIME_ENV_CONFIG" "$runtime_dest"
+    qwen3vl_export_env_from_yaml "$PYTHON_BIN" "$CONFIG_PATH" "$1" "$2" "$3"
 }
 
 _build_curriculum_stage_plan() {
@@ -275,26 +173,41 @@ print(span)
 PY
 }
 
-_list_checkpoint_dirs() {
-    "$PYTHON_BIN" - "$CKPT_DIR" <<'PY'
+_build_curriculum_stage_dataset_plan() {
+    local stage_datasets_str="$1"
+    local default_dataset_spec="$2"
+    local num_stages="$3"
+    "$PYTHON_BIN" - "$stage_datasets_str" "$default_dataset_spec" "$num_stages" <<'PY'
 import sys
-from pathlib import Path
 
-ckpt_dir = Path(sys.argv[1]).resolve()
-candidates = []
-for path in ckpt_dir.glob("checkpoint-*"):
-    if path.is_dir():
-        candidates.append(path)
-for stage_dir in ckpt_dir.glob("stage_*"):
-    if not stage_dir.is_dir():
-        continue
-    for path in stage_dir.glob("checkpoint-*"):
-        if path.is_dir():
-            candidates.append(path)
+raw_stage_datasets, default_dataset_spec, num_stages_str = sys.argv[1:]
+num_stages = int(num_stages_str)
 
-for path in sorted(candidates, key=lambda p: str(p.relative_to(ckpt_dir))):
-    print(path.relative_to(ckpt_dir))
+if num_stages <= 0:
+    raise SystemExit("Curriculum stage dataset plan requires num_stages > 0.")
+
+raw_stage_datasets = raw_stage_datasets.strip()
+if not raw_stage_datasets:
+    specs = [default_dataset_spec] * num_stages
+else:
+    specs = [item.strip() for item in raw_stage_datasets.split("|")]
+    if len(specs) == 1 and num_stages > 1:
+        specs = specs * num_stages
+
+if len(specs) != num_stages:
+    raise SystemExit(
+        f"Curriculum stage dataset spec length mismatch: got {len(specs)} spec(s) for {num_stages} stages."
+    )
+
+for spec in specs:
+    if not spec:
+        raise SystemExit("Curriculum stage dataset spec entries must be non-empty.")
+    print(spec)
 PY
+}
+
+_list_checkpoint_dirs() {
+    qwen3vl_list_checkpoint_dirs "$PYTHON_BIN" "$CKPT_DIR"
 }
 
 # Export env vars that Python code needs (canonicalized in qwen3vl_runtime_env.yaml)
@@ -303,18 +216,20 @@ _set_env_from_runtime "QWEN3VL_LATENT_TOKEN_ID" "latent_token_id" "151669"
 _set_env_from_runtime "QWEN3VL_THINKING_START_ID" "thinking_start_id" "151667"
 _set_env_from_runtime "QWEN3VL_THINKING_END_ID" "thinking_end_id" "151668"
 _set_env_from_runtime "QWEN3VL_THINKING_SEP_ID" "thinking_sep_id" "151670"
-_set_env_from_runtime "QWEN3VL_LOSS_TYPE" "loss_type" "vae+ot+mse"
-_set_env_from_runtime "QWEN3VL_LATENT_AUX_LOSS_SOURCE" "latent_aux_loss_source" "vae_sample"
+_set_env_from_runtime "QWEN3VL_LOSS_TYPE" "loss_type" "ce+vae"
+_set_env_from_runtime "QWEN3VL_LATENT_AUX_LOSS_SOURCE" "latent_aux_loss_source" "hidden"
 _set_env_from_runtime "QWEN3VL_MATCH_STRATEGY" "match_strategy" "truncate"
 _set_env_from_runtime "QWEN3VL_MAX_NEW_TOKENS" "max_new_tokens" "40960"
 _set_env_from_runtime "QWEN3VL_VAE_INTERMEDIATE_SIZE" "vae_intermediate_size" "512"
 _set_env_from_runtime "QWEN3VL_CURRICULUM_ENABLE" "curriculum_enable" "1"
 _set_env_from_runtime "QWEN3VL_CURRICULUM_EPOCHS" "curriculum_epochs" "0,1,2"
-_set_env_from_runtime "QWEN3VL_CURRICULUM_LOSS_TYPES" "curriculum_loss_types" "ce+mse:0.4+ot:0.4,ce+vae:0.4+mse:0.4+ot:0.4,ce+vae_ce+vae:0.4+mse:0.4+ot:0.4"
-_set_env_from_runtime "QWEN3VL_CURRICULUM_VAE_TRAINABLE" "curriculum_vae_trainable" "1"
+_set_env_from_runtime "QWEN3VL_CURRICULUM_LOSS_TYPES" "curriculum_loss_types" "ce+mse:0.4+ot:0.4,vae,ce+vae"
+_set_env_from_runtime "QWEN3VL_CURRICULUM_VAE_TRAINABLE" "curriculum_vae_trainable" "0,1,0"
 _set_env_from_runtime "QWEN3VL_CURRICULUM_AUX_SOURCE" "curriculum_aux_source" "hidden"
-_set_env_from_runtime "QWEN3VL_CURRICULUM_LORA_TRAINABLE" "curriculum_lora_trainable" "1"
-_set_env_from_runtime "QWEN3VL_CURRICULUM_LATENT_CE" "curriculum_latent_ce" "1"
+_set_env_from_runtime "QWEN3VL_CURRICULUM_LORA_TRAINABLE" "curriculum_lora_trainable" "1,0,1"
+_set_env_from_runtime "QWEN3VL_CURRICULUM_LATENT_CE" "curriculum_latent_ce" "1,0,0"
+_set_env_from_runtime "QWEN3VL_CURRICULUM_STAGE_DATASETS" "curriculum_stage_datasets" ""
+_set_env_from_runtime "QWEN3VL_PREPARE_CURRICULUM_DATASETS" "prepare_curriculum_datasets" "0"
 _set_env_from_runtime "QWEN3VL_LATENT_CE_TOKEN" "latent_ce_token" "0"
 _set_env_from_runtime "QWEN3VL_HIDDEN_STATES_HOOK" "hidden_states_hook" "1"
 _set_env_from_main "DATALOADER_NUM_WORKERS" "dataloader_num_workers" "4"
@@ -392,29 +307,6 @@ if [[ ! "$DATASET_DIR" = /* ]]; then
 fi
 
 mkdir -p "$RUN_DIR"
-eval "$(qwen3vl_materialize_dataset_mix "$PYTHON_BIN" "$DATASET_DIR" "$DATASET_SPEC" "$RUN_DIR")"
-DATASET_SPEC="$QWEN3VL_EFFECTIVE_DATASET_SPEC"
-DATASET_DIR="$QWEN3VL_EFFECTIVE_DATASET_DIR"
-DATASET_RATIO_APPLIED="${QWEN3VL_DATASET_RATIO_APPLIED:-0}"
-DATASET_MIX_SUMMARY_PATH="${QWEN3VL_DATASET_MIX_SUMMARY_PATH:-}"
-DATASET_COUNT="${QWEN3VL_DATASET_COUNT:-1}"
-
-if [ "$DATASET_COUNT" -gt 1 ]; then
-  case "${DATASET_STREAMING,,}" in
-    1|true|yes)
-      echo "❌ Multi-dataset SFT requires streaming=false so the merged dataset can be jointly shuffled." >&2
-      exit 1
-      ;;
-  esac
-  if [[ -z "$DATASET_MIX_STRATEGY" || "$DATASET_MIX_STRATEGY" == "null" ]]; then
-    DATASET_MIX_STRATEGY="concat"
-  fi
-fi
-
-set -- "$@" "dataset=$DATASET_SPEC" "dataset_dir=$DATASET_DIR"
-if [ "$DATASET_COUNT" -gt 1 ]; then
-  set -- "$@" "mix_strategy=$DATASET_MIX_STRATEGY"
-fi
 
 USE_SWANLAB_CONFIG="$(_get_main_config "use_swanlab" || echo "false")"
 SWANLAB_RUN_NAME=""
@@ -442,7 +334,7 @@ fi
 
 # Setup logging
 mkdir -p "$RUN_DIR" "$CKPT_DIR"
-_snapshot_run_configs "$RUN_DIR"
+qwen3vl_snapshot_run_configs "$CONFIG_PATH" "$QWEN3VL_RUNTIME_ENV_CONFIG" "$RUN_DIR"
 CONFIG_PATH="$RUN_DIR/$(basename "$CONFIG_PATH")"
 QWEN3VL_RUNTIME_ENV_CONFIG="$RUN_DIR/$(basename "$QWEN3VL_RUNTIME_ENV_CONFIG")"
 RERUN_EVALS_SH="$RUN_DIR/rerun_evals.sh"
@@ -483,7 +375,7 @@ fi
 BACKFILL_GPUS="\${BACKFILL_GPUS:-\${BACKFILL_CUDA_VISIBLE_DEVICES:-\${CUDA_VISIBLE_DEVICES:-0}}}"
 BENCH_GPUS="\${BENCH_GPUS:-\${BENCH_CUDA_VISIBLE_DEVICES:-\${CUDA_VISIBLE_DEVICES:-\$BACKFILL_GPUS}}}"
 
-QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" CUDA_VISIBLE_DEVICES="\$BACKFILL_GPUS" $PYTHON_BIN Qwen/scripts/backfill_transparent_eval.py --checkpoint_dir "$CKPT_DIR" --checkpoint checkpoint_latest --gpu_memory_utilization \${GPU_MEMORY_UTILIZATION:-0.9} 2>&1 | tee \${BACKFILL_LOG:-/tmp/backfill_thinking_debug.log}
+QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" CUDA_VISIBLE_DEVICES="\$BACKFILL_GPUS" $PYTHON_BIN Qwen/inference/backfill_transparent_eval.py --checkpoint_dir "$CKPT_DIR" --checkpoint checkpoint_latest --gpu_memory_utilization \${GPU_MEMORY_UTILIZATION:-0.9} 2>&1 | tee \${BACKFILL_LOG:-/tmp/backfill_thinking_debug.log}
 BENCH_DIR="$RUN_DIR/bench"
 mkdir -p "\$BENCH_DIR"
 QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" VLLM_FORCE_THINK=$VLLM_FORCE_THINK CUDA_VISIBLE_DEVICES="\$BENCH_GPUS" $PYTHON_BIN Qwen/evaluation/run_all_benchmarks.py --start-server --gpus "\$BENCH_GPUS" --benchmarks \${BENCHMARKS:-MathVision,MMMU,RealWorldQA} --num-samples \${BENCHMARK_NUM_SAMPLES:-$BENCHMARK_NUM_SAMPLES} --lora-path "$CKPT_DIR/checkpoint_latest" --run-dir "\$BENCH_DIR"
@@ -526,7 +418,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export TMPDIR="${TMPDIR:-/tmp}"
 
 if [ "${NNODES:-1}" = "1" ]; then
-    export MASTER_PORT="$(_resolve_master_port)"
+    export MASTER_PORT="$(qwen3vl_resolve_master_port "$PYTHON_BIN")"
 fi
 
 # Detect distributed backend from config (DeepSpeed vs FSDP) for display purposes
@@ -566,6 +458,7 @@ QWEN3VL_SPLIT_CURRICULUM_STAGES="${QWEN3VL_SPLIT_CURRICULUM_STAGES:-1}"
 TOTAL_NUM_TRAIN_EPOCHS="$(_resolve_total_num_train_epochs "$MAIN_NUM_TRAIN_EPOCHS" "$QWEN3VL_CURRICULUM_EPOCHS")"
 
 STAGE_PLAN_LINES=()
+STAGE_DATASET_SPECS=()
 if [ "$QWEN3VL_SPLIT_CURRICULUM_STAGES" = "1" ] && [ "$QWEN3VL_CURRICULUM_ENABLE" = "1" ]; then
     mapfile -t STAGE_PLAN_LINES < <(
         _build_curriculum_stage_plan \
@@ -577,6 +470,18 @@ if [ "$QWEN3VL_SPLIT_CURRICULUM_STAGES" = "1" ] && [ "$QWEN3VL_CURRICULUM_ENABLE
             "$QWEN3VL_CURRICULUM_LATENT_CE" \
             "$TOTAL_NUM_TRAIN_EPOCHS"
     )
+    mapfile -t STAGE_DATASET_SPECS < <(
+        _build_curriculum_stage_dataset_plan \
+            "$QWEN3VL_CURRICULUM_STAGE_DATASETS" \
+            "$DATASET_SPEC" \
+            "${#STAGE_PLAN_LINES[@]}"
+    )
+fi
+
+if [ "$QWEN3VL_PREPARE_CURRICULUM_DATASETS" = "1" ]; then
+    _log_wrapper_status "prepare_curriculum_datasets start"
+    "$PYTHON_BIN" "$REPO_ROOT/Qwen/data/prepare_qwen3vl_curriculum_datasets.py" 2>&1 | tee -a "$LOG_FILE"
+    _log_wrapper_status "prepare_curriculum_datasets done"
 fi
 
 
@@ -599,17 +504,15 @@ echo "Dataset dir: $DATASET_DIR"
 echo "GPUs: $CUDA_VISIBLE_DEVICES"
 echo ""
 echo "Dataset Mixing:"
-echo "  - Entries: $DATASET_COUNT"
-echo "  - Ratio parsing: $([ "$DATASET_RATIO_APPLIED" = "1" ] && echo "enabled" || echo "disabled")"
+echo "  - Base spec: $DATASET_SPEC"
 echo "  - Mix strategy: ${DATASET_MIX_STRATEGY:-concat}"
 if [ "${DATASET_MIX_STRATEGY:-concat}" = "concat" ]; then
   echo "  - Joint shuffle: enabled via concat + Trainer random sampler"
 else
   echo "  - Joint shuffle: Trainer random sampler enabled; mix ordering follows ${DATASET_MIX_STRATEGY}"
 fi
-if [ -n "$DATASET_MIX_SUMMARY_PATH" ]; then
-  echo "  - Summary: $DATASET_MIX_SUMMARY_PATH"
-fi
+echo "  - Stage dataset overrides: ${QWEN3VL_CURRICULUM_STAGE_DATASETS:-none}"
+echo "  - Auto-prepare derived datasets: $QWEN3VL_PREPARE_CURRICULUM_DATASETS"
 echo ""
 echo "Latent Supervision:"
 echo "  - Enabled: $QWEN3VL_LATENT_SUPERVISION"
@@ -632,9 +535,11 @@ echo "  - Loss types: $QWEN3VL_CURRICULUM_LOSS_TYPES"
 echo "  - Latent step CE: $QWEN3VL_CURRICULUM_LATENT_CE"
 echo "  - Split into separate runs: $QWEN3VL_SPLIT_CURRICULUM_STAGES"
 if [ "${#STAGE_PLAN_LINES[@]}" -gt 0 ]; then
-  for stage_line in "${STAGE_PLAN_LINES[@]}"; do
+  for idx in "${!STAGE_PLAN_LINES[@]}"; do
+    stage_line="${STAGE_PLAN_LINES[$idx]}"
     IFS=$'\t' read -r stage_num stage_start stage_end stage_loss stage_vae_trainable stage_lora_trainable stage_aux_source stage_latent_ce <<< "$stage_line"
-    echo "    Stage $stage_num: epochs [$stage_start, $stage_end) loss=$stage_loss vae_trainable=$stage_vae_trainable lora_trainable=$stage_lora_trainable aux_source=$stage_aux_source latent_ce=$stage_latent_ce"
+    stage_dataset_spec="${STAGE_DATASET_SPECS[$idx]:-$DATASET_SPEC}"
+    echo "    Stage $stage_num: epochs [$stage_start, $stage_end) loss=$stage_loss vae_trainable=$stage_vae_trainable lora_trainable=$stage_lora_trainable aux_source=$stage_aux_source latent_ce=$stage_latent_ce dataset=$stage_dataset_spec"
   done
 fi
 echo ""
@@ -669,6 +574,9 @@ for arg in "$@"; do
     if [[ "$arg" == swanlab_run_name=* ]]; then
         continue
     fi
+    if [[ "$arg" == dataset=* || "$arg" == dataset_dir=* || "$arg" == mix_strategy=* || "$arg" == num_train_epochs=* ]]; then
+        continue
+    fi
     TRAIN_ARGS+=("$arg")
 done
 
@@ -682,13 +590,38 @@ _run_llamafactory_stage() {
     local stage_aux_source="$7"
     local stage_latent_ce="$8"
     local stage_resume="$9"
+    local stage_dataset_spec="${10}"
     local stage_output_dir="$CKPT_DIR/stage_${stage_num}"
     local stage_num_train_epochs
     stage_num_train_epochs="$(_compute_epoch_span "$stage_start" "$stage_end")"
 
+    eval "$(qwen3vl_materialize_dataset_mix "$PYTHON_BIN" "$DATASET_DIR" "$stage_dataset_spec" "$stage_output_dir")"
+    local effective_dataset_spec="$QWEN3VL_EFFECTIVE_DATASET_SPEC"
+    local effective_dataset_dir="$QWEN3VL_EFFECTIVE_DATASET_DIR"
+    local stage_dataset_ratio_applied="${QWEN3VL_DATASET_RATIO_APPLIED:-0}"
+    local stage_dataset_mix_summary_path="${QWEN3VL_DATASET_MIX_SUMMARY_PATH:-}"
+    local stage_dataset_count="${QWEN3VL_DATASET_COUNT:-1}"
+
+    if [ "$stage_dataset_count" -gt 1 ]; then
+      case "${DATASET_STREAMING,,}" in
+        1|true|yes)
+          echo "❌ Multi-dataset SFT requires streaming=false so the merged dataset can be jointly shuffled." >&2
+          return 1
+          ;;
+      esac
+      if [[ -z "$DATASET_MIX_STRATEGY" || "$DATASET_MIX_STRATEGY" == "null" ]]; then
+        DATASET_MIX_STRATEGY="concat"
+      fi
+    fi
+
     local stage_args=("${TRAIN_ARGS[@]}")
     stage_args+=("output_dir=$stage_output_dir")
     stage_args+=("num_train_epochs=$stage_num_train_epochs")
+    stage_args+=("dataset=$effective_dataset_spec")
+    stage_args+=("dataset_dir=$effective_dataset_dir")
+    if [ "$stage_dataset_count" -gt 1 ]; then
+        stage_args+=("mix_strategy=$DATASET_MIX_STRATEGY")
+    fi
     if [ -n "$stage_resume" ]; then
         stage_args+=("adapter_name_or_path=$stage_resume")
         stage_args+=("resume_from_checkpoint=null")
@@ -704,6 +637,11 @@ _run_llamafactory_stage() {
     export QWEN3VL_LORA_TRAINABLE="$stage_lora_trainable"
     export QWEN3VL_LATENT_AUX_LOSS_SOURCE="$stage_aux_source"
     export QWEN3VL_LATENT_CE_ACTIVE="$stage_latent_ce"
+    if [ -n "$stage_resume" ] && [ -f "$stage_resume/vae.safetensors" ]; then
+        export QWEN3VL_VAE_CHECKPOINT_PATH="$stage_resume/vae.safetensors"
+    else
+        unset QWEN3VL_VAE_CHECKPOINT_PATH || true
+    fi
     if [[ "$stage_loss" == *"vae_ce"* ]]; then
         export QWEN3VL_VAE_CE_ENABLE=1
     else
@@ -722,7 +660,16 @@ _run_llamafactory_stage() {
     echo "  LoRA trainable: $stage_lora_trainable"
     echo "  Aux source: $stage_aux_source"
     echo "  Latent CE: $stage_latent_ce"
+    echo "  VAE handoff: ${QWEN3VL_VAE_CHECKPOINT_PATH:-none}"
     echo "  Handoff weights: ${stage_resume:-none}"
+    echo "  Dataset spec: $stage_dataset_spec"
+    echo "  Effective dataset spec: $effective_dataset_spec"
+    echo "  Effective dataset dir: $effective_dataset_dir"
+    echo "  Dataset entries: $stage_dataset_count"
+    echo "  Ratio parsing: $([ "$stage_dataset_ratio_applied" = "1" ] && echo "enabled" || echo "disabled")"
+    if [ -n "$stage_dataset_mix_summary_path" ]; then
+        echo "  Dataset summary: $stage_dataset_mix_summary_path"
+    fi
     echo "  Stage output dir: $stage_output_dir"
     echo "========================================================================"
 
@@ -783,7 +730,8 @@ if [ "${#STAGE_PLAN_LINES[@]}" -gt 0 ]; then
             "$stage_lora_trainable" \
             "$stage_aux_source" \
             "$stage_latent_ce" \
-            "$stage_resume"
+            "$stage_resume" \
+            "${STAGE_DATASET_SPECS[$((stage_num - 1))]:-$DATASET_SPEC}"
         stage_exit_code=$?
         if [ "$stage_exit_code" -ne 0 ]; then
             train_exit_code=$stage_exit_code
@@ -800,7 +748,8 @@ else
         "${QWEN3VL_LORA_TRAINABLE:-1}" \
         "$QWEN3VL_LATENT_AUX_LOSS_SOURCE" \
         "${QWEN3VL_LATENT_CE_ACTIVE:-1}" \
-        ""
+        "" \
+        "$DATASET_SPEC"
     stage_exit_code=$?
     if [ "$stage_exit_code" -ne 0 ]; then
         train_exit_code=$stage_exit_code
@@ -866,7 +815,7 @@ if [ "$train_exit_code" -eq 0 ] && [ "$RUN_BACKFILL" = "1" ]; then
                 # Run backfill in background with specific GPU
                 (
                     echo "[$(date '+%F %T')] Start $checkpoint_name on GPU $gpu_id" >> "$RUN_DIR/backfill_all_checkpoints.log"
-                    if QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" CUDA_VISIBLE_DEVICES="$gpu_id" "$PYTHON_BIN" Qwen/scripts/backfill_transparent_eval.py \
+                    if QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" CUDA_VISIBLE_DEVICES="$gpu_id" "$PYTHON_BIN" Qwen/inference/backfill_transparent_eval.py \
                         --checkpoint_dir "$CKPT_DIR" \
                         --checkpoint "$checkpoint_name" \
                         --gpu_memory_utilization 0.9 \
@@ -917,7 +866,7 @@ fi
 cleanup_vllm_benchmark_processes() {
     # Ensure leaked vLLM worker/core processes do not affect later jobs.
     "$PYTHON_BIN" - <<'PY'
-from Qwen.scripts.vllm_utils import cleanup_vllm_engine_processes
+from Qwen.inference.vllm_utils import cleanup_vllm_engine_processes
 cleanup_vllm_engine_processes()
 PY
 }

@@ -1,6 +1,6 @@
 ### model
-# Native Qwen3-VL-2B-Thinking for unified SFT training
-# Uses Qwen3VL's native vision tower (no DPSK OCR encoder)
+# Qwen3-VL-2B-Thinking for unified SFT training
+# Uses Qwen3VL's vision tower (no DPSK OCR encoder)
 # Special thinking tokens (present in base model):
 # - <think> (151667): Opens thinking/reasoning section
 # - </think> (151668): Closes thinking/reasoning section

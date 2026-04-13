@@ -8,7 +8,10 @@ const state = {
     imageData: null,
     tokens: [],
     hiddenStates: null,
-    attentionWeights: null,
+    attentionInfo: null,
+    attentionOverview: null,
+    attentionRowCache: {},
+    activeAttentionRequestId: 0,
     continuousMask: [],
     tsneCoordinates: null,
     tsneFeatureTypes: [],
@@ -221,7 +224,9 @@ async function handleGenerate() {
         // Update state
         state.tokens = data.tokens || [];
         state.hiddenStates = data.hidden_states || null;
-        state.attentionWeights = data.attention_weights || null;
+        state.attentionInfo = data.attention || null;
+        state.attentionOverview = null;
+        state.attentionRowCache = {};
         state.continuousMask = data.continuous_mask || [];
         state.tsneCoordinates = data.tsne_coordinates || null;
         state.tsneFeatureTypes = data.tsne_feature_types || [];
@@ -235,7 +240,7 @@ async function handleGenerate() {
         renderAnswer(data.answer);
         renderTokens();
         renderTSNE();
-        renderAttention();
+        await renderAttention();
 
         hideToast();
         showToast('Generation complete!', 'success');
@@ -807,62 +812,119 @@ function highlightTSNEPoint(index) {
     }
 }
 
-function renderAttention() {
-    if (!state.attentionWeights || state.attentionWeights.length === 0) {
+async function fetchAttentionOverview() {
+    if (!state.attentionInfo?.id) return null;
+    if (state.attentionOverview) return state.attentionOverview;
+
+    const response = await fetch(`/api/attention/${encodeURIComponent(state.attentionInfo.id)}/overview`);
+    if (!response.ok) {
+        throw new Error(`Failed to load attention overview (${response.status})`);
+    }
+
+    const data = await response.json();
+    state.attentionOverview = data;
+    return data;
+}
+
+async function fetchAttentionRow(index) {
+    if (!state.attentionInfo?.id) return null;
+    if (state.attentionRowCache[index]) return state.attentionRowCache[index];
+
+    const response = await fetch(`/api/attention/${encodeURIComponent(state.attentionInfo.id)}/row?index=${index}`);
+    if (!response.ok) {
+        throw new Error(`Failed to load attention row (${response.status})`);
+    }
+
+    const data = await response.json();
+    state.attentionRowCache[index] = data;
+    return data;
+}
+
+function renderAttentionEmpty(message) {
         elements.attentionPlot.innerHTML = `
             <div class="empty-state">
                 <span class="empty-icon">🎨</span>
-                <p>Attention weights not available for this checkpoint</p>
+                <p>${escapeHtml(message)}</p>
             </div>
         `;
+}
+
+function buildTokenLabels(indices) {
+    return indices.map((idx) => {
+        const token = state.tokens[idx];
+        const text = token?.text || '';
+        return text.length > 20 ? `${text.substring(0, 20)}...` : text;
+    });
+}
+
+async function renderAttention() {
+    const requestId = ++state.activeAttentionRequestId;
+
+    if (!state.attentionInfo?.id) {
+        renderAttentionEmpty('Attention weights not available for this run');
         return;
     }
 
-    const selectedIndex = state.selectedTokenIndex;
-    const attentionMatrix = state.attentionWeights;
+    elements.attentionPlot.innerHTML = `
+        <div class="empty-state">
+            <span class="empty-icon">⏳</span>
+            <p>Loading attention data...</p>
+        </div>
+    `;
 
-    let z, y;
-    if (selectedIndex !== null && selectedIndex >= 0 && selectedIndex < attentionMatrix.length) {
-        z = [attentionMatrix[selectedIndex]];
-        y = [state.tokens[selectedIndex]?.text || `token_${selectedIndex}`];
-    } else {
-        z = attentionMatrix;
-        y = state.tokens.map(t => t?.text || '');
+    try {
+        const selectedIndex = state.selectedTokenIndex;
+        let z;
+        let x;
+        let y;
+        let titleText;
+
+        if (selectedIndex !== null && selectedIndex >= 0 && selectedIndex < state.tokens.length) {
+            const rowPayload = await fetchAttentionRow(selectedIndex);
+            if (requestId !== state.activeAttentionRequestId) return;
+            z = [rowPayload.row];
+            x = buildTokenLabels(state.tokens.map((_, idx) => idx));
+            y = [state.tokens[selectedIndex]?.text || `token_${selectedIndex}`];
+            titleText = `Attention from: ${state.tokens[selectedIndex]?.text || `token_${selectedIndex}`}`;
+        } else {
+            const overview = await fetchAttentionOverview();
+            if (requestId !== state.activeAttentionRequestId) return;
+            z = overview.matrix;
+            x = buildTokenLabels(overview.col_indices);
+            y = buildTokenLabels(overview.row_indices);
+            titleText = `Attention Heatmap (overview ${overview.matrix.length}x${overview.matrix[0]?.length || 0})`;
+        }
+
+        const trace = {
+            z: z,
+            x: x,
+            y: y,
+            type: 'heatmap',
+            colorscale: 'Blues',
+            showscale: true,
+            hoverinfo: 'z',
+        };
+
+        const layout = {
+            title: {
+                text: titleText,
+                font: { size: 16 }
+            },
+            xaxis: { title: 'Key Position' },
+            yaxis: { title: 'Query Position' },
+            margin: { l: 100, r: 50, t: 50, b: 100 },
+            paper_bgcolor: 'rgba(0,0,0,0)',
+            plot_bgcolor: 'rgba(0,0,0,0)',
+        };
+
+        const config = { responsive: true, displayModeBar: false };
+        elements.attentionPlot.innerHTML = '';
+        Plotly.newPlot(elements.attentionPlot, [trace], layout, config);
+    } catch (error) {
+        if (requestId !== state.activeAttentionRequestId) return;
+        console.error('Attention rendering failed:', error);
+        renderAttentionEmpty(error.message || 'Failed to load attention data');
     }
-
-    // Truncate labels
-    const x = state.tokens.map(t => {
-        const text = t?.text || '';
-        return text.length > 20 ? text.substring(0, 20) + '...' : text;
-    });
-
-    const trace = {
-        z: z,
-        x: x,
-        y: y,
-        type: 'heatmap',
-        colorscale: 'Blues',
-        showscale: true,
-        hoverinfo: 'z',
-    };
-
-    const layout = {
-        title: {
-            text: selectedIndex !== null
-                ? `Attention from: ${escapeHtml(y[0])}`
-                : 'Attention Heatmap',
-            font: { size: 16 }
-        },
-        xaxis: { title: 'Key Position' },
-        yaxis: { title: 'Query Position' },
-        margin: { l: 100, r: 50, t: 50, b: 100 },
-        paper_bgcolor: 'rgba(0,0,0,0)',
-        plot_bgcolor: 'rgba(0,0,0,0)',
-    };
-
-    const config = { responsive: true, displayModeBar: false };
-    elements.attentionPlot.innerHTML = '';
-    Plotly.newPlot(elements.attentionPlot, [trace], layout, config);
 }
 
 // ============================================================================

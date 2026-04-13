@@ -23,7 +23,7 @@ import socket
 import sys
 import time
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -31,10 +31,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from tokenizers import AddedToken
 
-_REPO_ROOT = Path(__file__).parent.parent.parent
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO_ROOT))
 
-from Qwen.scripts.vllm_utils import (
+from Qwen.inference.vllm_utils import (
     apply_runtime_env_for_thinking,
     infer_tensor_parallel_size,
     normalize_media_path,
@@ -66,6 +66,7 @@ else:
     apply_thinking_mode_patch = None
 
 from vllm import LLM, SamplingParams
+from vllm.multimodal.hasher import MultiModalHasher
 from transformers import AutoProcessor
 
 # Try to import LoRARequest
@@ -85,6 +86,23 @@ lora_request = None
 config = {}
 
 
+def _patch_multimodal_none_hashing() -> None:
+    original = MultiModalHasher.serialize_item.__func__
+    if getattr(MultiModalHasher, "_qwen_none_patch_applied", False):
+        return
+
+    def _serialize_item(cls, obj: object):
+        if obj is None:
+            return (b"<none>",)
+        return original(cls, obj)
+
+    MultiModalHasher.serialize_item = classmethod(_serialize_item)
+    MultiModalHasher._qwen_none_patch_applied = True
+
+
+_patch_multimodal_none_hashing()
+
+
 class ChatMessage(BaseModel):
     role: str
     content: Any  # Can be string or list of dicts
@@ -101,8 +119,11 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
 
 
-def run_llm_generation(
-    messages: List[Dict[str, Any]],
+class ChatCompletionBatchRequest(BaseModel):
+    requests: List[ChatCompletionRequest]
+
+
+def _make_sampling_params(
     *,
     temperature: float,
     max_tokens: int,
@@ -110,11 +131,8 @@ def run_llm_generation(
     top_p: float = 1.0,
     presence_penalty: float = 0.0,
     repetition_penalty: float = 1.0,
-):
-    global llm, processor, lora_request
-
-    vllm_input = prepare_inputs_for_vllm(messages, processor)
-    sampling_params = SamplingParams(
+) -> SamplingParams:
+    return SamplingParams(
         max_tokens=max_tokens,
         temperature=temperature,
         n=n,
@@ -124,14 +142,78 @@ def run_llm_generation(
         stop_token_ids=[151643, 151645],
         skip_special_tokens=False,
     )
-    outputs = llm.generate(
-        [vllm_input],
+
+
+def _serialize_chat_output(output) -> Dict[str, Any]:
+    choices = []
+    total_completion_tokens = 0
+    for idx, candidate in enumerate(output.outputs):
+        total_completion_tokens += len(candidate.token_ids)
+        choices.append(
+            {
+                "index": idx,
+                "message": {
+                    "role": "assistant",
+                    "content": candidate.text,
+                },
+                "finish_reason": candidate.finish_reason if hasattr(candidate, "finish_reason") else "stop",
+            }
+        )
+
+    return {
+        "id": "chatcmpl-" + str(int(time.time())),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": config.get("model_path"),
+        "choices": choices,
+        "usage": {
+            "prompt_tokens": len(output.prompt_token_ids),
+            "completion_tokens": total_completion_tokens,
+            "total_tokens": len(output.prompt_token_ids) + total_completion_tokens,
+        },
+    }
+
+
+def _request_sampling_signature(request: ChatCompletionRequest) -> Tuple[float, int, int, float, float, float]:
+    return (
+        request.temperature,
+        request.max_tokens,
+        request.n,
+        request.top_p,
+        request.presence_penalty,
+        request.repetition_penalty,
+    )
+
+
+def run_llm_generation_batch(requests: List[ChatCompletionRequest]):
+    global llm, processor, lora_request
+
+    if not requests:
+        return []
+
+    signature = _request_sampling_signature(requests[0])
+    for request in requests[1:]:
+        if _request_sampling_signature(request) != signature:
+            raise ValueError("Batched chat completions require identical sampling parameters")
+
+    vllm_inputs = []
+    for request in requests:
+        messages = [{"role": m.role, "content": m.content} for m in request.messages]
+        vllm_inputs.append(prepare_inputs_for_vllm(messages, processor))
+
+    sampling_params = _make_sampling_params(
+        temperature=requests[0].temperature,
+        max_tokens=requests[0].max_tokens,
+        n=requests[0].n,
+        top_p=requests[0].top_p,
+        presence_penalty=requests[0].presence_penalty,
+        repetition_penalty=requests[0].repetition_penalty,
+    )
+    return llm.generate(
+        vllm_inputs,
         sampling_params=sampling_params,
         lora_request=lora_request,
     )
-    output = outputs[0]
-    response_text = output.outputs[0].text
-    return output, response_text
 
 
 @app.get("/health")
@@ -182,50 +264,37 @@ async def chat_completions(request: ChatCompletionRequest):
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     try:
-        # Convert messages to vLLM format
-        messages = [{"role": m.role, "content": m.content} for m in request.messages]
-        output, response_text = run_llm_generation(
-            messages,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            n=request.n,
-            top_p=request.top_p,
-            presence_penalty=request.presence_penalty,
-            repetition_penalty=request.repetition_penalty,
-        )
+        output = run_llm_generation_batch([request])[0]
 
         # DEBUG: Print raw output to see if thinking tokens exist (only if VLLM_DEBUG=1)
+        response_text = output.outputs[0].text
         if os.environ.get("VLLM_DEBUG", "0") == "1":
             print(f"[DEBUG] Raw response_text: {repr(response_text[:500])}")
 
-        choices = []
-        total_completion_tokens = 0
-        for idx, candidate in enumerate(output.outputs):
-            total_completion_tokens += len(candidate.token_ids)
-            choices.append(
-                {
-                    "index": idx,
-                    "message": {
-                        "role": "assistant",
-                        "content": candidate.text,
-                    },
-                    "finish_reason": candidate.finish_reason if hasattr(candidate, "finish_reason") else "stop",
-                }
-            )
+        return _serialize_chat_output(output)
 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/chat/completions_batch")
+async def chat_completions_batch(request: ChatCompletionBatchRequest):
+    """Batch chat completion endpoint for benchmark inference."""
+    global llm
+
+    if llm is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    if not request.requests:
+        raise HTTPException(status_code=400, detail="No requests provided")
+
+    try:
+        outputs = run_llm_generation_batch(request.requests)
         return {
-            "id": "chatcmpl-" + str(int(time.time())),
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": config.get("model_path"),
-            "choices": choices,
-            "usage": {
-                "prompt_tokens": len(output.prompt_token_ids),
-                "completion_tokens": total_completion_tokens,
-                "total_tokens": len(output.prompt_token_ids) + total_completion_tokens,
-            }
+            "object": "list",
+            "data": [_serialize_chat_output(output) for output in outputs],
         }
-
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

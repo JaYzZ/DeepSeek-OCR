@@ -24,7 +24,6 @@ import errno
 import platform
 import requests
 import threading
-import concurrent.futures
 import random
 import base64
 from collections import deque
@@ -43,7 +42,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(_EVAL_DIR))
 from config import get_data_path, QWEN3_VL_2B_THINKING
 from utils import select_compatible_tensor_parallel_gpus
-from Qwen.scripts.vllm_utils import (
+from Qwen.inference.vllm_utils import (
     apply_runtime_env_for_thinking,
     cleanup_vllm_engine_processes,
     normalize_media_path,
@@ -361,12 +360,21 @@ def _stream_managed_process_output(
 ) -> threading.Thread:
     """Mirror managed child output to console, benchmark.log, and an in-memory tail."""
 
+    def _should_log_child_line(line: str) -> bool:
+        noisy_substrings = (
+            "Adding requests:",
+            "Processed prompts:",
+            '"POST /v1/chat/completions HTTP/1.1" 200 OK',
+            '"POST /v1/chat/completions_batch HTTP/1.1" 200 OK',
+        )
+        return not any(token in line for token in noisy_substrings)
+
     def _stream() -> None:
         for line in process.stdout:
             rendered = line.rstrip()
             print(f"  [{prefix}] {rendered}")
             output_lines.append(rendered)
-            if logger:
+            if logger and _should_log_child_line(rendered):
                 logger.log(f"[{prefix}] {rendered}", to_console=False)
 
     thread = threading.Thread(target=_stream, daemon=True)
@@ -771,18 +779,24 @@ def run_server_inference(
         total_rows = len(rows)
         progress_step = max(1, min(10, total_rows // 10 if total_rows >= 10 else 1))
 
-        def log_benchmark_progress(phase: str, completed: int, total: int, force: bool = False):
+        def log_benchmark_progress(
+            phase: str,
+            completed: int,
+            total: int,
+            force: bool = False,
+            processing: int = 0,
+        ):
             if not logger or total <= 0:
                 return
             if not force and completed % progress_step != 0 and completed != total:
                 return
             elapsed = time.time() - start_time
             rate = completed / elapsed if elapsed > 0 else 0.0
-            remaining = total - completed
+            remaining = max(total - completed - processing, 0)
             eta_seconds = remaining / rate if rate > 0 else 0.0
             logger.log(
-                f"{phase} progress: {completed}/{total} "
-                f"({(completed / total) * 100:.1f}%) | "
+                f"{phase} progress: completed={completed} processing={processing} total={total} "
+                f"({(completed / total) * 100:.1f}% done) | "
                 f"elapsed={elapsed:.1f}s | rate={rate:.2f} samples/s | eta={eta_seconds:.1f}s"
             )
 
@@ -834,6 +848,18 @@ def run_server_inference(
                 continue
 
         log_benchmark_progress("Prompt build", len(request_tasks), total_rows, force=True)
+        if not request_tasks:
+            error_payload = {
+                "benchmark": benchmark,
+                "error": "No request tasks were built",
+                "num_rows": total_rows,
+            }
+            stats_file = os.path.join(run_dir, f"{benchmark.lower()}{output_suffix}_stats.json")
+            with open(stats_file, "w", encoding="utf-8") as f:
+                json.dump(error_payload, f, indent=2)
+            if logger:
+                logger.log(f"Error: {benchmark} produced no request tasks")
+            continue
 
         def call_server(task: Tuple[int, object, List[dict], dict]) -> Tuple[int, Optional[Dict[str, object]], Optional[str]]:
             idx, row, messages, payload = task
@@ -893,32 +919,140 @@ def run_server_inference(
                     time.sleep((2 ** attempt) + random.random())
             return idx, None, last_err
 
-        # Execute requests concurrently to keep vLLM busy.
+        def call_server_batch(
+            batch_tasks: List[Tuple[int, object, List[dict], dict]]
+        ) -> Tuple[List[Tuple[int, Optional[Dict[str, object]], Optional[str]]], Optional[str]]:
+            if not batch_tasks:
+                return [], None
+
+            url = f"{server_url}/v1/chat/completions_batch"
+            batch_payload = {"requests": [task[3] for task in batch_tasks]}
+            last_err = None
+
+            for attempt in range(3):
+                try:
+                    resp = requests.post(url, json=batch_payload, timeout=None)
+                    if resp.status_code != 200:
+                        last_err = f"HTTP {resp.status_code}: {resp.text[:400]}"
+                        raise RuntimeError(last_err)
+
+                    result_data = resp.json()
+                    responses = result_data.get("data", [])
+                    if len(responses) != len(batch_tasks):
+                        raise RuntimeError(
+                            f"Batch response size mismatch: expected {len(batch_tasks)}, got {len(responses)}"
+                        )
+
+                    batch_results: List[Tuple[int, Optional[Dict[str, object]], Optional[str]]] = []
+                    for task, single_result in zip(batch_tasks, responses):
+                        idx, row, messages, _payload = task
+                        choices = single_result.get("choices", [])
+                        if not choices:
+                            batch_results.append((idx, None, "No choices returned from server"))
+                            continue
+
+                        candidate_results = []
+                        for choice in choices:
+                            response_raw = choice["message"]["content"]
+                            response_final = (
+                                response_raw.split("</think>")[-1].strip()
+                                if "</think>" in response_raw
+                                else response_raw
+                            )
+                            candidate_results.append(
+                                {
+                                    "gen": response_final,
+                                    "gen_raw": response_raw,
+                                    "finish_reason": choice.get("finish_reason", "stop"),
+                                }
+                            )
+
+                        primary = candidate_results[0]
+                        row_dict = row.to_dict() if hasattr(row, "to_dict") else dict(row)
+                        row_dict = _sanitize_json_value(row_dict)
+                        out = {
+                            "question_id": idx,
+                            "annotation": row_dict,
+                            "task": benchmark,
+                            "result": {
+                                "gen": primary["gen"],
+                                "gen_raw": primary["gen_raw"],
+                                "finish_reason": primary["finish_reason"],
+                            },
+                            "messages": messages,
+                        }
+                        if len(candidate_results) > 1:
+                            out["candidates"] = candidate_results
+                            out["candidate_stats"] = {
+                                "num_candidates": len(candidate_results),
+                                "num_unique_final_answers": len({c["gen"] for c in candidate_results}),
+                                "num_unique_raw_answers": len({c["gen_raw"] for c in candidate_results}),
+                            }
+                        if "usage" in single_result:
+                            out["usage"] = single_result["usage"]
+                        batch_results.append((idx, out, None))
+
+                    return batch_results, None
+                except Exception as e:
+                    last_err = str(e)
+                    time.sleep((2 ** attempt) + random.random())
+
+            return [], last_err
+
+        # Batch requests so vLLM can decode multiple samples in one generate() call.
         effective_concurrency = max(1, int(concurrency or 1))
-        if effective_concurrency == 1:
-            completed_requests = 0
-            for task in tqdm(request_tasks, total=len(request_tasks), desc=f"{benchmark} infer"):
-                idx, out, err = call_server(task)
+        sample_errors: List[str] = []
+        batch_tasks = [
+            request_tasks[start:start + effective_concurrency]
+            for start in range(0, len(request_tasks), effective_concurrency)
+        ]
+        completed_requests = 0
+        for batch in tqdm(batch_tasks, total=len(batch_tasks), desc=f"{benchmark} infer"):
+            log_benchmark_progress(
+                "Inference",
+                completed_requests,
+                len(request_tasks),
+                force=True,
+                processing=len(batch),
+            )
+            batch_results, batch_err = call_server_batch(batch)
+            if batch_err is not None:
+                for idx, _row, _messages, _payload in batch:
+                    print(f"Error for sample {idx}: {batch_err}")
+                    if len(sample_errors) < 5:
+                        sample_errors.append(f"sample {idx}: {batch_err}")
+                completed_requests += len(batch)
+                log_benchmark_progress("Inference", completed_requests, len(request_tasks), force=True)
+                continue
+
+            for idx, out, err in batch_results:
                 if out is not None:
                     results_by_idx[idx] = out
                 else:
                     print(f"Error for sample {idx}: {err}")
-                completed_requests += 1
-                log_benchmark_progress("Inference", completed_requests, len(request_tasks))
-        else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=effective_concurrency) as ex:
-                futures = [ex.submit(call_server, task) for task in request_tasks]
-                completed_requests = 0
-                for fut in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"{benchmark} infer"):
-                    idx, out, err = fut.result()
-                    if out is not None:
-                        results_by_idx[idx] = out
-                    else:
-                        print(f"Error for sample {idx}: {err}")
-                    completed_requests += 1
-                    log_benchmark_progress("Inference", completed_requests, len(request_tasks))
+                    if len(sample_errors) < 5:
+                        sample_errors.append(f"sample {idx}: {err}")
+
+            completed_requests += len(batch)
+            log_benchmark_progress("Inference", completed_requests, len(request_tasks), force=True)
 
         log_benchmark_progress("Inference", len(request_tasks), len(request_tasks), force=True)
+        if not results_by_idx:
+            error_payload = {
+                "benchmark": benchmark,
+                "error": "No successful inference rows were produced",
+                "num_requests": len(request_tasks),
+                "num_failures": len(request_tasks),
+                "sample_errors": sample_errors,
+            }
+            stats_file = os.path.join(run_dir, f"{benchmark.lower()}{output_suffix}_stats.json")
+            with open(stats_file, "w", encoding="utf-8") as f:
+                json.dump(error_payload, f, indent=2)
+            if logger:
+                logger.log(f"Error: {benchmark} inference produced 0 successful rows out of {len(request_tasks)} requests")
+                for err in sample_errors:
+                    logger.log(err)
+            continue
 
         # Save results
         with open(output_file, 'w') as f:
@@ -2198,7 +2332,7 @@ Examples:
         "--server-concurrency",
         type=int,
         default=None,
-        help="Number of concurrent in-flight requests to the vLLM server (default: 16)"
+        help="Number of concurrent in-flight requests to the vLLM server (default: 32)"
     )
     parser.add_argument(
         "--server-temperature",
@@ -2244,7 +2378,7 @@ Examples:
     args = parser.parse_args()
     apply_runtime_env_for_thinking(repo_root=Path(__file__).resolve().parents[2])
     if args.server_concurrency is None:
-        args.server_concurrency = int(_get_runtime_yaml_value("benchmark_server_concurrency", 16))
+        args.server_concurrency = int(_get_runtime_yaml_value("benchmark_server_concurrency", 32))
     if args.skip_eval:
         print("Error: evaluation is required for both benchmark and explore runs")
         return 1
@@ -2430,7 +2564,8 @@ Examples:
                         output_suffix="_explore",
                     )
                     if not explore_inference_files:
-                        logger.log("Warning: Exploration mode produced no output files")
+                        logger.log("Error: Exploration mode produced no successful output files")
+                        return 1
             elif args.skip_infer and not args.skip_eval:
                 # Try to find existing inference files in run_dir
                 for benchmark in benchmarks:

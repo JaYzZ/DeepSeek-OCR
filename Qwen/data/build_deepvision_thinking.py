@@ -10,9 +10,10 @@ Output JSONL schema (aligned with r1_onevision_thinking.jsonl):
 - images
 - latent_ground_truth
 - latent_supervision
+- latent_seq_lens
 - num_latent_steps
 - cot
-- cot_token_ids
+- cot_chunk_token_ids
 - task
 
 Two-phase workflow:
@@ -41,8 +42,15 @@ script_dir = Path(__file__).parent
 repo_root = script_dir.parent.parent
 sys.path.insert(0, str(repo_root))
 
-from Qwen.scripts.adaptive_vello_renderer import AdaptiveVelloRenderer
-from Qwen.scripts.utils import chunk_thinking_text, format_cot_subsequences
+from Qwen.data.utils import (
+    AdaptiveSkiaRenderer,
+    _atomic_save_png,
+    _ensure_thinking_chunks_fit_renderer,
+    build_cot_chunk_token_ids,
+    load_cached_latent_seq_len,
+    chunk_thinking_text,
+    format_cot_subsequences,
+)
 from OCRVL.encoder.qwen3vl_encoder import Qwen3VLEncoder
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -50,20 +58,63 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_MODEL_PATH = "/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking"
+PRIMARY_ANNOTATION_SOURCE = "q32-vision-anno"
 
 def _safe_name(x: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_\-.]+", "_", str(x)).strip("_")
 
 
-def _to_json_text(v: Any) -> str:
+def _load_annotation_payload(v: Any) -> Optional[Dict[str, Any]]:
     if v is None:
-        return ""
-    if isinstance(v, str):
+        return None
+    if isinstance(v, dict):
         return v
-    try:
-        return json.dumps(v, ensure_ascii=False)
-    except Exception:
-        return str(v)
+    if isinstance(v, str):
+        stripped = v.strip()
+        if not stripped:
+            return None
+        try:
+            parsed = json.loads(stripped)
+        except Exception:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _normalize_annotation_paragraph(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    else:
+        text = str(value)
+    return " ".join(text.split()).strip()
+
+
+def _format_annotation_text(v: Any) -> str:
+    """Render only the highest-quality q32 prose fields as titled paragraphs."""
+    payload = _load_annotation_payload(v)
+    if not payload:
+        return ""
+
+    visual_complexity = payload.get("visual_complexity")
+    if not isinstance(visual_complexity, dict):
+        visual_complexity = {}
+
+    sections = [
+        ("Annotation Density Analysis", visual_complexity.get("annotation_density_analysis")),
+        ("Element Richness Analysis", visual_complexity.get("element_richness_analysis")),
+        ("Visual Dependency Justification", payload.get("visual_dependency_justification")),
+    ]
+
+    paragraphs = []
+    for title, raw_text in sections:
+        text = _normalize_annotation_paragraph(raw_text)
+        if not text:
+            continue
+        paragraphs.append(f"{title}\n{text}")
+
+    return "\n\n".join(paragraphs)
 
 
 def _extract_prompt_text(prompt: Any, role: str) -> str:
@@ -110,6 +161,17 @@ def _extract_first_image_bytes(images_field: Any) -> Optional[bytes]:
     return None
 
 
+def _is_valid_image_file(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size <= 0:
+        return False
+    try:
+        with Image.open(path) as img:
+            img.verify()
+        return True
+    except Exception:
+        return False
+
+
 def _build_thinking_text(row: Dict[str, Any], source: str) -> str:
     question = str(row.get("question") or "").strip()
     prompt = row.get("prompt")
@@ -120,13 +182,10 @@ def _build_thinking_text(row: Dict[str, Any], source: str) -> str:
     if source == "system":
         return system_text
     if source == "annotation":
-        parts = []
-        for k in ("q32-vision-anno", "gpt5-mini-vision-anno", "domain-anno"):
-            if k in row and row.get(k) is not None:
-                txt = _to_json_text(row.get(k)).strip()
-                if txt:
-                    parts.append(txt)
-        return "\n".join(parts)
+        value = row.get(PRIMARY_ANNOTATION_SOURCE)
+        if value is None:
+            return ""
+        return _format_annotation_text(value)
     if source == "auto":
         ann = _build_thinking_text(row, "annotation")
         if ann:
@@ -165,7 +224,9 @@ def main_render_only(args):
     output_dir.mkdir(parents=True, exist_ok=True)
     images_dir.mkdir(parents=True, exist_ok=True)
 
-    renderer = AdaptiveVelloRenderer()
+    # Keep DeepVision thinking renders on the same adaptive Skia path as
+    # r1_onevision so line wrapping and newline preservation match.
+    renderer = AdaptiveSkiaRenderer()
 
     all_rows = _iter_deepvision_rows(data_dir, args.max_samples)
     logger.info(f"Rows loaded: {len(all_rows)}")
@@ -212,12 +273,12 @@ def main_render_only(args):
 
             query_name = f"{sample_id}_main"
             query_path = images_dir / f"{query_name}.png"
-            if not query_path.exists():
+            if not _is_valid_image_file(query_path):
                 try:
                     import io
 
                     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                    img.save(query_path)
+                    _atomic_save_png(img, query_path)
                 except Exception:
                     skipped += 1
                     continue
@@ -226,6 +287,7 @@ def main_render_only(args):
             thinking_chunks = chunk_thinking_text(thinking_text, args.max_chars_per_chunk)
             if not thinking_chunks:
                 thinking_chunks = [question[: max(1, args.max_chars_per_chunk)].strip() or "Question context"]
+            thinking_chunks = _ensure_thinking_chunks_fit_renderer(renderer, thinking_chunks)
 
             thinking_image_paths = []
             for cidx, chunk in enumerate(thinking_chunks):
@@ -265,6 +327,8 @@ def main_render_only(args):
 
     # Flush remaining render tasks.
     flush_render_buffer(force=True)
+
+    renderer.shutdown()
 
     logger.info("=" * 70)
     logger.info("Render summary")
@@ -351,6 +415,7 @@ def main_encode_only(args):
     _encode_missing_features(encoder, sorted(all_paths), cache_dir, args.batch_size)
 
     kept = 0
+    seq_len_cache: Dict[str, int] = {}
     with open(out_jsonl, "w", encoding="utf-8") as f_out:
         for s in samples:
             thinking_cache_paths = []
@@ -361,6 +426,23 @@ def main_encode_only(args):
 
             num_latent_steps = len(thinking_cache_paths)
             if num_latent_steps == 0:
+                continue
+
+            latent_seq_lens = [
+                load_cached_latent_seq_len(cache_path, seq_len_cache)
+                for cache_path in thinking_cache_paths
+            ]
+            cot_chunk_token_ids = build_cot_chunk_token_ids(
+                tokenizer,
+                s.get("thinking_chunks") or [],
+            )
+            if len(cot_chunk_token_ids) != num_latent_steps:
+                logger.warning(
+                    "Skipping %s: chunk/token count mismatch (%s vs %s)",
+                    s.get("sample_id", "<unknown>"),
+                    len(cot_chunk_token_ids),
+                    num_latent_steps,
+                )
                 continue
 
             latent_placeholders = "<think_sep>".join(["<latent>"] * num_latent_steps)
@@ -375,9 +457,10 @@ def main_encode_only(args):
                 "images": [s["query_image_path"]],
                 "latent_ground_truth": thinking_cache_paths,
                 "latent_supervision": [query_cache_path],
+                "latent_seq_lens": latent_seq_lens,
                 "num_latent_steps": num_latent_steps,
                 "cot": cot,
-                "cot_token_ids": tokenizer.encode(cot, add_special_tokens=False),
+                "cot_chunk_token_ids": cot_chunk_token_ids,
                 "task": "deepvision_thinking",
             }
             f_out.write(json.dumps(item, ensure_ascii=False) + "\n")
@@ -399,8 +482,8 @@ def main():
     parser.add_argument("--data-dir", default="/share/project/xiyan/huggingface/skylenage/DeepVision-103K")
     parser.add_argument("--output-dir", default="Qwen/data")
     parser.add_argument("--images-dir", default="Qwen/data/deepvision_images")
-    parser.add_argument("--metadata-file", default="deepvision_103k_metadata.jsonl")
-    parser.add_argument("--output-jsonl", default="deepvision_103k_thinking.jsonl")
+    parser.add_argument("--metadata-file", default="metadata/deepvision_103k_metadata.jsonl")
+    parser.add_argument("--output-jsonl", default="sft/deepvision_103k_thinking.jsonl")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-chars-per-chunk", type=int, default=4800)
     parser.add_argument("--batch-size", type=int, default=64)

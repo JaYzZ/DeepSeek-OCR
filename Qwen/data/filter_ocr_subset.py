@@ -6,7 +6,7 @@ This script filters the existing unified SFT dataset to include only OCR tasks,
 avoiding a full dataset rebuild.
 
 Usage:
-    python Qwen/scripts/filter_ocr_subset.py
+    python Qwen/data/filter_ocr_subset.py
 """
 
 import json
@@ -71,7 +71,7 @@ def main():
 
     # Use Qwen3VL-converted data (bbox coordinates in [0, 1000] format)
     input_path = base_dir / "OCRVL/data/ocrvl_unified_sft_qwen3vl.jsonl"
-    output_path = base_dir / "Qwen/data/ocrvl_ocr_supplement.jsonl"
+    output_path = base_dir / "Qwen/data/sft/ocrvl_ocr_supplement.jsonl"
 
     if not input_path.exists():
         print(f"Error: Input file not found: {input_path}")

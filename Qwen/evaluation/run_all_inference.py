@@ -19,7 +19,7 @@ _SCRIPT_DIR = Path(__file__).parent
 _REPO_ROOT = _SCRIPT_DIR.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
-from Qwen.scripts.vllm_utils import apply_runtime_env_for_thinking, resolve_lora_artifacts
+from Qwen.inference.vllm_utils import apply_runtime_env_for_thinking, resolve_lora_artifacts
 
 def run_vllm_inference(
     model_path: str,

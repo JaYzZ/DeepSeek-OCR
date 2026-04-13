@@ -9,7 +9,7 @@ Usage:
     In your RL config, set:
         data:
           custom_cls:
-            path: Qwen.scripts.chimera_rl_dataset
+            path: Qwen.verl.chimera_rl_dataset
             name: ChimeraRLDataset
 """
 
@@ -27,6 +27,13 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 
 logger = logging.getLogger(__name__)
+CHIMERA_SYSTEM_PROMPT = (
+    "You are solving a challenging academic problem from a rendered question image. "
+    "Reason carefully. In the final answer, provide only the final result. "
+    "If the problem has labeled subparts, keep the part labels and provide only the final answer for each part. "
+    "If the problem has a single final answer, put it in \\boxed{}. "
+    "Do not restate the full question or include unnecessary explanation in the final answer."
+)
 
 
 def _build_user_content(prompt_text: str, *, has_image: bool):
@@ -36,6 +43,31 @@ def _build_user_content(prompt_text: str, *, has_image: bool):
         {"type": "image"},
         {"type": "text", "text": prompt_text},
     ]
+
+
+def _build_problem_context(subject: str, topic: str) -> str:
+    parts = []
+    if subject:
+        parts.append(subject)
+    if topic and topic.lower() != subject.lower():
+        parts.append(topic)
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return f"This is a {parts[0]} problem."
+    return f"This is a {parts[0]} problem about {parts[1]}."
+
+
+def _build_user_prompt_text(question: str, *, subject: str, topic: str, has_image: bool) -> str:
+    context = _build_problem_context(subject, topic)
+    if has_image:
+        base = "The image contains the full problem statement. Solve it carefully."
+        return f"{base} {context}".strip()
+
+    base = "Solve the following problem carefully."
+    if context:
+        base = f"{base} {context}"
+    return f"{base}\n\n{question}".strip()
 
 
 def _extract_equivalent_answers(answer: str, solution: str, original_solution: str) -> list:
@@ -136,10 +168,13 @@ class ChimeraRLDataset(RLHFDataset):
                     answer = str(row.get("answer", "")).strip()
                     solution = str(row.get("solution", "")).strip()
                     original_solution = str(row.get("original_solution", "")).strip()
+                    subject = str(row.get("subject", "general")).strip()
                     topic = str(row.get("topic", "general")).strip()
                     index = int(row.get("index", 0))
+                    correctness = row.get("correctness")
 
-                    # Skip samples without required fields
+                    # Skip samples without required fields. Keep verifier-failed
+                    # traces because RL reward uses the canonical answer.
                     if not question or not answer:
                         continue
 
@@ -150,10 +185,12 @@ class ChimeraRLDataset(RLHFDataset):
                     images = []
                     if text_only:
                         # Text-only mode: no images, question in prompt
-                        if topic:
-                            user_content = f"Solve this {topic} question:\n{question}"
-                        else:
-                            user_content = f"Solve this question:\n{question}"
+                        user_content = _build_user_prompt_text(
+                            question,
+                            subject=subject,
+                            topic=topic,
+                            has_image=False,
+                        )
                     else:
                         # OPTIMIZATION 6: Use pre-indexed image lookup instead of disk check
                         if sample_id in self._image_index:
@@ -163,30 +200,31 @@ class ChimeraRLDataset(RLHFDataset):
                                 repo_root = Path(__file__).parent.parent.parent
                                 question_image_path = str(repo_root / question_image_path)
                             images = [question_image_path]
-                            if topic:
-                                user_content = _build_user_content(
-                                    f"Solve this {topic} question shown in the image.",
+                            user_content = _build_user_content(
+                                _build_user_prompt_text(
+                                    question,
+                                    subject=subject,
+                                    topic=topic,
                                     has_image=True,
-                                )
-                            else:
-                                user_content = _build_user_content(
-                                    "Solve the question shown in the image.",
-                                    has_image=True,
-                                )
+                                ),
+                                has_image=True,
+                            )
                         else:
                             # Fallback to text if image not found
-                            if topic:
-                                user_content = _build_user_content(
-                                    f"Solve this {topic} question:\n{question}",
+                            user_content = _build_user_content(
+                                _build_user_prompt_text(
+                                    question,
+                                    subject=subject,
+                                    topic=topic,
                                     has_image=False,
-                                )
-                            else:
-                                user_content = _build_user_content(
-                                    f"Solve this question:\n{question}",
-                                    has_image=False,
-                                )
+                                ),
+                                has_image=False,
+                            )
 
-                    prompt = [{"role": "user", "content": user_content}]
+                    prompt = [
+                        {"role": "system", "content": CHIMERA_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_content},
+                    ]
 
                     # Extract equivalent answers
                     equivalent_answers = _extract_equivalent_answers(answer, solution, original_solution)
@@ -195,8 +233,8 @@ class ChimeraRLDataset(RLHFDataset):
                     verl_row = {
                         "prompt": prompt,
                         "images": images,
-                        "data_source": f"chimera::{topic}",
-                        "ability": topic if topic else "reasoning",
+                        "data_source": f"chimera::{subject or topic}",
+                        "ability": topic if topic else subject or "reasoning",
                         "reward_model": {
                             "style": "rule",
                             "ground_truth": answer,
@@ -206,7 +244,9 @@ class ChimeraRLDataset(RLHFDataset):
                             "split": parquet_file,
                             "index": index,
                             "question": question,
+                            "subject": subject,
                             "topic": topic,
+                            "correctness": bool(correctness) if correctness is not None else None,
                             "text_only": text_only,
                         },
                     }

@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 from config import QWEN3_VL_2B_THINKING, resolve_path
 from Qwen.evaluation.utils import normalize_chat_api_url
-from Qwen.scripts.vllm_utils import normalize_media_path, resolve_lora_artifacts
+from Qwen.inference.vllm_utils import normalize_media_path, resolve_lora_artifacts
 
 try:
     from vllm.v1.engine import LoRARequest

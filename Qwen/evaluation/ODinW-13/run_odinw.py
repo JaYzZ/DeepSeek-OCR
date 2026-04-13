@@ -16,7 +16,7 @@ import random
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 from config import resolve_path, get_data_path, get_results_path, QWEN3_VL_2B_THINKING
-from Qwen.scripts.vllm_utils import normalize_media_path, resolve_lora_artifacts
+from Qwen.inference.vllm_utils import normalize_media_path, resolve_lora_artifacts
 
 # vLLM imports
 from vllm import LLM, SamplingParams

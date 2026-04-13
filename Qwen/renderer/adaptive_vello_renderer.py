@@ -18,8 +18,8 @@ from typing import Dict, Tuple, List, Optional
 import numpy as np
 from PIL import Image
 
-# Add parent directory to path
-repo_root = Path(__file__).parent.parent
+# Add repo root to path
+repo_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(repo_root))
 
 from Renderer.skia_renderer import prepare_text_for_rendering

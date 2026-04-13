@@ -46,6 +46,15 @@ def _patch_once() -> None:
     """Apply all patches."""
     logger = logging.getLogger(__name__)
 
+    try:
+        from Qwen.compat.patch_embed import apply_all_qwen3vl_patch_embed_fixes
+
+        apply_all_qwen3vl_patch_embed_fixes()
+    except ImportError as e:
+        logger.warning(f"[sitecustomize] Failed to import Qwen patch-embed fix: {e}")
+    except Exception as e:
+        logger.warning(f"[sitecustomize] Failed to apply Qwen patch-embed fix: {e}")
+
     # Apply Qwen patches (latent supervision, callbacks, tokenizer, etc.)
     if _qwen_patches_enabled():
         try:

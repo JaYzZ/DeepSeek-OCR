@@ -8,24 +8,19 @@
 #
 # Usage:
 #   bash Qwen/scripts/train_qwen3vl_chimera.sh [config.yaml]
-#   tmux new-session -d -s chi_sft 'bash Qwen/scripts/train_qwen3vl_chimera.sh Qwen/configs/qwen3vl_native_chimera_thinking.yaml'
+#   tmux new-session -d -s chi_sft 'bash Qwen/scripts/train_qwen3vl_chimera.sh Qwen/configs/qwen3vl_chimera_thinking.yaml'
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+source "$SCRIPT_DIR/qwen3vl_common.sh"
 source "$SCRIPT_DIR/train_qwen3vl_dataset_mix.sh"
 
-# Required python interpreter (OCRFlow env)
-PYTHON_BIN="$REPO_ROOT/../../envs/ocrflow/bin/python"
-if [ ! -x "$PYTHON_BIN" ]; then
-  echo "❌ Python not found or not executable: $PYTHON_BIN" >&2
-  echo "   Please ensure OCRFlow env exists at: $REPO_ROOT/../../envs/ocrflow" >&2
-  exit 1
-fi
+PYTHON_BIN="$(qwen3vl_require_python_bin "$REPO_ROOT")"
 
 # Default config
-DEFAULT_CONFIG="$REPO_ROOT/Qwen/configs/qwen3vl_native_chimera_thinking.yaml"
+DEFAULT_CONFIG="$REPO_ROOT/Qwen/configs/qwen3vl_chimera_thinking.yaml"
 DEFAULT_RUNTIME_ENV_CONFIG="$REPO_ROOT/Qwen/configs/qwen3vl_runtime_env.yaml"
 
 CONFIG_PATH="${1:-$DEFAULT_CONFIG}"
@@ -42,117 +37,20 @@ fi
 # Derive model path from config (used for HF_MODULES_CACHE if present)
 MODEL_PATH="$(grep -E '^model_name_or_path:' "$CONFIG_PATH" | head -n 1 | awk '{print $2}')"
 
-# ============================================================================
-# Export config values as environment variables for Python callbacks
-# ============================================================================
-# Helper to read a yaml key (supports dotted paths, e.g. "runtime.backfill_enable")
-_get_yaml_value() {
-    local file_path="$1"
-    local key="$2"
-    local default_value="${3:-}"
-    "$PYTHON_BIN" - "$file_path" "$key" "$default_value" <<'PY'
-import sys
-from pathlib import Path
-import yaml
-
-file_path, key, default_value = sys.argv[1], sys.argv[2], sys.argv[3]
-try:
-    data = yaml.safe_load(Path(file_path).read_text()) or {}
-except Exception:
-    print(default_value)
-    raise SystemExit(0)
-
-value = data
-for part in key.split("."):
-    if isinstance(value, dict) and part in value:
-        value = value[part]
-    else:
-        value = default_value
-        break
-
-if value is None:
-    value = default_value
-if isinstance(value, bool):
-    print("1" if value else "0")
-else:
-    print(str(value))
-PY
-}
-
 _get_main_config() {
-    _get_yaml_value "$CONFIG_PATH" "$1" "${2:-}"
+    qwen3vl_get_yaml_value "$PYTHON_BIN" "$CONFIG_PATH" "$1" "${2:-}"
 }
 
 _get_runtime_config() {
-    _get_yaml_value "$QWEN3VL_RUNTIME_ENV_CONFIG" "$1" "${2:-}"
+    qwen3vl_get_yaml_value "$PYTHON_BIN" "$QWEN3VL_RUNTIME_ENV_CONFIG" "$1" "${2:-}"
 }
 
 _set_env_from_runtime() {
-    local env_name="$1"
-    local runtime_key="$2"
-    local default_value="$3"
-    local current_value="${!env_name:-}"
-    if [[ -n "$current_value" ]]; then
-        export "$env_name=$current_value"
-    else
-        export "$env_name=$(_get_runtime_config "$runtime_key" "$default_value")"
-    fi
+    qwen3vl_export_env_from_yaml "$PYTHON_BIN" "$QWEN3VL_RUNTIME_ENV_CONFIG" "$1" "$2" "$3"
 }
 
 _set_env_from_main() {
-    local env_name="$1"
-    local main_key="$2"
-    local default_value="$3"
-    local current_value="${!env_name:-}"
-    if [[ -n "$current_value" ]]; then
-        export "$env_name=$current_value"
-    else
-        export "$env_name=$(_get_main_config "$main_key" "$default_value")"
-    fi
-}
-
-_resolve_master_port() {
-    "$PYTHON_BIN" - "${MASTER_PORT:-}" <<'PY'
-import socket
-import sys
-
-preferred = sys.argv[1].strip()
-
-def is_free(port: int) -> bool:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.bind(("", port))
-        return True
-    except OSError:
-        return False
-    finally:
-        sock.close()
-
-if not preferred:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("", 0))
-    print(sock.getsockname()[1])
-    sock.close()
-    raise SystemExit(0)
-
-port = max(1, min(int(preferred), 65535))
-while port <= 65535:
-    if is_free(port):
-        print(port)
-        raise SystemExit(0)
-    port += 1
-
-raise SystemExit("No available TCP port found.")
-PY
-}
-
-_snapshot_run_configs() {
-    local dest_dir="$1"
-    local config_dest="$dest_dir/$(basename "$CONFIG_PATH")"
-    local runtime_dest="$dest_dir/$(basename "$QWEN3VL_RUNTIME_ENV_CONFIG")"
-
-    cp -f "$CONFIG_PATH" "$config_dest"
-    cp -f "$QWEN3VL_RUNTIME_ENV_CONFIG" "$runtime_dest"
+    qwen3vl_export_env_from_yaml "$PYTHON_BIN" "$CONFIG_PATH" "$1" "$2" "$3"
 }
 
 # Export env vars that Python code needs (canonicalized in qwen3vl_runtime_env.yaml)
@@ -295,7 +193,7 @@ fi
 
 # Setup logging
 mkdir -p "$RUN_DIR" "$CKPT_DIR"
-_snapshot_run_configs "$RUN_DIR"
+qwen3vl_snapshot_run_configs "$CONFIG_PATH" "$QWEN3VL_RUNTIME_ENV_CONFIG" "$RUN_DIR"
 CONFIG_PATH="$RUN_DIR/$(basename "$CONFIG_PATH")"
 QWEN3VL_RUNTIME_ENV_CONFIG="$RUN_DIR/$(basename "$QWEN3VL_RUNTIME_ENV_CONFIG")"
 RERUN_EVALS_SH="$RUN_DIR/rerun_evals.sh"
@@ -336,7 +234,7 @@ fi
 BACKFILL_GPUS="\${BACKFILL_GPUS:-\${BACKFILL_CUDA_VISIBLE_DEVICES:-\${CUDA_VISIBLE_DEVICES:-0}}}"
 BENCH_GPUS="\${BENCH_GPUS:-\${BENCH_CUDA_VISIBLE_DEVICES:-\${CUDA_VISIBLE_DEVICES:-\$BACKFILL_GPUS}}}"
 
-QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" CUDA_VISIBLE_DEVICES="\$BACKFILL_GPUS" $PYTHON_BIN Qwen/scripts/backfill_transparent_eval.py --checkpoint_dir "$CKPT_DIR" --checkpoint checkpoint_latest --gpu_memory_utilization \${GPU_MEMORY_UTILIZATION:-0.9} 2>&1 | tee \${BACKFILL_LOG:-/tmp/backfill_thinking_debug.log}
+QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" CUDA_VISIBLE_DEVICES="\$BACKFILL_GPUS" $PYTHON_BIN Qwen/inference/backfill_transparent_eval.py --checkpoint_dir "$CKPT_DIR" --checkpoint checkpoint_latest --gpu_memory_utilization \${GPU_MEMORY_UTILIZATION:-0.9} 2>&1 | tee \${BACKFILL_LOG:-/tmp/backfill_thinking_debug.log}
 BENCH_DIR="$RUN_DIR/bench"
 mkdir -p "\$BENCH_DIR"
 QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" VLLM_FORCE_THINK=$VLLM_FORCE_THINK CUDA_VISIBLE_DEVICES="\$BENCH_GPUS" $PYTHON_BIN Qwen/evaluation/run_all_benchmarks.py --start-server --gpus "\$BENCH_GPUS" --benchmarks \${BENCHMARKS:-MathVision,MMMU,RealWorldQA} --num-samples \${BENCHMARK_NUM_SAMPLES:-$BENCHMARK_NUM_SAMPLES} --lora-path "$CKPT_DIR/checkpoint_latest" --run-dir "\$BENCH_DIR"
@@ -379,7 +277,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export TMPDIR="${TMPDIR:-/tmp}"
 
 if [ "${NNODES:-1}" = "1" ]; then
-    export MASTER_PORT="$(_resolve_master_port)"
+    export MASTER_PORT="$(qwen3vl_resolve_master_port "$PYTHON_BIN")"
 fi
 
 # Detect distributed backend from config (DeepSpeed vs FSDP) for display purposes
@@ -537,8 +435,9 @@ if [ "$train_exit_code" -eq 0 ] && [ "$RUN_BACKFILL" = "1" ]; then
 
     # Find all checkpoints that need backfill
     CHECKPOINT_LIST=()
-    for CHECKPOINT in $(ls -td "$CKPT_DIR"/checkpoint-* 2>/dev/null | sort -V); do
-        CHECKPOINT_NAME=$(basename "$CHECKPOINT")
+    while IFS= read -r CHECKPOINT_NAME; do
+        [ -n "$CHECKPOINT_NAME" ] || continue
+        CHECKPOINT="$CKPT_DIR/$CHECKPOINT_NAME"
 
         # Skip if already has results
         if [ -d "$CHECKPOINT/eval_results" ] && [ "$(ls "$CHECKPOINT/eval_results"/backfill_*.json 2>/dev/null | wc -l)" -gt 0 ]; then
@@ -547,7 +446,7 @@ if [ "$train_exit_code" -eq 0 ] && [ "$RUN_BACKFILL" = "1" ]; then
         fi
 
         CHECKPOINT_LIST+=("$CHECKPOINT_NAME")
-    done
+    done < <(qwen3vl_list_checkpoint_dirs "$PYTHON_BIN" "$CKPT_DIR")
 
     NUM_CHECKPOINTS=${#CHECKPOINT_LIST[@]}
     _log_wrapper_status "backfill_discovery num_gpus=$NUM_GPUS num_checkpoints=$NUM_CHECKPOINTS checkpoints=${CHECKPOINT_LIST[*]:-none}"
@@ -576,7 +475,7 @@ if [ "$train_exit_code" -eq 0 ] && [ "$RUN_BACKFILL" = "1" ]; then
                 # Run backfill in background with specific GPU
                 (
                     echo "[$(date '+%F %T')] Start $checkpoint_name on GPU $gpu_id" >> "$RUN_DIR/backfill_all_checkpoints.log"
-                    if QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" CUDA_VISIBLE_DEVICES="$gpu_id" "$PYTHON_BIN" Qwen/scripts/backfill_transparent_eval.py \
+                    if QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" CUDA_VISIBLE_DEVICES="$gpu_id" "$PYTHON_BIN" Qwen/inference/backfill_transparent_eval.py \
                         --checkpoint_dir "$CKPT_DIR" \
                         --checkpoint "$checkpoint_name" \
                         --gpu_memory_utilization 0.9 \
@@ -627,7 +526,7 @@ fi
 cleanup_vllm_benchmark_processes() {
     # Ensure leaked vLLM worker/core processes do not affect later jobs.
     "$PYTHON_BIN" - <<'PY'
-from Qwen.scripts.vllm_utils import cleanup_vllm_engine_processes
+from Qwen.inference.vllm_utils import cleanup_vllm_engine_processes
 cleanup_vllm_engine_processes()
 PY
 }

@@ -19,8 +19,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -34,13 +32,15 @@ script_dir = Path(__file__).parent
 repo_root = script_dir.parent.parent
 sys.path.insert(0, str(repo_root))
 
-from Renderer.skia_renderer import (
-    SkiaRenderer,
-    measure_finalized_text_canvas,
-    prepare_text_for_rendering,
-    snap_canvas_to_grid,
+from Qwen.data.utils import (
+    AdaptiveSkiaRenderer,
+    _atomic_save_png,
+    _ensure_thinking_chunks_fit_renderer,
+    build_cot_chunk_token_ids,
+    load_cached_latent_seq_len,
+    chunk_thinking_text,
+    format_cot_subsequences,
 )
-from Qwen.scripts.utils import chunk_thinking_text, format_cot_subsequences
 from OCRVL.encoder.qwen3vl_encoder import Qwen3VLEncoder
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_MODEL_PATH = "/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking"
-DEFAULT_TRAIN_CONFIG = repo_root / "Qwen/configs/qwen3vl_native_chimera_thinking.yaml"
+DEFAULT_TRAIN_CONFIG = repo_root / "Qwen/configs/qwen3vl_chimera_thinking.yaml"
 
 
 def _load_cutoff_len_from_yaml(config_path: Path) -> Optional[int]:
@@ -82,191 +82,6 @@ def _resolve_max_expanded_len(cli_value: Optional[int], train_config: Path) -> i
 
     logger.warning("Falling back to max expanded len = 8192 because cutoff_len could not be resolved.")
     return 8192
-
-
-@dataclass(frozen=True)
-class SkiaRenderConfig:
-    min_size: int = 32
-    max_size: int = 4096
-    vit_divisor: int = 32
-    padding: int = 12
-    thinking_padding: int = 8
-    short_line_wrap_threshold: int = 20
-    short_line_min_lines: int = 8
-
-
-def _atomic_save_png(image: Any, output_path: Path) -> None:
-    """Write PNG via a unique temp file in the target directory, then rename."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="wb",
-        suffix=output_path.suffix,
-        prefix=f"{output_path.stem}.",
-        dir=output_path.parent,
-        delete=False,
-    ) as tmp_file:
-        tmp_path = Path(tmp_file.name)
-    try:
-        Image.fromarray(image).save(tmp_path, format="PNG")
-        if not tmp_path.exists():
-            raise FileNotFoundError(f"Temporary render output missing after save: {tmp_path}")
-        tmp_path.replace(output_path)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink()
-
-
-class AdaptiveSkiaRenderer:
-    """Skia renderer with the same adaptive text preprocessing interface as Vello."""
-
-    def __init__(self, min_font_size: float = 10.0, max_font_size: float = 10.0):
-        self._config = SkiaRenderConfig()
-        self.min_font_size = min_font_size
-        self.max_font_size = max_font_size
-        self._renderer_cache: Dict[tuple[int, int, int, bool, bool], SkiaRenderer] = {}
-
-    def _get_renderer(
-        self,
-        width: int,
-        height: int,
-        padding: int,
-        preserve_newlines: bool,
-    ) -> SkiaRenderer:
-        key = (width, height, padding, preserve_newlines, False)
-        renderer = self._renderer_cache.get(key)
-        if renderer is None:
-            renderer = SkiaRenderer(
-                width=width,
-                height=height,
-                padding=padding,
-                min_font_size=self.min_font_size,
-                max_font_size=self.max_font_size,
-                preserve_newlines=preserve_newlines,
-            )
-            self._renderer_cache[key] = renderer
-        return renderer
-
-    def _measure_canvas(self, prepared_text: str, padding: int) -> tuple[int, int, int, int]:
-        raw_width, raw_height = measure_finalized_text_canvas(
-            prepared_text,
-            padding=padding,
-            font_size=self.min_font_size,
-            min_size=self._config.min_size,
-        )
-        snapped_width, snapped_height = snap_canvas_to_grid(
-            raw_width,
-            raw_height,
-            divisor=self._config.vit_divisor,
-            min_size=self._config.min_size,
-            max_size=self._config.max_size,
-        )
-        return raw_width, raw_height, snapped_width, snapped_height
-
-    def _prepare_render(self, text: str, thinking_mode: bool) -> tuple[str, dict[str, Any], int]:
-        padding = self._config.thinking_padding if thinking_mode else self._config.padding
-        prepared_text, layout_info = prepare_text_for_rendering(
-            text,
-            short_line_threshold=self._config.short_line_wrap_threshold,
-            min_lines_for_reflow=self._config.short_line_min_lines,
-            max_canvas_size=self._config.max_size,
-            measurement_padding=padding,
-            measurement_font_size=self.min_font_size,
-            min_canvas_size=self._config.min_size,
-            measurement_divisor=self._config.vit_divisor,
-        )
-        return prepared_text, layout_info, padding
-
-    def measure_text(self, text: str, thinking_mode: bool) -> tuple[int, int, int, int]:
-        prepared_text, layout_info, padding = self._prepare_render(text, thinking_mode)
-        return self._measure_canvas(
-            prepared_text,
-            padding,
-        )
-
-    def _render_one(self, text: str, thinking_mode: bool) -> Any:
-        prepared_text, layout_info, padding = self._prepare_render(text, thinking_mode)
-        # Skip rendering if layout failed (text too long to fit)
-        if not prepared_text or layout_info.get("layout_type") == "failed":
-            logger.warning(f"Render failed: layout_type={layout_info.get('layout_type')}, text_len={len(text)}")
-            return None
-        _, _, width, height = self._measure_canvas(prepared_text, padding)
-        return self._get_renderer(
-            width,
-            height,
-            padding,
-            layout_info["preserve_newlines"],
-        ).render_batch([prepared_text])[0]
-
-    def render_batch(self, texts: List[str], thinking_mode: bool = False) -> List[Any]:
-        prepared_specs = []
-        for text in texts:
-            prepared_text, layout_info, padding = self._prepare_render(text, thinking_mode)
-            prepared_specs.append(
-                (
-                    prepared_text,
-                    padding,
-                    layout_info["preserve_newlines"],
-                )
-            )
-
-        grouped: Dict[tuple[int, int, int, bool], List[tuple[int, str]]] = {}
-        for idx, (prepared_text, padding, preserve_newlines) in enumerate(prepared_specs):
-            _, _, width, height = self._measure_canvas(prepared_text, padding)
-            grouped.setdefault((width, height, padding, preserve_newlines), []).append((idx, prepared_text))
-
-        results: List[Any] = [None] * len(texts)
-        for (width, height, padding, preserve_newlines), items in grouped.items():
-            renderer = self._get_renderer(width, height, padding, preserve_newlines)
-            images = renderer.render_batch([text for _, text in items])
-            for (idx, _), image in zip(items, images):
-                results[idx] = image
-        return results
-
-    def render(self, text: str, output_path: str, thinking_mode: bool = False) -> bool:
-        if not text or not text.strip():
-            return False
-        image = self._render_one(text, thinking_mode)
-        if image is None:
-            return False  # Skip failed renders
-        output_path = Path(output_path)
-        _atomic_save_png(image, output_path)
-        return True
-
-    def shutdown(self) -> None:
-        for renderer in self._renderer_cache.values():
-            renderer.shutdown()
-        self._renderer_cache.clear()
-
-
-def load_cached_latent_seq_len(cache_path: str, seq_len_cache: dict[str, int]) -> int:
-    cached = seq_len_cache.get(cache_path)
-    if cached is not None:
-        return cached
-    latent = torch.load(cache_path, map_location="cpu", mmap=True, weights_only=False)
-    tensor = None
-    if isinstance(latent, dict):
-        if "l_features" in latent:
-            tensor = latent["l_features"]
-        elif "latent" in latent:
-            tensor = latent["latent"]
-    elif isinstance(latent, torch.Tensor):
-        tensor = latent
-    if tensor is None:
-        raise ValueError(f"Unable to resolve latent tensor from cache: {cache_path}")
-    seq_len = int(tensor.shape[0]) if tensor.dim() >= 2 else 1
-    seq_len_cache[cache_path] = seq_len
-    return seq_len
-
-
-def build_cot_chunk_token_ids(tokenizer, thinking_chunks: List[str]) -> List[List[int]]:
-    token_ids: List[List[int]] = []
-    for chunk in thinking_chunks or []:
-        text = str(chunk or "")
-        ids = tokenizer.encode(text, add_special_tokens=False)
-        if len(ids) == 0:
-            ids = tokenizer.encode(" ", add_special_tokens=False)
-        token_ids.append(ids)
-    return token_ids
 
 IMAGE_PROMPT_POOL = [
     "Solve this {topic} question in the image.",
@@ -432,76 +247,6 @@ def _render_pending_paths(
         return
     rendered = renderer.render_batch(texts, thinking_mode=thinking_mode)
     _save_rendered_results(rendered, output_paths)
-
-
-def _split_text_for_rendering(text: str) -> tuple[str, str]:
-    text = str(text or "").strip()
-    if not text:
-        return "", ""
-
-    lines = text.splitlines()
-    if len(lines) >= 4:
-        midpoint = len(lines) // 2
-        candidates: List[tuple[int, int]] = []
-        for idx in range(1, len(lines)):
-            stripped = lines[idx].strip()
-            prev_stripped = lines[idx - 1].strip()
-            boundary_score = 0
-            if not prev_stripped or not stripped:
-                boundary_score -= 4
-            if re.match(r"^\s*(?:[-*+]\s+|\d+\.\s+|[A-Za-z][\.\)]\s+)", stripped):
-                boundary_score -= 2
-            if re.match(r"^\s*(?:[-*+]\s+|\d+\.\s+|[A-Za-z][\.\)]\s+)", prev_stripped):
-                boundary_score -= 1
-            candidates.append((abs(idx - midpoint) + boundary_score, idx))
-        if candidates:
-            _, split_idx = min(candidates)
-            left = "\n".join(lines[:split_idx]).strip()
-            right = "\n".join(lines[split_idx:]).strip()
-            if left and right:
-                return left, right
-
-    sentence_split = re.split(r"(?<=[.!?])\s+", text)
-    if len(sentence_split) >= 2:
-        midpoint = len(sentence_split) // 2
-        left = " ".join(sentence_split[:midpoint]).strip()
-        right = " ".join(sentence_split[midpoint:]).strip()
-        if left and right:
-            return left, right
-
-    words = text.split()
-    if len(words) >= 2:
-        midpoint = len(words) // 2
-        left = " ".join(words[:midpoint]).strip()
-        right = " ".join(words[midpoint:]).strip()
-        if left and right:
-            return left, right
-
-    midpoint = len(text) // 2
-    return text[:midpoint].strip(), text[midpoint:].strip()
-
-
-def _ensure_thinking_chunks_fit_renderer(
-    renderer: AdaptiveSkiaRenderer,
-    thinking_chunks: List[str],
-) -> List[str]:
-    queue_chunks = [str(chunk or "").strip() for chunk in thinking_chunks if str(chunk or "").strip()]
-    fitted_chunks: List[str] = []
-
-    while queue_chunks:
-        chunk = queue_chunks.pop(0)
-        raw_width, raw_height, _, _ = renderer.measure_text(chunk, thinking_mode=True)
-        if raw_width <= renderer._config.max_size and raw_height <= renderer._config.max_size:
-            fitted_chunks.append(chunk)
-            continue
-
-        left, right = _split_text_for_rendering(chunk)
-        if not left or not right or left == chunk or right == chunk:
-            fitted_chunks.append(chunk)
-            continue
-        queue_chunks = [left, right, *queue_chunks]
-
-    return fitted_chunks
 
 
 def _build_render_batch(
@@ -795,12 +540,14 @@ def main_encode_only(args):
 
             num_latent_steps = len(solution_cache_paths)
             latent_seq_lens = [
-                load_cached_latent_seq_len(cache_path, seq_len_cache)
+                load_cached_latent_seq_len(cache_path, seq_len_cache, min_tensor_ndim=2, fallback_seq_len=1)
                 for cache_path in solution_cache_paths
             ]
             cot_chunk_token_ids = build_cot_chunk_token_ids(
                 tokenizer,
                 s.get("solution_chunks") or [],
+                normalize_chunks=False,
+                empty_chunk_fallback_text=" ",
             )
             if len(cot_chunk_token_ids) != num_latent_steps:
                 logger.warning(
@@ -1025,10 +772,15 @@ def main_all(args):
 
             num_latent_steps = len(solution_cache_paths)
             latent_seq_lens = [
-                load_cached_latent_seq_len(cache_path, seq_len_cache)
+                load_cached_latent_seq_len(cache_path, seq_len_cache, min_tensor_ndim=2, fallback_seq_len=1)
                 for cache_path in solution_cache_paths
             ]
-            cot_chunk_token_ids = build_cot_chunk_token_ids(tokenizer, s.get("solution_chunks") or [])
+            cot_chunk_token_ids = build_cot_chunk_token_ids(
+                tokenizer,
+                s.get("solution_chunks") or [],
+                normalize_chunks=False,
+                empty_chunk_fallback_text=" ",
+            )
             if len(cot_chunk_token_ids) != num_latent_steps:
                 logger.warning(
                     "Skipping %s: chunk/token count mismatch (%s vs %s)",
@@ -1119,9 +871,9 @@ def main():
         default=str(DEFAULT_TRAIN_CONFIG),
         help="Training YAML used to derive cutoff_len when --max-expanded-len is not set",
     )
-    parser.add_argument("--metadata-file", default="chimera_qwen35_metadata.jsonl")
-    parser.add_argument("--output-jsonl-image", default="chimera_qwen35_thinking_image_input.jsonl")
-    parser.add_argument("--output-jsonl-text", default="chimera_qwen35_thinking_text_input.jsonl")
+    parser.add_argument("--metadata-file", default="metadata/chimera_qwen35_metadata.jsonl")
+    parser.add_argument("--output-jsonl-image", default="sft/chimera_qwen35_thinking_image_input.jsonl")
+    parser.add_argument("--output-jsonl-text", default="sft/chimera_qwen35_thinking_text_input.jsonl")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument(
         "--max-expanded-len",

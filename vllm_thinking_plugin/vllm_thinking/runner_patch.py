@@ -188,6 +188,15 @@ class LatentVAE(nn.Module):
         return dist.rsample()
 
 
+def _align_vae_to_hidden_state(vae: nn.Module, hidden_state: torch.Tensor) -> nn.Module:
+    """Keep rollout VAE on the same device/dtype as the hidden state stream."""
+    param = next(vae.parameters(), None)
+    if param is None or param.device != hidden_state.device or param.dtype != hidden_state.dtype:
+        vae = vae.to(device=hidden_state.device, dtype=hidden_state.dtype)
+    vae.eval()
+    return vae
+
+
 # Token IDs now resolved lazily via _get_token_id() - see section above
 DEFAULT_THINKING_LENGTH = 1024  # Will be min(max_tokens//2, 1024)
 DEFAULT_MIN_CONTINUOUS_STEPS = 0
@@ -230,6 +239,7 @@ def apply_thinking_mode_patch():
             return
 
         hidden_size = self.model.config.text_config.hidden_size
+        self.latent_vae = None
 
         # Try LoRA path first
         lora_path = os.environ.get("VLLM_LORA_CHECKPOINT_PATH")
@@ -238,14 +248,17 @@ def apply_thinking_mode_patch():
             if os.path.exists(vae_path):
                 try:
                     vae_state = load_file(vae_path)
-                    self.latent_vae = LatentVAE(hidden_size=hidden_size)
-                    self.latent_vae.load_state_dict(vae_state, strict=False)
-                    self.latent_vae = self.latent_vae.cuda()
+                    loaded_vae = LatentVAE(hidden_size=hidden_size)
+                    loaded_vae.load_state_dict(vae_state, strict=False)
+                    loaded_vae = loaded_vae.cuda()
+                    loaded_vae.eval()
+                    self.latent_vae = loaded_vae
                     if not _VLLM_VAE_LOGGED:
                         logger.warning("[Thinking] vLLM rollout VAE loaded: path=%s hidden_size=%s", vae_path, hidden_size)
                         _VLLM_VAE_LOGGED = True
                     return
                 except Exception as e:
+                    self.latent_vae = None
                     logger.warning(f"[Thinking] Load VAE failed: {e}")
 
         # Try model path
@@ -254,17 +267,20 @@ def apply_thinking_mode_patch():
         if os.path.exists(vae_path):
             try:
                 vae_state = load_file(vae_path)
-                self.latent_vae = LatentVAE(hidden_size=hidden_size)
-                self.latent_vae.load_state_dict(vae_state, strict=False)
-                self.latent_vae = self.latent_vae.cuda()
+                loaded_vae = LatentVAE(hidden_size=hidden_size)
+                loaded_vae.load_state_dict(vae_state, strict=False)
+                loaded_vae = loaded_vae.cuda()
+                loaded_vae.eval()
+                self.latent_vae = loaded_vae
                 if not _VLLM_VAE_LOGGED:
                     logger.warning("[Thinking] vLLM rollout VAE loaded: path=%s hidden_size=%s", vae_path, hidden_size)
                     _VLLM_VAE_LOGGED = True
                 return
             except Exception as e:
+                self.latent_vae = None
                 logger.warning(f"[Thinking] Load VAE failed: {e}")
 
-        logger.warning("[Thinking] No VAE found")
+        logger.debug("[Thinking] No VAE found")
 
     def _detect_initial_mode_from_prompt(prompt_ids) -> str:
         prompt_ids = list(prompt_ids or [])
@@ -715,6 +731,7 @@ def apply_thinking_mode_patch():
                 else:
                     if state.get('mode') == 'continuous' and last_hidden is not None:
                         if self.latent_vae is not None:
+                            self.latent_vae = _align_vae_to_hidden_state(self.latent_vae, last_hidden)
                             vae_dist = self.latent_vae.forward(last_hidden, temperature=1.0)
                             vae_emb = vae_dist.rsample()
                             latent_embedding = vae_emb
@@ -726,7 +743,7 @@ def apply_thinking_mode_patch():
                 use_continuous_embedding = bool(state.get('mode') == 'continuous' and last_hidden is not None)
                 global _CONTINUOUS_AR_CERT_LOGGED
                 if use_continuous_embedding and not _CONTINUOUS_AR_CERT_LOGGED:
-                    logger.warning(
+                    logger.debug(
                         "[Thinking] vLLM continuous AR active: req_id=%s source=%s saved_hidden_states=true saved_latent_embeddings=%s saved_latent_log_probs=%s",
                         req_id,
                         "latent_vae_rsample" if self.latent_vae is not None else "last_hidden",

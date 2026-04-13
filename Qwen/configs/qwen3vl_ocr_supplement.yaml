@@ -44,9 +44,9 @@ freeze_vision_tower: true
 #
 # Data source: Pre-filtered from OCRVL/data/ocrvl_unified_sft.jsonl
 # To create the filtered dataset (one-time setup):
-#   python Qwen/scripts/filter_ocr_subset.py
+#   python Qwen/data/filter_ocr_subset.py
 #
-# This creates Qwen/data/ocrvl_ocr_supplement.jsonl without rebuilding from source.
+# This creates Qwen/data/sft/ocrvl_ocr_supplement.jsonl without rebuilding from source.
 dataset: ocrvl_ocr_supplement
 dataset_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/data
 template: qwen3_vl

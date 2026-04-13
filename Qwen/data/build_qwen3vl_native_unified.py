@@ -13,7 +13,7 @@ Tasks included:
 - VQA (rendered): LLaVA-Instruct-665K with rendered questions
 - VQA (text): LLaVA-Instruct-665K with text questions
 
-Output: Qwen/data/qwen3vl_native_unified_sft.jsonl (~2.5M samples)
+Output: Qwen/data/sft/qwen3vl_native_unified_sft.jsonl (~2.5M samples)
 """
 
 import argparse
@@ -28,7 +28,7 @@ script_dir = Path(__file__).parent
 repo_root = script_dir.parent.parent
 sys.path.insert(0, str(repo_root))
 
-from Qwen.scripts.adaptive_vello_renderer import AdaptiveVelloRenderer
+from Qwen.renderer.adaptive_vello_renderer import AdaptiveVelloRenderer
 
 
 def load_jsonl(path: str) -> List[Dict]:
@@ -143,7 +143,7 @@ def main():
     )
     parser.add_argument(
         "--output-dir",
-        default="Qwen/data",
+        default="Qwen/data/sft",
         help="Output directory",
     )
     parser.add_argument(

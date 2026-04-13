@@ -13,8 +13,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from Qwen.scripts import build_chimera_verl_dataset as chimera_build
-from Qwen.scripts import chimera_rl_dataset
+from Qwen.data import build_chimera_verl_dataset as chimera_build
+from Qwen.verl import chimera_gspo_reward
+from Qwen.verl import chimera_rl_dataset
 from verl_compat.bootstrap import _patch_rlhf_dataset_message_builder
 from verl_compat.continuous_replay import (
     _inject_latent_log_probs_into_rollout,
@@ -39,10 +40,17 @@ def test_build_chimera_verl_dataset_emits_structured_image_content(tmp_path):
     assert len(images) == 1
     assert prompt == [
         {
+            "role": "system",
+            "content": chimera_build.CHIMERA_SYSTEM_PROMPT,
+        },
+        {
             "role": "user",
             "content": [
                 {"type": "image"},
-                {"type": "text", "text": "Solve this Mathematics question shown in the image."},
+                {
+                    "type": "text",
+                    "text": "The image contains the full problem statement. Solve it carefully. This is a Mathematics problem.",
+                },
             ],
         }
     ]
@@ -54,6 +62,31 @@ def test_chimera_rl_dataset_helper_emits_structured_image_content():
         {"type": "text", "text": "Solve it."},
     ]
     assert chimera_rl_dataset._build_user_content("Solve it.", has_image=False) == "Solve it."
+
+
+def test_build_chimera_record_keeps_incorrect_trace_rows(tmp_path):
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+
+    record = chimera_build._build_record(
+        {
+            "question": "Q",
+            "answer": "A",
+            "solution": "S",
+            "original_solution": "OS",
+            "subject": "Math",
+            "topic": "Geometry",
+            "index": 0,
+            "correctness": False,
+        },
+        source_name="train",
+        row_idx=0,
+        chimera_images_dir=image_dir,
+    )
+
+    assert record is not None
+    assert record["reward_model"]["ground_truth"] == "A"
+    assert record["extra_info"]["correctness"] is False
 
 
 def test_rlhf_dataset_patch_preserves_structured_multimodal_content():
@@ -154,3 +187,22 @@ def test_continuous_replay_trace_is_trimmed_to_actual_response_length():
     assert trimmed_hidden.tolist() == hidden_row[:2].tolist()
     assert trimmed_latent.tolist() == latent_row[:2].tolist()
     assert trimmed_log_probs.tolist() == latent_log_probs[:2].tolist()
+
+
+def test_chimera_reward_accepts_structured_multipart_answers():
+    prediction = "(a) (1/3, 1/3, 1/3)\n(b) 1\n(c) 1/3\n(d) (1/3)(1 - e^{-3t})"
+    ground_truth = (
+        "(a) π = (1/3, 1/3, 1/3).\n"
+        "(b) E[T | X_0 = A] = 1.\n"
+        "(c) Probability = 1/3.\n"
+        "(d) P(X_t = B | X_t ∈ {A,B,C}, X_0 = A) = (1/3)(1 - e^{-3t})."
+    )
+
+    score = chimera_gspo_reward.compute_score(
+        data_source="chimera::math",
+        solution_str=prediction,
+        ground_truth=ground_truth,
+        extra_info={},
+    )
+
+    assert score == 1.0

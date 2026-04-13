@@ -16,10 +16,10 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).parent.parent.parent
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO_ROOT))
 
-from Qwen.scripts.vllm_utils import (
+from Qwen.inference.vllm_utils import (
     apply_runtime_env_for_thinking,
     infer_tensor_parallel_size,
     normalize_checkpoint_name,
@@ -986,7 +986,7 @@ def main():
     if args.metadata:
         eval_metadata = Path(args.metadata)
     else:
-        eval_metadata = _REPO_ROOT / "Qwen/data/transparent_eval.jsonl"
+        eval_metadata = _REPO_ROOT / "Qwen/data/eval/transparent_eval.jsonl"
 
     if not eval_metadata.exists():
         raise FileNotFoundError(f"Metadata not found: {eval_metadata}")

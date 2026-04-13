@@ -5,27 +5,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-PYTHON_BIN="$REPO_ROOT/../../envs/ocrflow/bin/python"
-
-if [ ! -x "$PYTHON_BIN" ]; then
-  echo "Python not found: $PYTHON_BIN" >&2
-  exit 1
-fi
-
-count_visible_gpus() {
-  if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-    awk -F',' '{print NF}' <<<"${CUDA_VISIBLE_DEVICES}"
-    return
-  fi
-  "$PYTHON_BIN" - <<'PY'
-import torch
-print(torch.cuda.device_count())
-PY
-}
+source "$SCRIPT_DIR/qwen3vl_common.sh"
+PYTHON_BIN="$(qwen3vl_require_python_bin "$REPO_ROOT")"
 
 TIMESTAMP="${QWEN3VL_TIMESTAMP:-$(date '+%Y%m%d_%H%M%S')}"
 RUNTIME_ENV_STAMP="${QWEN3VL_RUNTIME_ENV_STAMP:-$TIMESTAMP}"
-VISIBLE_GPUS="$(count_visible_gpus)"
+VISIBLE_GPUS="$(qwen3vl_count_visible_gpus "$PYTHON_BIN")"
 
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] && [[ "$VISIBLE_GPUS" =~ ^[0-9]+$ ]] && [[ "$VISIBLE_GPUS" -gt 0 ]]; then
   CUDA_VISIBLE_DEVICES="$(seq -s, 0 $((VISIBLE_GPUS - 1)))"
@@ -99,7 +84,7 @@ if [ ! -f "$TRAIN_FILE" ] || [ ! -f "$VAL_FILE" ]; then
   cat >&2 <<EOF2
 DeepVision VERL parquet not found.
 Build it first with:
-  $PYTHON_BIN Qwen/scripts/build_deepvision_verl_dataset.py
+  $PYTHON_BIN Qwen/data/build_deepvision_verl_dataset.py
 EOF2
   exit 1
 fi
@@ -134,15 +119,10 @@ mkdir -p "$OUTPUT_DIR"
 LOG_FILE="${LOG_FILE:-$OUTPUT_DIR/training.log}"
 RESOLVED_CONFIG_FILE="$OUTPUT_DIR/resolved_runtime_config.yaml"
 
-sanitize_log_stream() {
-  stdbuf -oL -eL perl -MIO::Handle -ne 'BEGIN { STDOUT->autoflush(1) } s/\e\[[0-9;]*[[:alpha:]]//g; s/\r/\n/g; print'
-}
-cp "$PROJECT_BASE_CONFIG" "$OUTPUT_DIR/$(basename "$PROJECT_BASE_CONFIG")"
-if [[ -n "$PROJECT_CONFIG" ]]; then
-  cp "$PROJECT_CONFIG" "$OUTPUT_DIR/$(basename "$PROJECT_CONFIG")"
-fi
+qwen3vl_copy_if_present "$PROJECT_BASE_CONFIG" "$OUTPUT_DIR"
+qwen3vl_copy_if_present "$PROJECT_CONFIG" "$OUTPUT_DIR"
 
-exec > >(sanitize_log_stream | tee -a "$LOG_FILE") 2>&1
+exec > >(qwen3vl_sanitize_log_stream | tee -a "$LOG_FILE") 2>&1
 
 export DEEPSEEK_OCR_ROOT="$REPO_ROOT"
 export MODEL_PATH
@@ -198,7 +178,6 @@ export OUTPUT_DIR
 [[ -n "$RESUME_MODE" ]] && export RESUME_MODE
 
 export QWEN3VL_RUNTIME_ENV_STAMP="$RUNTIME_ENV_STAMP"
-export PYTHONPATH="$REPO_ROOT:$REPO_ROOT/vllm_thinking_plugin:${PYTHONPATH:-}"
 export VLLM_PLUGINS="${VLLM_PLUGINS:-vllm_thinking}"
 export VLLM_THINKING="${VLLM_THINKING:-1}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
@@ -306,7 +285,7 @@ fi
 } > "$OUTPUT_DIR/launcher_effective_env.snapshot.txt"
 
 CMD=(
-  "$PYTHON_BIN" -u "$REPO_ROOT/Qwen/scripts/run_verl_ppo.py"
+  "$PYTHON_BIN" -u "$REPO_ROOT/Qwen/verl/run_verl_ppo.py"
   --project-config "$PROJECT_BASE_CONFIG"
 )
 

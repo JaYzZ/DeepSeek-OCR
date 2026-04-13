@@ -23,7 +23,7 @@ thinking_end_id: 151668
 thinking_sep_id: 151670
 
 ### latent objective runtime
-loss_type: ce+vae_ce+vae+mse+ot
+loss_type: ce+vae
 latent_aux_loss_source: hidden
 latent_ce_token: 0
 # 0 => use sampled CoT token IDs at latent-step CE positions (default)
@@ -34,12 +34,14 @@ vae_intermediate_size: 512
 
 ### curriculum
 curriculum_enable: 1
-curriculum_epochs: 0,1
-curriculum_loss_types: ce:0.1+vae_ce+vae+mse:0.1+ot:0.1,ce:0.5+vae_ce+vae:0.4+mse:0.4+ot:0.4
-curriculum_vae_trainable: 1,1
-curriculum_lora_trainable: 0,1
-curriculum_aux_source: hidden,hidden
-curriculum_latent_ce: 1,1
+curriculum_epochs: 0,1,2
+curriculum_loss_types: ce+vae_ce+mse:0.3+ot:0.3,ce+vae_ce+mse:0.3+ot:0.3,ce+vae_ce+mse:0.3+ot:0.3
+curriculum_vae_trainable: 1,1,1
+curriculum_lora_trainable: 1,1,1
+curriculum_aux_source: vae_sample,vae_sample,vae_sample
+curriculum_latent_ce: 1,1,1
+prepare_curriculum_datasets: 1
+curriculum_stage_datasets: "r1_onevision_thinking,deepvision_thinking|r1_onevision_thinking,deepvision_thinking|r1_onevision_thinking,deepvision_thinking|r1_onevision_thinking,deepvision_thinking"
 
 ### backfill / transparent eval
 # Used by post-training backfill and transparent eval callbacks.
@@ -49,9 +51,9 @@ backfill_enable: 1
 ### post-training benchmark
 # Used by the training wrappers when they optionally launch benchmark eval.
 benchmark_enable: 1
-benchmark_list: MathVision,MMMU,RealWorldQA
+benchmark_list: MathVision,MMMU,RealWorldQA,M3CoT
 benchmark_num_samples: 100
-benchmark_server_concurrency: 16
+benchmark_server_concurrency: 32
 
 ### vLLM runtime
 # These control whether continuous hidden-state AR is enabled at inference time.

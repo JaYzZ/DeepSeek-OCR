@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -235,6 +236,17 @@ def test_parse_loss_spec_defaults_unweighted_terms_to_one():
     ]
 
 
+def test_set_output_loss_keeps_modeloutput_trainer_compatible():
+    outputs = CausalLMOutputWithPast(logits=torch.randn(1, 2, 3))
+    loss = torch.tensor(1.23)
+
+    lfi._set_output_loss(outputs, loss)
+
+    assert outputs.loss is loss
+    assert "loss" in outputs
+    assert outputs["loss"] is loss
+
+
 def test_curriculum_applies_on_non_world_zero(monkeypatch):
     monkeypatch.setenv("QWEN3VL_CURRICULUM_ENABLE", "1")
     monkeypatch.setenv("QWEN3VL_CURRICULUM_EPOCHS", "1")
@@ -296,6 +308,28 @@ def test_should_save_vae_checkpoint_respects_active_loss_spec(monkeypatch):
     assert lfi._should_save_vae_checkpoint() is True
 
 
+def test_save_vae_checkpoint_falls_back_to_runtime_handoff(tmp_path, monkeypatch):
+    class DummyVAE(torch.nn.Module):
+        def state_dict(self, *args, **kwargs):
+            return {"bad_weight": torch.empty(0, dtype=torch.bfloat16)}
+
+    model = SimpleNamespace(latent_vae=DummyVAE())
+    runtime_ckpt = tmp_path / "runtime_vae.safetensors"
+    output_dir = tmp_path / "saved"
+    valid_state = {"good_weight": torch.ones(2, dtype=torch.bfloat16)}
+    import safetensors.torch
+
+    safetensors.torch.save_file(valid_state, str(runtime_ckpt))
+    monkeypatch.setenv("QWEN3VL_VAE_CHECKPOINT_PATH", str(runtime_ckpt))
+    monkeypatch.setattr(lfi, "_is_rank0", lambda: True)
+
+    lfi.save_vae_checkpoint(model, str(output_dir))
+
+    saved = safetensors.torch.load_file(str(output_dir / "vae.safetensors"))
+    assert tuple(saved["good_weight"].shape) == (2,)
+    assert torch.equal(saved["good_weight"], valid_state["good_weight"])
+
+
 def test_unbalanced_sinkhorn_prefers_selective_matches_over_full_average():
     cost_matrix = torch.tensor(
         [
@@ -344,3 +378,86 @@ def test_ot_sample_loss_is_more_selective_than_pairwise_average(monkeypatch):
     assert cost_matrix.shape == (2, 3)
     assert torch.isfinite(loss)
     assert float(loss.item()) < float(cost_matrix.mean().item())
+
+
+def test_ot_sampling_defaults_to_disabled(monkeypatch):
+    monkeypatch.delenv("QWEN3VL_OT_SAMPLE_K", raising=False)
+
+    assert lfi._get_ot_sample_k() is None
+
+
+def test_contiguous_true_spans_splits_latent_chunks():
+    mask = torch.tensor([0, 1, 1, 0, 1, 1, 1, 0], dtype=torch.bool)
+
+    spans = lfi._contiguous_true_spans(mask)
+
+    assert spans == [(1, 3), (4, 7)]
+
+
+def test_grounded_chunk_ot_uses_dustbin_without_losing_image_connection(monkeypatch):
+    monkeypatch.setenv("QWEN3VL_OT_ANCHORS", "2")
+    monkeypatch.setenv("QWEN3VL_OT_MIN_IMAGE_MASS", "0.4")
+    monkeypatch.setenv("QWEN3VL_OT_DUSTBIN_COST", "0.6")
+    monkeypatch.setenv("QWEN3VL_OT_GROUNDING_PENALTY", "4.0")
+    monkeypatch.setenv("QWEN3VL_OT_EPSILON", "0.1")
+    monkeypatch.setenv("QWEN3VL_OT_TAU", "1.0")
+    monkeypatch.setenv("QWEN3VL_OT_SINKHORN_ITERS", "20")
+
+    pred_tokens = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.9, 0.1],
+            [0.0, 1.0],
+            [0.0, 0.9],
+        ],
+        dtype=torch.float32,
+    )
+    target_tokens = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    loss, stats = lfi._compute_grounded_chunk_ot_loss(pred_tokens, target_tokens)
+
+    assert torch.isfinite(loss)
+    assert stats["pred_anchors"] == pytest.approx(2.0)
+    assert stats["real_mass"] > 0.2
+    assert stats["dustbin_mass"] > 0.0
+    assert stats["grounding_shortfall"] < 0.25
+
+
+def test_ot_loss_tracks_chunks_in_stats(monkeypatch):
+    monkeypatch.setenv("QWEN3VL_OT_ANCHORS", "1")
+    monkeypatch.setenv("QWEN3VL_OT_MIN_IMAGE_MASS", "0.3")
+    monkeypatch.setenv("QWEN3VL_OT_DUSTBIN_COST", "0.7")
+    monkeypatch.setenv("QWEN3VL_OT_GROUNDING_PENALTY", "2.0")
+    monkeypatch.setenv("QWEN3VL_OT_EPSILON", "0.1")
+    monkeypatch.setenv("QWEN3VL_OT_TAU", "1.0")
+    monkeypatch.setenv("QWEN3VL_OT_SINKHORN_ITERS", "20")
+
+    hidden_states = torch.tensor(
+        [
+            [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [0.8, 0.2],
+                [0.0, 0.0],
+                [0.0, 1.0],
+                [0.1, 0.9],
+                [0.0, 0.0],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    latent_positions = torch.tensor([[0, 0, 1, 1, 0, 1, 1]], dtype=torch.bool)
+    latent_supervision = [[torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)]]
+
+    loss, stats = lfi._compute_ot_loss(hidden_states, latent_supervision, latent_positions)
+
+    assert loss is not None
+    assert stats["num_valid_samples"] == 1
+    assert stats["num_valid_chunks"] == 2
+    assert stats["aggregated"]["avg_pred_tokens"] == pytest.approx(1.0)

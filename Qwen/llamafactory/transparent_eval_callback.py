@@ -61,7 +61,7 @@ class QwenTransparentEvalCallback(TrainerCallback):
         self.limit = os.environ.get("QWEN3VL_TRANSPARENT_EVAL_LIMIT", "")
         self.repo_root = os.environ.get("REPO_ROOT", "/share/project/xiyan/sources/DeepSeek-OCR")
 
-        logger.info("[QwenTransparentEval] Initialized - will auto-enable when eval_dataset='qwen3vl_transparent_eval'")
+        logger.info("[QwenTransparentEval] Initialized - will auto-enable when eval_dataset='transparent_eval'")
         logger.info(f"[QwenTransparentEval] Config: max_tokens={self.max_new_tokens}, temp={self.temperature}, limit={self.limit}")
 
     def on_evaluate(
@@ -72,7 +72,7 @@ class QwenTransparentEvalCallback(TrainerCallback):
         **kwargs
     ):
         """Run transparent evaluation after standard evaluation completes."""
-        # Auto-enable: Check if eval_dataset is configured to qwen3vl_transparent_eval
+        # Auto-enable: Check if eval_dataset is configured to transparent_eval
         should_run = False
 
         eval_dataloader = kwargs.get('eval_dataloader')
@@ -80,7 +80,7 @@ class QwenTransparentEvalCallback(TrainerCallback):
             dataset = getattr(eval_dataloader, 'dataset', None)
             if dataset is not None:
                 dataset_name = getattr(dataset, 'dataset_name', None)
-                if dataset_name == 'qwen3vl_transparent_eval':
+                if dataset_name == 'transparent_eval':
                     should_run = True
 
         # Also check if output_dir contains 'thinking' (for r1_onevision_thinking runs)

@@ -58,11 +58,13 @@ logs/
 swanlog/*
 **/.pytest_cache/*
 **/data/*.json*
+**/data/**/*.json*
 **/data/**/**.png
 **/data/**/**.jpg
 **/data/**/**.parquet
 **/data/*images/*
 **/data/cache/*
+**/.hf_cache/**
 Qwen/results/*
 Qwen/evaluation/data/*
 *.tsv

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
 import errno
 import io
 import json
@@ -17,6 +18,8 @@ import os
 import socket
 import sys
 import time
+from types import MethodType
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -40,14 +43,14 @@ except ImportError:  # pragma: no cover - environment-specific
 _REPO_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
-from Qwen.scripts.vllm_utils import apply_runtime_env_for_thinking
+from Qwen.inference.vllm_utils import apply_runtime_env_for_thinking
 from Qwen.llamafactory.integration import LatentVAE
 
 sys.path.insert(0, str(Path(__file__).parent))
 from utils.visualization_utils import compute_tsne
 
 
-DEFAULT_MODEL_PATH = "Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking"
+DEFAULT_MODEL_PATH = "/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking"
 DEFAULT_LORA_PATH = (
     "Qwen/checkpoints/qwen3vl-2b/verl/chimera_gspo/"
     "run_20260401_033750/global_step_20/actor/lora_adapter"
@@ -56,6 +59,9 @@ DEFAULT_VIS_MAX_TOKENS = int(os.environ.get("QWEN_VIS_DEFAULT_MAX_TOKENS", "8192
 MAX_VIS_MAX_TOKENS = int(os.environ.get("QWEN_VIS_MAX_TOKENS", "8192"))
 ATTENTION_MAX_TOKENS = int(os.environ.get("QWEN_VIS_ATTENTION_MAX_TOKENS", "512"))
 TSNE_MAX_FEATURE_POINTS = int(os.environ.get("QWEN_VIS_TSNE_MAX_FEATURE_POINTS", "1500"))
+ATTENTION_CACHE_DIR = Path(os.environ.get("QWEN_VIS_ATTENTION_CACHE_DIR", "/tmp/qwen_vis_attention"))
+ATTENTION_CACHE_TTL_SECONDS = int(os.environ.get("QWEN_VIS_ATTENTION_CACHE_TTL_SECONDS", str(60 * 60)))
+ATTENTION_OVERVIEW_MAX_SIZE = int(os.environ.get("QWEN_VIS_ATTENTION_OVERVIEW_MAX_SIZE", "256"))
 
 
 def _env_flag_enabled(name: str, default: str = "0") -> bool:
@@ -376,6 +382,54 @@ def _append_attention_row(matrix: np.ndarray, row: np.ndarray) -> np.ndarray:
     return expanded
 
 
+class _LastLayerAttentionCollector:
+    def __init__(self) -> None:
+        self.matrix = np.empty((0, 0), dtype=np.float32)
+
+    def capture(self, attn_weights: torch.Tensor | None) -> None:
+        if attn_weights is None or attn_weights.ndim != 4 or attn_weights.shape[0] == 0:
+            return
+        averaged = attn_weights[0].detach().float().mean(dim=0).cpu().numpy()
+        if averaged.ndim != 2:
+            return
+        if averaged.shape[0] == averaged.shape[1]:
+            self.matrix = averaged
+            return
+        if averaged.shape[0] == 1:
+            self.matrix = _append_attention_row(self.matrix, averaged[0])
+
+
+def _resolve_last_text_attention_module(model: Any) -> Any:
+    core_model = _resolve_multimodal_core(model)
+    language_model = getattr(core_model, "language_model", None)
+    layers = getattr(language_model, "layers", None)
+    if not layers:
+        raise RuntimeError("Unable to resolve last text attention layer for visualization")
+    return layers[-1].self_attn
+
+
+@contextmanager
+def _capture_last_layer_attention(model: Any, enabled: bool):
+    if not enabled:
+        yield None
+        return
+
+    attn_module = _resolve_last_text_attention_module(model)
+    collector = _LastLayerAttentionCollector()
+    original_forward = attn_module.forward
+
+    def wrapped_forward(module_self, *args, **kwargs):
+        attn_output, attn_weights = original_forward(*args, **kwargs)
+        collector.capture(attn_weights)
+        return attn_output, attn_weights
+
+    attn_module.forward = MethodType(wrapped_forward, attn_module)
+    try:
+        yield collector
+    finally:
+        attn_module.forward = original_forward
+
+
 def _align_analysis_lengths(analysis: dict[str, Any]) -> dict[str, Any]:
     token_count = len(analysis["tokens"])
 
@@ -555,6 +609,98 @@ def _format_response_text_for_display(text: str) -> str:
     return text
 
 
+def _cleanup_attention_cache() -> None:
+    try:
+        ATTENTION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    now = time.time()
+    for meta_path in ATTENTION_CACHE_DIR.glob("*.json"):
+        try:
+            if now - meta_path.stat().st_mtime <= ATTENTION_CACHE_TTL_SECONDS:
+                continue
+            with open(meta_path, "r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+            array_path = ATTENTION_CACHE_DIR / metadata["array_file"]
+            if array_path.exists():
+                array_path.unlink()
+            meta_path.unlink()
+        except Exception:
+            continue
+
+
+def _downsample_attention_matrix(matrix: np.ndarray, max_size: int) -> np.ndarray:
+    if matrix.ndim != 2:
+        raise ValueError("Attention matrix must be 2D")
+    rows, cols = matrix.shape
+    target = max(1, int(max_size))
+    if rows <= target and cols <= target:
+        return matrix
+
+    row_indices = np.linspace(0, rows - 1, min(rows, target), dtype=int)
+    col_indices = np.linspace(0, cols - 1, min(cols, target), dtype=int)
+    return matrix[np.ix_(row_indices, col_indices)]
+
+
+def _store_attention_matrix(attention_weights: np.ndarray | None, token_count: int) -> dict[str, Any] | None:
+    if not _has_data(attention_weights):
+        return None
+
+    attention_array = np.asarray(attention_weights, dtype=np.float16)
+    if attention_array.ndim != 2:
+        return None
+
+    _cleanup_attention_cache()
+    ATTENTION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    attention_id = f"attn_{uuid.uuid4().hex}"
+    array_filename = f"{attention_id}.npy"
+    meta_filename = f"{attention_id}.json"
+    tmp_array_path = ATTENTION_CACHE_DIR / f"{array_filename}.tmp"
+    tmp_meta_path = ATTENTION_CACHE_DIR / f"{meta_filename}.tmp"
+    array_path = ATTENTION_CACHE_DIR / array_filename
+    meta_path = ATTENTION_CACHE_DIR / meta_filename
+
+    with open(tmp_array_path, "wb") as handle:
+        np.save(handle, attention_array, allow_pickle=False)
+    os.replace(tmp_array_path, array_path)
+
+    metadata = {
+        "id": attention_id,
+        "array_file": array_filename,
+        "shape": [int(attention_array.shape[0]), int(attention_array.shape[1])],
+        "dtype": str(attention_array.dtype),
+        "token_count": int(token_count),
+        "created_at": int(time.time()),
+    }
+    with open(tmp_meta_path, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle)
+    os.replace(tmp_meta_path, meta_path)
+    return metadata
+
+
+def _load_attention_metadata(attention_id: str) -> dict[str, Any]:
+    meta_path = ATTENTION_CACHE_DIR / f"{attention_id}.json"
+    if not meta_path.exists():
+        raise HTTPException(status_code=404, detail="Attention cache entry not found")
+    with open(meta_path, "r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    return metadata
+
+
+def _load_attention_matrix(attention_id: str) -> tuple[np.memmap, dict[str, Any]]:
+    metadata = _load_attention_metadata(attention_id)
+    array_path = ATTENTION_CACHE_DIR / metadata["array_file"]
+    if not array_path.exists():
+        raise HTTPException(status_code=404, detail="Attention cache array not found")
+    matrix = np.load(array_path, mmap_mode="r", allow_pickle=False)
+    expected_shape = tuple(int(x) for x in metadata["shape"])
+    if matrix.shape != expected_shape:
+        raise HTTPException(status_code=500, detail="Attention cache shape mismatch")
+    return matrix, metadata
+
+
 def _generate_with_adaptive_thinking_trace(
     model: Any,
     tokenizer: Any,
@@ -591,20 +737,21 @@ def _generate_with_adaptive_thinking_trace(
         video_grid_thw=batch.get("video_grid_thw"),
     )
 
-    with torch.inference_mode():
-        prompt_outputs = core_model(
-            input_ids=input_ids,
-            attention_mask=language_inputs["attention_mask"],
-            position_ids=None,
-            inputs_embeds=None,
-            pixel_values=batch.get("pixel_values"),
-            pixel_values_videos=batch.get("pixel_values_videos"),
-            image_grid_thw=batch.get("image_grid_thw"),
-            video_grid_thw=batch.get("video_grid_thw"),
-            output_attentions=collect_attention,
-            return_dict=True,
-            use_cache=True,
-        )
+    with _capture_last_layer_attention(model, collect_attention) as attention_collector:
+        with torch.inference_mode():
+            prompt_outputs = core_model(
+                input_ids=input_ids,
+                attention_mask=language_inputs["attention_mask"],
+                position_ids=None,
+                inputs_embeds=None,
+                pixel_values=batch.get("pixel_values"),
+                pixel_values_videos=batch.get("pixel_values_videos"),
+                image_grid_thw=batch.get("image_grid_thw"),
+                video_grid_thw=batch.get("video_grid_thw"),
+                output_attentions=False,
+                return_dict=True,
+                use_cache=True,
+            )
 
     prompt_token_ids = input_ids[0].detach().cpu().tolist()
     token_ids = list(prompt_token_ids)
@@ -614,10 +761,6 @@ def _generate_with_adaptive_thinking_trace(
     continuous_mask = [False] * prompt_len
     generated_token_ids: list[int] = []
     latent_embedding_rows: list[np.ndarray] = []
-
-    last_layer_attention = np.empty((0, 0), dtype=np.float32)
-    if collect_attention and prompt_outputs.attentions:
-        last_layer_attention = prompt_outputs.attentions[-1][0].detach().float().mean(dim=0).cpu().numpy()
 
     vision_embeddings: list[dict[str, Any]] = []
     visual_mask = language_inputs["visual_pos_masks"]
@@ -635,22 +778,15 @@ def _generate_with_adaptive_thinking_trace(
     state = "continuous" if _prompt_has_unclosed_think(prompt_token_ids) else "discrete"
     thinking_steps = 0
     current_hidden = prompt_outputs.last_hidden_state[:, -1:, :]
-    current_attn_row = (
-        prompt_outputs.attentions[-1][0].detach().float().mean(dim=0)[-1]
-        if collect_attention and getattr(prompt_outputs, "attentions", None)
-        else None
-    )
 
     def _record_step(
         token_id: int,
         token_embed: torch.Tensor,
         hidden: torch.Tensor,
-        attn_row: torch.Tensor | None,
         *,
         is_continuous: bool,
         latent_embed: torch.Tensor | None,
     ) -> None:
-        nonlocal last_layer_attention
         token_ids.append(int(token_id))
         generated_token_ids.append(int(token_id))
         token_embeddings_rows.append(token_embed[0, 0].detach().float().cpu().numpy())
@@ -658,8 +794,6 @@ def _generate_with_adaptive_thinking_trace(
         continuous_mask.append(bool(is_continuous))
         if latent_embed is not None:
             latent_embedding_rows.append(latent_embed[0, 0].detach().float().cpu().numpy())
-        if collect_attention and attn_row is not None:
-            last_layer_attention = _append_attention_row(last_layer_attention, attn_row.detach().float().cpu().numpy())
 
     with torch.inference_mode():
         while len(generated_token_ids) < max_new_tokens:
@@ -701,12 +835,10 @@ def _generate_with_adaptive_thinking_trace(
                 next_input_ids = None
                 next_input_embeds = latent_embed
                 thinking_steps += 1
-
             _record_step(
                 next_token,
                 token_embed,
                 current_hidden,
-                current_attn_row,
                 is_continuous=(mode_after_step == "continuous"),
                 latent_embed=latent_embed if mode_after_step == "continuous" else None,
             )
@@ -728,16 +860,13 @@ def _generate_with_adaptive_thinking_trace(
                 past_key_values=kv_cache,
                 cache_position=cache_position,
                 use_cache=True,
-                output_attentions=collect_attention,
+                output_attentions=False,
                 return_dict=True,
             )
             kv_cache = outputs.past_key_values
             current_hidden = outputs.last_hidden_state[:, -1:, :]
-            current_attn_row = (
-                outputs.attentions[-1][0].detach().float().mean(dim=0)[0]
-                if collect_attention and getattr(outputs, "attentions", None)
-                else None
-            )
+
+    last_layer_attention = attention_collector.matrix if attention_collector is not None else np.empty((0, 0), dtype=np.float32)
 
     tokens = []
     for position, token_id in enumerate(token_ids):
@@ -781,6 +910,7 @@ def _collect_sequence_analysis(
     generation_batch: dict[str, Any],
     *,
     collect_attention: bool,
+    generated_input_embeds: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     full_input_ids = generated_sequences
     full_attention_mask = torch.ones_like(full_input_ids, device=full_input_ids.device)
@@ -795,23 +925,31 @@ def _collect_sequence_analysis(
         video_grid_thw=generation_batch.get("video_grid_thw"),
     )
 
+    replay_inputs_embeds = language_inputs["inputs_embeds"]
+    if generated_input_embeds is not None and generated_input_embeds.numel() > 0:
+        generated_count = int(generated_input_embeds.shape[1])
+        prompt_len = int(full_input_ids.shape[1]) - generated_count
+        replay_inputs_embeds = replay_inputs_embeds.clone()
+        replay_inputs_embeds[:, prompt_len:, :] = generated_input_embeds.to(
+            device=replay_inputs_embeds.device,
+            dtype=replay_inputs_embeds.dtype,
+        )
+
+    core_model = _resolve_multimodal_core(model)
     with torch.inference_mode():
-        outputs = model.language_model(
+        outputs = core_model(
             input_ids=None,
-            inputs_embeds=language_inputs["inputs_embeds"],
+            inputs_embeds=replay_inputs_embeds,
             attention_mask=language_inputs["attention_mask"],
             position_ids=language_inputs["position_ids"],
-            visual_pos_masks=language_inputs["visual_pos_masks"],
-            deepstack_visual_embeds=language_inputs["deepstack_visual_embeds"],
             output_attentions=collect_attention,
-            output_hidden_states=True,
             return_dict=True,
             use_cache=False,
         )
 
     token_ids = full_input_ids[0].detach().cpu().tolist()
-    token_embeddings = language_inputs["inputs_embeds"][0].detach().float().cpu().numpy()
-    hidden_states = outputs.hidden_states[-1][0].detach().float().cpu().numpy()
+    token_embeddings = replay_inputs_embeds[0].detach().float().cpu().numpy()
+    hidden_states = outputs.last_hidden_state[0].detach().float().cpu().numpy()
 
     last_layer_attention = None
     if collect_attention and outputs.attentions:
@@ -1030,7 +1168,7 @@ def run_generation(
     device = _resolve_device(model)
     model_dtype = next(param.dtype for param in model.parameters() if torch.is_floating_point(param))
     batch, _ = _prepare_batch(messages, processor, device=device, dtype=model_dtype)
-    collect_attention = effective_max_tokens <= ATTENTION_MAX_TOKENS
+    collect_attention = True
     response_text, analysis = _generate_with_adaptive_thinking_trace(
         model,
         tokenizer,
@@ -1101,20 +1239,15 @@ async def root():
 
 @app.get("/api/example")
 async def get_example():
-    deepvision_path = _REPO_ROOT / "Qwen/data/deepvision_103k_sft.jsonl"
+    deepvision_path = _REPO_ROOT / "Qwen/data/metadata/deepvision_103k_metadata.jsonl"
     if not deepvision_path.exists():
-        raise HTTPException(status_code=404, detail="Deepvision data file not found")
+        raise HTTPException(status_code=404, detail="Deepvision metadata file not found")
 
     with open(deepvision_path, "r", encoding="utf-8") as handle:
         example = json.loads(handle.readline())
 
-    image_path = example.get("images", [None])[0]
-    messages = example.get("messages", [])
-    question = ""
-    for message in messages:
-        if message.get("role") == "user":
-            question = message.get("content", "").replace("<image>\n", "")
-            break
+    image_path = example.get("query_image_path")
+    question = example.get("question", "")
 
     image_base64 = None
     if image_path and Path(image_path).exists():
@@ -1168,6 +1301,7 @@ async def infer_vis(request: dict[str, Any]):
             top_p=1.0,
             repetition_penalty=1.0,
         )
+        attention_cache = _store_attention_matrix(analysis.get("attention_weights"), len(analysis["tokens"]))
 
         tsne_coordinates = analysis.get("tsne_coordinates")
         tsne_feature_types = analysis.get("tsne_feature_types", [])
@@ -1184,11 +1318,11 @@ async def infer_vis(request: dict[str, Any]):
             "answer": response_text,
             "tokens": analysis["tokens"],
             "hidden_states": None,
-            "attention_weights": analysis["attention_weights"].tolist() if _has_data(analysis["attention_weights"]) else None,
             "continuous_mask": analysis["continuous_mask"],
             "tsne_coordinates": tsne_coordinates,
             "tsne_feature_types": tsne_feature_types,
             "tsne_position_indices": tsne_position_indices,
+            "attention": attention_cache,
             "token_metadata": {
                 "total_tokens": len(analysis["tokens"]),
                 "continuous_tokens": sum(1 for flag in analysis["continuous_mask"] if flag),
@@ -1200,6 +1334,37 @@ async def infer_vis(request: dict[str, Any]):
     except Exception as exc:
         print(f"[infer] failed: {exc}", flush=True)
         raise HTTPException(status_code=500, detail=f"Inference error: {exc}") from exc
+
+
+@app.get("/api/attention/{attention_id}/overview")
+async def get_attention_overview(attention_id: str, max_size: int = ATTENTION_OVERVIEW_MAX_SIZE):
+    matrix, metadata = _load_attention_matrix(attention_id)
+    overview = _downsample_attention_matrix(matrix, max_size=max_size).astype(np.float32, copy=False)
+    row_indices = np.linspace(0, matrix.shape[0] - 1, overview.shape[0], dtype=int).tolist()
+    col_indices = np.linspace(0, matrix.shape[1] - 1, overview.shape[1], dtype=int).tolist()
+    return {
+        "attention_id": attention_id,
+        "matrix": overview.tolist(),
+        "row_indices": row_indices,
+        "col_indices": col_indices,
+        "shape": metadata["shape"],
+        "dtype": metadata["dtype"],
+    }
+
+
+@app.get("/api/attention/{attention_id}/row")
+async def get_attention_row(attention_id: str, index: int):
+    matrix, metadata = _load_attention_matrix(attention_id)
+    if index < 0 or index >= matrix.shape[0]:
+        raise HTTPException(status_code=400, detail="Attention row index out of range")
+    row = np.asarray(matrix[index], dtype=np.float32)
+    return {
+        "attention_id": attention_id,
+        "index": int(index),
+        "row": row.tolist(),
+        "shape": metadata["shape"],
+        "dtype": metadata["dtype"],
+    }
 
 
 @app.post("/v1/chat/completions")

@@ -226,6 +226,10 @@ def _get_loss_spec() -> str:
     return os.environ.get("QWEN3VL_LOSS_TYPE", "ot+mse").lower()
 
 
+def _opsd_replay_mode_enabled() -> bool:
+    return os.environ.get("QWEN3VL_OPSD_REPLAY_MODE", "0") == "1"
+
+
 def _get_latent_aux_loss_source() -> str:
     """Choose where auxiliary latent losses are applied.
 
@@ -240,6 +244,30 @@ def _get_latent_aux_loss_source() -> str:
             "Expected 'hidden' or 'vae_sample'."
         )
     return source
+
+
+def _loss_term_weight(loss_spec: str, loss_name: str) -> float:
+    """Return the configured weight for a loss term, or 0 when absent."""
+    for name, weight in _parse_loss_spec(loss_spec):
+        if name == loss_name:
+            return float(weight)
+    return 0.0
+
+
+def _main_ce_enabled(loss_spec: str) -> bool:
+    """Whether the primary model forward should compute token CE."""
+    return _loss_term_weight(loss_spec, "ce") > 0.0
+
+
+def _set_output_loss(outputs, loss) -> None:
+    """Expose custom loss through both attribute and mapping access.
+
+    HF Trainer checks `"loss" in outputs` for `ModelOutput` returns instead of
+    relying on `outputs.loss`, so custom auxiliary-only losses must populate both.
+    """
+    outputs.loss = loss
+    if isinstance(outputs, dict):
+        outputs["loss"] = loss
 
 
 class LatentVAE(nn.Module):
@@ -582,7 +610,7 @@ def _patch_model_for_thinking_projection(logger) -> None:
         vae_keys = [k for k in state_dict.keys() if k.startswith('latent_vae.')]
         if vae_keys:
             # Create VAE before loading so weights can be restored
-            hidden_size = self.config.hidden_size
+            hidden_size = _resolve_model_hidden_size(self)
             vae = LatentVAE(hidden_size=hidden_size, intermediate_size=int(os.environ.get("QWEN3VL_VAE_INTERMEDIATE_SIZE", "512")), deterministic=False)
             _align_module_to_model_dtype_device(self, vae)
             self.register_module('latent_vae', vae)
@@ -617,20 +645,121 @@ def _apply_vae_trainable(model, trainable: bool) -> None:
         if trainable:
             logger.debug("[Qwen3VL Latent] VAE not yet created, will be trainable when created")
 
+
+def _apply_runtime_stage_trainability(model) -> None:
+    """Apply LoRA/VAE trainability from env vars for split-stage runs.
+
+    The shell launcher materializes curriculum stages as separate trainer runs and
+    disables the curriculum callback inside each run. In that mode we still need
+    to honor `QWEN3VL_LORA_TRAINABLE` / `QWEN3VL_VAE_TRAINABLE` before optimizer
+    creation, otherwise all LoRA params remain trainable by default.
+    """
+    if model is None:
+        return
+
+    lora_trainable = get_flag("QWEN3VL_LORA_TRAINABLE", True)
+    vae_trainable = get_flag("QWEN3VL_VAE_TRAINABLE", True)
+
+    lora_updated = False
+    vae_updated = False
+    for name, param in model.named_parameters():
+        lower_name = name.lower()
+        if "lora_" in lower_name and param.requires_grad != lora_trainable:
+            param.requires_grad = lora_trainable
+            lora_updated = True
+        if "latent_vae" in name and param.requires_grad != vae_trainable:
+            param.requires_grad = vae_trainable
+            vae_updated = True
+
+    if _is_rank0():
+        if lora_updated:
+            state = "trainable" if lora_trainable else "frozen"
+            logger.info(f"[Qwen3VL Latent] Applied runtime LoRA trainability: {state}")
+        if vae_updated:
+            state = "trainable" if vae_trainable else "frozen"
+            logger.info(f"[Qwen3VL Latent] Applied runtime VAE trainability: {state}")
+
+def _resolve_model_float_reference(model: nn.Module) -> Optional[tuple[torch.device, torch.dtype]]:
+    """Return the dominant floating device/dtype pair used by the model."""
+    dtype_counts: dict[tuple[torch.device, torch.dtype], int] = {}
+
+    for tensor in list(model.parameters()) + list(model.buffers()):
+        if not torch.is_floating_point(tensor):
+            continue
+        key = (tensor.device, tensor.dtype)
+        dtype_counts[key] = dtype_counts.get(key, 0) + int(tensor.numel())
+
+    if not dtype_counts:
+        return None
+
+    return max(dtype_counts.items(), key=lambda item: item[1])[0]
+
+
+def _resolve_model_hidden_size(model: Any) -> int:
+    """Resolve text hidden size through common Qwen/PEFT/FSDP wrappers."""
+    config = getattr(model, "config", None)
+    hidden_size = getattr(config, "hidden_size", None)
+    if hidden_size is not None:
+        return int(hidden_size)
+
+    text_config = getattr(config, "text_config", None)
+    nested_hidden_size = getattr(text_config, "hidden_size", None)
+    if nested_hidden_size is not None:
+        return int(nested_hidden_size)
+
+    base_model = getattr(model, "base_model", None)
+    if base_model is not None and base_model is not model:
+        return _resolve_model_hidden_size(base_model)
+
+    nested_model = getattr(model, "model", None)
+    if nested_model is not None and nested_model is not model:
+        return _resolve_model_hidden_size(nested_model)
+
+    raise RuntimeError("Failed to resolve model hidden size for LatentVAE creation.")
+
+
 def _align_module_to_model_dtype_device(model: nn.Module, module: nn.Module) -> None:
-    """Match a newly-created module to the model's floating dtype/device."""
-    ref_tensor = None
-    for param in model.parameters():
-        if torch.is_floating_point(param):
-            ref_tensor = param
-            break
-    if ref_tensor is None:
-        for buffer in model.buffers():
-            if torch.is_floating_point(buffer):
-                ref_tensor = buffer
-                break
-    if ref_tensor is not None:
-        module.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+    """Match a newly-created module to the dominant floating dtype/device."""
+    ref = _resolve_model_float_reference(model)
+    if ref is not None:
+        device, dtype = ref
+        module.to(device=device, dtype=dtype)
+
+
+def _normalize_aux_module_dtypes(model: nn.Module) -> None:
+    """Force LoRA and latent-VAE params to match the model's dominant float dtype."""
+    ref = _resolve_model_float_reference(model)
+    if ref is None:
+        return
+
+    device, dtype = ref
+    changed = 0
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if "lora_" not in name.lower() and "latent_vae" not in name:
+                continue
+            if not torch.is_floating_point(param):
+                continue
+            if param.dtype != dtype or param.device != device:
+                param.data = param.data.to(device=device, dtype=dtype)
+                changed += 1
+
+        for name, buffer in model.named_buffers():
+            if "lora_" not in name.lower() and "latent_vae" not in name:
+                continue
+            if not torch.is_floating_point(buffer):
+                continue
+            if buffer.dtype != dtype or buffer.device != device:
+                buffer.data = buffer.data.to(device=device, dtype=dtype)
+                changed += 1
+
+    if changed and _is_rank0():
+        logger.info(
+            "[Qwen3VL Latent] Normalized LoRA/VAE floating tensors to %s on %s (%d tensors)",
+            str(dtype),
+            str(device),
+            changed,
+        )
 
 
 # Export function for external use
@@ -646,14 +775,44 @@ def ensure_vae_in_model(model) -> None:
 def _resolve_latent_vae_module(model) -> Optional[nn.Module]:
     """Find latent_vae through common training wrappers."""
     visited: set[int] = set()
-    current = model
-    while current is not None and id(current) not in visited:
+    queue: list[Any] = [model]
+    while queue:
+        current = queue.pop(0)
+        if current is None or id(current) in visited:
+            continue
         visited.add(id(current))
+
         vae = getattr(current, "latent_vae", None)
         if vae is not None:
             return vae
-        current = getattr(current, "module", None)
+
+        for attr in ("module", "model", "base_model", "wrapped_module", "_fsdp_wrapped_module"):
+            child = getattr(current, attr, None)
+            if child is not None:
+                queue.append(child)
     return None
+
+
+def _vae_state_dict_has_empty_tensors(state_dict: dict[str, torch.Tensor]) -> bool:
+    """Detect invalid shard-like state dicts with empty tensors."""
+    if not state_dict:
+        return True
+    for tensor in state_dict.values():
+        if not isinstance(tensor, torch.Tensor):
+            return True
+        if tensor.numel() == 0 or any(dim == 0 for dim in tensor.shape):
+            return True
+    return False
+
+
+def _resolve_runtime_vae_checkpoint_file() -> Optional[str]:
+    """Resolve the runtime VAE handoff file, if configured."""
+    checkpoint_path = os.environ.get("QWEN3VL_VAE_CHECKPOINT_PATH", "").strip()
+    if not checkpoint_path:
+        return None
+    if os.path.isdir(checkpoint_path):
+        checkpoint_path = os.path.join(checkpoint_path, "vae.safetensors")
+    return checkpoint_path if os.path.exists(checkpoint_path) else None
 
 
 def save_vae_checkpoint(model, output_dir: str) -> None:
@@ -676,12 +835,40 @@ def save_vae_checkpoint(model, output_dir: str) -> None:
         name: tensor.detach().cpu()
         for name, tensor in vae.state_dict().items()
     }
+    save_source = "model"
+
+    if _vae_state_dict_has_empty_tensors(vae_state_dict):
+        fallback_path = _resolve_runtime_vae_checkpoint_file()
+        if fallback_path is not None:
+            try:
+                fallback_state_dict = safetensors.torch.load_file(fallback_path)
+                if not _vae_state_dict_has_empty_tensors(fallback_state_dict):
+                    vae_state_dict = {
+                        name: tensor.detach().cpu()
+                        for name, tensor in fallback_state_dict.items()
+                    }
+                    save_source = f"runtime_handoff:{fallback_path}"
+                    logger.warning(
+                        "[Qwen3VL Latent] VAE state_dict contained empty tensors; reusing runtime handoff %s",
+                        fallback_path,
+                    )
+                else:
+                    logger.warning(
+                        "[Qwen3VL Latent] Runtime VAE checkpoint also invalid: %s",
+                        fallback_path,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[Qwen3VL Latent] Failed to reuse runtime VAE checkpoint %s: %s",
+                    fallback_path,
+                    e,
+                )
 
     if _is_rank0():
         os.makedirs(output_dir, exist_ok=True)
         vae_path = os.path.join(output_dir, "vae.safetensors")
         safetensors.torch.save_file(vae_state_dict, vae_path)
-        logger.info(f"[Qwen3VL Latent] Saved VAE checkpoint to {vae_path}")
+        logger.info(f"[Qwen3VL Latent] Saved VAE checkpoint to {vae_path} (source={save_source})")
     try:
         if dist.is_initialized():
             dist.barrier()
@@ -710,7 +897,24 @@ def load_vae_checkpoint(model, checkpoint_path: str) -> None:
 
     vae_state_dict = safetensors.torch.load_file(checkpoint_path)
     vae.load_state_dict(vae_state_dict, strict=True)
+    _align_module_to_model_dtype_device(model, vae)
     logger.info(f"[Qwen3VL Latent] Loaded VAE checkpoint from {checkpoint_path}")
+
+
+def _maybe_load_runtime_vae_checkpoint(model) -> None:
+    """Restore VAE weights from an explicit runtime handoff path when provided."""
+    checkpoint_path = os.environ.get("QWEN3VL_VAE_CHECKPOINT_PATH", "").strip()
+    if not checkpoint_path:
+        return
+
+    if os.path.isdir(checkpoint_path):
+        checkpoint_path = os.path.join(checkpoint_path, "vae.safetensors")
+
+    if not os.path.exists(checkpoint_path):
+        logger.warning(f"[Qwen3VL Latent] Runtime VAE checkpoint not found: {checkpoint_path}")
+        return
+
+    load_vae_checkpoint(model, checkpoint_path)
 
 
 def _should_save_vae_checkpoint() -> bool:
@@ -1885,11 +2089,14 @@ def _patch_model_forward(logger) -> None:
             print(f"[DEBUG] latent_positions={type(latent_positions)}, shape={latent_positions.shape if latent_positions is not None else 'None'}", flush=True, file=sys.stderr)
 
         has_vae_in_loss = "vae" in loss_spec
+        main_ce_enabled = _main_ce_enabled(loss_spec)
         # Check curriculum control for VAE parameter trainability
         vae_param_trainable = get_flag("QWEN3VL_VAE_TRAINABLE", True)
 
-        # VAE is used for losses if it exists in loss spec AND is trainable
-        use_latent_vae = has_vae_in_loss and vae_param_trainable
+        # VAE participates in forward/loss whenever requested by the loss spec.
+        # Trainability is controlled separately through param.requires_grad so we
+        # can keep a frozen VAE active during later curriculum stages.
+        use_latent_vae = has_vae_in_loss
 
         # Lazy initialization of LatentVAE on first forward pass
         # Create VAE if "vae" in loss spec, even if not trainable (frozen mode)
@@ -1897,7 +2104,7 @@ def _patch_model_forward(logger) -> None:
             # Check if VAE already exists (from checkpoint load) or needs to be created
             if not hasattr(self, 'latent_vae') or self.latent_vae is None:
                 # Get hidden size from model config and create VAE with default config
-                hidden_size = self.config.hidden_size
+                hidden_size = _resolve_model_hidden_size(self)
                 # Create VAE with config from env var
                 vae = LatentVAE(hidden_size=hidden_size, intermediate_size=int(os.environ.get("QWEN3VL_VAE_INTERMEDIATE_SIZE", "512")), deterministic=False)
                 _align_module_to_model_dtype_device(self, vae)
@@ -1939,7 +2146,12 @@ def _patch_model_forward(logger) -> None:
                     "[Qwen3VL Latent] Expected latent_positions tensor, got %s",
                     type(latent_positions),
                 )
-        need_hidden_states = latent_supervision is not None and has_latent_positions
+        has_latent_targets = (
+            latent_ground_truth is not None
+            or latent_ground_truth_packed is not None
+            or latent_supervision is not None
+        )
+        need_hidden_states = has_latent_targets and has_latent_positions
 
         # Debug logging for latent stats
         if debug_enabled:
@@ -1996,8 +2208,9 @@ def _patch_model_forward(logger) -> None:
             print(f"  labels: {labels.shape if labels is not None else None}", flush=True, file=sys.stderr)
 
         vae_ce_mask = kwargs.pop("vae_ce_mask", None)
-        effective_labels = labels
-        if labels is not None and vae_ce_mask is not None and not _latent_ce_enabled():
+        logits_to_keep = kwargs.get("logits_to_keep", None)
+        effective_labels = labels if main_ce_enabled else None
+        if effective_labels is not None and vae_ce_mask is not None and not _latent_ce_enabled():
             effective_labels = labels.masked_fill(vae_ce_mask.bool(), -100)
 
         # Only skip pixel_values when latent_ground_truth is present and non-empty
@@ -2043,6 +2256,8 @@ def _patch_model_forward(logger) -> None:
             latent_present = latent_ground_truth is not None and len(latent_ground_truth) > 0
             print(f"[PATCHED_FORWARD] latent_present={latent_present}, latent_len={len(latent_ground_truth) if latent_ground_truth else 0}, pv={getattr(pixel_values_to_model, 'shape', None)}", flush=True, file=sys.stderr)
 
+        use_manual_main_ce = effective_labels is not None and logits_to_keep is not None
+
         outputs = original_forward(
             self,
             input_ids=None if inputs_embeds is not None else input_ids,
@@ -2050,7 +2265,7 @@ def _patch_model_forward(logger) -> None:
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            labels=effective_labels,
+            labels=None if use_manual_main_ce else effective_labels,
             pixel_values=pixel_values_to_model,
             image_grid_thw=image_grid_thw_to_model,
             output_hidden_states=need_hidden_states and not use_hook,
@@ -2063,7 +2278,6 @@ def _patch_model_forward(logger) -> None:
         # Compute auxiliary latent losses on the configured predictor branch.
         thinking_loss = None
         thinking_breakdown: list[dict[str, Any]] = []
-        loss_spec = _get_loss_spec()
         loss_configs = _parse_loss_spec(loss_spec)
         loss_weights = {name: weight for name, weight in loss_configs}
         latent_aux_loss_source = _get_latent_aux_loss_source()
@@ -2121,7 +2335,7 @@ def _patch_model_forward(logger) -> None:
         seq_indices = None
         post_vae_loss = None
         post_vae_breakdown: list[dict[str, Any]] = []
-        if use_latent_vae and need_hidden_states and latent_supervision is not None and last_hidden_states is not None:
+        if use_latent_vae and need_hidden_states and last_hidden_states is not None:
             # VAE is already on the correct device as part of FSDP-wrapped model
             # Don't move it explicitly to avoid FSDP shard issues
             vae = self.latent_vae
@@ -2208,7 +2422,43 @@ def _patch_model_forward(logger) -> None:
                 )
 
         # Combine losses (OT is default, CE is optional during eval)
-        ce_loss = outputs.loss if hasattr(outputs, 'loss') else None
+        if use_manual_main_ce:
+            logits = getattr(outputs, "logits", None)
+            if logits is None:
+                raise RuntimeError("[Qwen3VL Latent] logits_to_keep path returned no logits for CE loss.")
+
+            shift_labels = F.pad(effective_labels, (0, 1), value=-100)[..., 1:].contiguous()
+            keep = int(logits.shape[1])
+            target = shift_labels[:, -keep:].contiguous()
+            flat_target = target.reshape(-1)
+            valid_indices = torch.nonzero(flat_target.ne(-100), as_tuple=False).flatten()
+            if valid_indices.numel() > 0:
+                flat_logits = logits.reshape(-1, logits.size(-1))
+                target_device = flat_target.to(logits.device)
+                loss_sum = logits.new_zeros(())
+                chunk_size = 4
+                if logits.is_cuda:
+                    try:
+                        free_bytes, _total_bytes = torch.cuda.mem_get_info(logits.device)
+                        bytes_per_row_fp32 = int(logits.size(-1)) * 4
+                        safety_factor = 8
+                        adaptive = int(free_bytes // max(1, bytes_per_row_fp32 * safety_factor))
+                        chunk_size = max(1, min(chunk_size, adaptive if adaptive > 0 else 1))
+                    except Exception:
+                        chunk_size = 1
+                for index_chunk in valid_indices.split(chunk_size):
+                    chunk_logits = flat_logits.index_select(0, index_chunk)
+                    chunk_target = target_device.index_select(0, index_chunk)
+                    loss_sum = loss_sum + F.cross_entropy(
+                        chunk_logits.float(),
+                        chunk_target,
+                        reduction="sum",
+                    )
+                ce_loss = loss_sum / valid_indices.numel()
+            else:
+                ce_loss = logits.sum() * 0.0
+        else:
+            ce_loss = outputs.loss if main_ce_enabled and hasattr(outputs, 'loss') else None
         extra_breakdown: list[dict[str, Any]] = []
         if post_vae_breakdown:
             extra_breakdown.extend(post_vae_breakdown)
@@ -2228,6 +2478,20 @@ def _patch_model_forward(logger) -> None:
         loss = ce_loss
         if aux_loss is not None:
             loss = aux_loss if loss is None else loss + aux_loss
+
+        if loss is None and _opsd_replay_mode_enabled() and not need_hidden_states:
+            if hasattr(self, "_qwen3vl_last_loss_info"):
+                setattr(self, "_qwen3vl_last_loss_info", None)
+            return outputs
+
+        if loss is None:
+            raise RuntimeError(
+                "[Qwen3VL Latent] No training loss was produced. "
+                f"loss_spec={loss_spec}, main_ce_enabled={main_ce_enabled}, "
+                f"use_latent_vae={use_latent_vae}, need_hidden_states={need_hidden_states}, "
+                f"has_latent_positions={has_latent_positions}, "
+                f"latent_ground_truth_packed={'yes' if isinstance(latent_ground_truth_packed, torch.Tensor) and latent_ground_truth_packed.numel() > 0 else 'no'}"
+            )
 
         # Debug: Log gradient norms on hidden states (only first few times)
         if debug_enabled and last_hidden_states is not None and last_hidden_states.requires_grad:
@@ -2273,7 +2537,8 @@ def _patch_model_forward(logger) -> None:
                 "_qwen3vl_last_loss_info",
                 {
                     "loss_spec": loss_spec,
-                    "use_latent_vae": "vae" in loss_spec,
+                    "use_latent_vae": use_latent_vae,
+                    "vae_trainable": bool(vae_param_trainable),
                     "latent_aux_loss_source": latent_aux_loss_source,
                     "ce": float(ce_val),
                     "thinking": float(thinking_val) if thinking_loss is not None else None,
@@ -2287,7 +2552,7 @@ def _patch_model_forward(logger) -> None:
 
         # Update outputs
         if loss is not None:
-            outputs.loss = loss
+            _set_output_loss(outputs, loss)
 
         return outputs
 
@@ -2310,12 +2575,7 @@ def _ensure_vae_created(model) -> None:
         return  # Already created
 
     # Get hidden size from model config
-    if hasattr(model, 'config'):
-        hidden_size = getattr(model.config, 'hidden_size', None)
-        if hidden_size is None:
-            hidden_size = getattr(model.config, 'text_config', {}).get('hidden_size', 2048)
-    else:
-        hidden_size = 2048
+    hidden_size = _resolve_model_hidden_size(model)
 
     # Create VAE
     vae = LatentVAE(hidden_size=hidden_size, intermediate_size=int(os.environ.get("QWEN3VL_VAE_INTERMEDIATE_SIZE", "512")), deterministic=False)
@@ -2371,7 +2631,7 @@ def _patch_trainer_callback(logger) -> None:
 
         @functools.wraps(original_create_optimizer)
         def patched_create_optimizer(self):
-            """Ensure VAE parameters are trainable and added to optimizer."""
+            """Ensure stage trainability is applied before optimizer finalization."""
             # First call original create_optimizer
             optimizer = original_create_optimizer(self)
 
@@ -2454,9 +2714,19 @@ def _patch_trainer_callback(logger) -> None:
         if "vae" in loss_spec and model is not None:
             # Create VAE now so it's available for create_optimizer
             _ensure_vae_created(model)
+            _maybe_load_runtime_vae_checkpoint(model)
+            _normalize_aux_module_dtypes(model)
+
+        if model is not None:
+            _apply_runtime_stage_trainability(model)
+            _normalize_aux_module_dtypes(model)
 
         # Call original __init__ (this calls create_optimizer)
         result = original_init(self, model=model, args=args, callbacks=callbacks, **kwargs)
+
+        if self.model is not None:
+            _apply_runtime_stage_trainability(self.model)
+            _normalize_aux_module_dtypes(self.model)
 
         # After optimizer is created, ensure VAE params are in optimizer
         if "vae" in loss_spec:
@@ -3460,7 +3730,9 @@ def _compute_contrastive_loss(
 
 
 def _get_ot_sample_k() -> Optional[int]:
-    sample_k_raw = os.environ.get("QWEN3VL_OT_SAMPLE_K", "16")
+    # Default to full token sets. Random OT subsampling adds avoidable noise to
+    # the auxiliary image-grounding signal.
+    sample_k_raw = os.environ.get("QWEN3VL_OT_SAMPLE_K", "none")
     sample_k = None
     if isinstance(sample_k_raw, str):
         if sample_k_raw.strip().lower() in ("none", "null", "off", "disable", "disabled"):
@@ -3469,10 +3741,46 @@ def _get_ot_sample_k() -> Optional[int]:
             try:
                 sample_k = int(sample_k_raw)
             except ValueError:
-                sample_k = 16
+                sample_k = None
     elif isinstance(sample_k_raw, int):
         sample_k = sample_k_raw
     return sample_k
+
+
+def _get_ot_anchor_count() -> int:
+    anchor_count_raw = os.environ.get("QWEN3VL_OT_ANCHORS", "4")
+    try:
+        anchor_count = int(anchor_count_raw)
+    except (TypeError, ValueError):
+        anchor_count = 4
+    return max(anchor_count, 1)
+
+
+def _get_ot_min_image_mass() -> float:
+    raw = os.environ.get("QWEN3VL_OT_MIN_IMAGE_MASS", "0.35")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 0.35
+    return min(max(value, 0.0), 1.0)
+
+
+def _get_ot_dustbin_cost() -> float:
+    raw = os.environ.get("QWEN3VL_OT_DUSTBIN_COST", "0.6")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 0.6
+    return max(value, 0.0)
+
+
+def _get_ot_grounding_penalty() -> float:
+    raw = os.environ.get("QWEN3VL_OT_GROUNDING_PENALTY", "2.0")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 2.0
+    return max(value, 0.0)
 
 
 def _sample_ot_tokens(
@@ -3499,11 +3807,32 @@ def _kl_positive(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return (x_safe * (torch.log(x_safe) - torch.log(y_safe)) - x_safe + y_safe).sum()
 
 
+def _normalize_transport_weights(
+    weights: Optional[torch.Tensor],
+    *,
+    size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if weights is None:
+        return torch.full((size,), 1.0 / size, device=device, dtype=dtype)
+
+    weights = weights.to(device=device, dtype=dtype).flatten()
+    if weights.numel() != size:
+        raise ValueError(f"Expected {size} transport weights, got {weights.numel()}")
+
+    floor = torch.tensor(torch.finfo(dtype).eps, device=device, dtype=dtype)
+    weights = weights.clamp_min(floor)
+    return weights / weights.sum()
+
+
 def _compute_unbalanced_sinkhorn_cost(
     cost_matrix: torch.Tensor,
     epsilon: float,
     tau: float,
     num_iters: int,
+    source_weights: Optional[torch.Tensor] = None,
+    target_weights: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if cost_matrix.ndim != 2:
         raise ValueError(f"cost_matrix must be 2D, got shape={tuple(cost_matrix.shape)}")
@@ -3520,8 +3849,8 @@ def _compute_unbalanced_sinkhorn_cost(
     dtype = cost_matrix.dtype
     n_pred, n_target = cost_matrix.shape
 
-    a = torch.full((n_pred,), 1.0 / n_pred, device=device, dtype=dtype)
-    b = torch.full((n_target,), 1.0 / n_target, device=device, dtype=dtype)
+    a = _normalize_transport_weights(source_weights, size=n_pred, device=device, dtype=dtype)
+    b = _normalize_transport_weights(target_weights, size=n_target, device=device, dtype=dtype)
     log_a = torch.log(a)
     log_b = torch.log(b)
     log_k = -cost_matrix / epsilon
@@ -3551,14 +3880,11 @@ def _compute_unbalanced_sinkhorn_cost(
     return objective, transport
 
 
-def _compute_ot_sample_loss(
+def _compute_ot_cost_matrix(
     pred_tokens: torch.Tensor,
     target_tokens: torch.Tensor,
     lm_head: nn.Module = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    sample_k = _get_ot_sample_k()
-    pred_tokens, target_tokens = _sample_ot_tokens(pred_tokens, target_tokens, sample_k)
-
+) -> torch.Tensor:
     if lm_head is not None:
         e = lm_head.weight.data
         e = e / torch.linalg.vector_norm(e, ord=2, dim=1, keepdim=True)
@@ -3575,11 +3901,21 @@ def _compute_ot_sample_loss(
 
         pred_norm = F.normalize(pred_repr, dim=-1)
         target_norm = F.normalize(target_repr, dim=-1)
-        cost_matrix = 1.0 - torch.mm(pred_norm, target_norm.t())
-    else:
-        pred_norm = F.normalize(pred_tokens, dim=-1)
-        target_norm = F.normalize(target_tokens, dim=-1)
-        cost_matrix = 1.0 - torch.mm(pred_norm, target_norm.t())
+        return 1.0 - torch.mm(pred_norm, target_norm.t())
+
+    pred_norm = F.normalize(pred_tokens, dim=-1)
+    target_norm = F.normalize(target_tokens, dim=-1)
+    return 1.0 - torch.mm(pred_norm, target_norm.t())
+
+
+def _compute_ot_sample_loss(
+    pred_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    lm_head: nn.Module = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    sample_k = _get_ot_sample_k()
+    pred_tokens, target_tokens = _sample_ot_tokens(pred_tokens, target_tokens, sample_k)
+    cost_matrix = _compute_ot_cost_matrix(pred_tokens, target_tokens, lm_head=lm_head)
 
     epsilon = float(os.environ.get("QWEN3VL_OT_EPSILON", "0.1"))
     tau = float(os.environ.get("QWEN3VL_OT_TAU", "1.0"))
@@ -3591,6 +3927,114 @@ def _compute_ot_sample_loss(
         num_iters=num_iters,
     )
     return loss, cost_matrix
+
+
+def _contiguous_true_spans(mask: torch.Tensor) -> list[tuple[int, int]]:
+    indices = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+    if indices.numel() == 0:
+        return []
+
+    split_points = torch.nonzero(indices[1:] != (indices[:-1] + 1), as_tuple=False).flatten() + 1
+    starts = torch.cat([indices.new_tensor([0]), split_points])
+    ends = torch.cat([split_points, indices.new_tensor([indices.numel()])])
+
+    spans: list[tuple[int, int]] = []
+    for start_idx, end_idx in zip(starts.tolist(), ends.tolist()):
+        start = int(indices[start_idx].item())
+        end = int(indices[end_idx - 1].item()) + 1
+        spans.append((start, end))
+    return spans
+
+
+def _pool_tokens_to_anchors(tokens: torch.Tensor, num_anchors: int) -> torch.Tensor:
+    if tokens.ndim != 2:
+        raise ValueError(f"Expected [N, D] token tensor, got shape={tuple(tokens.shape)}")
+    if tokens.shape[0] <= num_anchors:
+        return tokens
+
+    boundaries = torch.linspace(0, tokens.shape[0], num_anchors + 1, device=tokens.device)
+    anchors = []
+    for idx in range(num_anchors):
+        start = int(boundaries[idx].item())
+        end = int(boundaries[idx + 1].item())
+        if end <= start:
+            end = min(start + 1, tokens.shape[0])
+        anchors.append(tokens[start:end].mean(dim=0))
+    return torch.stack(anchors, dim=0)
+
+
+def _compute_grounded_chunk_ot_loss(
+    pred_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    lm_head: nn.Module = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if pred_tokens.ndim != 2 or target_tokens.ndim != 2:
+        raise ValueError(
+            f"Expected 2D tensors for chunk OT, got pred={tuple(pred_tokens.shape)}, target={tuple(target_tokens.shape)}"
+        )
+
+    pred_anchors = _pool_tokens_to_anchors(pred_tokens, _get_ot_anchor_count())
+    cost_matrix = _compute_ot_cost_matrix(pred_anchors, target_tokens, lm_head=lm_head)
+
+    epsilon = float(os.environ.get("QWEN3VL_OT_EPSILON", "0.1"))
+    tau = float(os.environ.get("QWEN3VL_OT_TAU", "1.0"))
+    num_iters = int(os.environ.get("QWEN3VL_OT_SINKHORN_ITERS", "8"))
+    min_image_mass = _get_ot_min_image_mass()
+    dustbin_cost = _get_ot_dustbin_cost()
+    grounding_penalty = _get_ot_grounding_penalty()
+
+    dustbin_column = torch.full(
+        (cost_matrix.shape[0], 1),
+        dustbin_cost,
+        device=cost_matrix.device,
+        dtype=cost_matrix.dtype,
+    )
+    augmented_cost = torch.cat([cost_matrix, dustbin_column], dim=1)
+
+    real_mass_share = min_image_mass
+    dustbin_mass_share = 1.0 - real_mass_share
+    if cost_matrix.shape[1] > 0:
+        real_target_weights = torch.full(
+            (cost_matrix.shape[1],),
+            real_mass_share / cost_matrix.shape[1] if real_mass_share > 0 else 0.0,
+            device=cost_matrix.device,
+            dtype=cost_matrix.dtype,
+        )
+    else:
+        real_target_weights = torch.empty(0, device=cost_matrix.device, dtype=cost_matrix.dtype)
+    target_weights = torch.cat(
+        [
+            real_target_weights,
+            torch.tensor([dustbin_mass_share], device=cost_matrix.device, dtype=cost_matrix.dtype),
+        ]
+    )
+    loss, transport = _compute_unbalanced_sinkhorn_cost(
+        cost_matrix=augmented_cost,
+        epsilon=epsilon,
+        tau=tau,
+        num_iters=num_iters,
+        target_weights=target_weights,
+    )
+
+    real_mass = transport[:, :-1].sum()
+    dustbin_mass = transport[:, -1].sum()
+    grounding_shortfall = torch.relu(
+        torch.tensor(min_image_mass, device=real_mass.device, dtype=real_mass.dtype) - real_mass
+    )
+    total_loss = loss + grounding_penalty * grounding_shortfall.square()
+
+    stats = {
+        "real_mass": float(real_mass.item()),
+        "dustbin_mass": float(dustbin_mass.item()),
+        "grounding_shortfall": float(grounding_shortfall.item()),
+        "pred_anchors": float(pred_anchors.shape[0]),
+        "target_tokens": float(target_tokens.shape[0]),
+        "cost_min": float(cost_matrix.min().item()),
+        "cost_max": float(cost_matrix.max().item()),
+        "cost_mean": float(cost_matrix.mean().item()),
+        "cost_std": float(cost_matrix.std().item()) if cost_matrix.numel() > 1 else 0.0,
+    }
+    return total_loss, stats
 
 
 def _compute_ot_loss(
@@ -3628,14 +4072,18 @@ def _compute_ot_loss(
             logger.debug(f"[Qwen3VL Latent] _compute_ot_loss: latent_positions shape={latent_positions.shape}, any={latent_positions.any()}")
         _compute_ot_loss._logged = True
 
-    # Compute OT loss per-sample and average
+    # Compute OT loss per chunk and average
     ot_losses = []
 
     # Statistics collection for detailed logging
     stats = {
         "num_valid_samples": 0,
+        "num_valid_chunks": 0,
         "total_pred_tokens": 0,
         "total_target_tokens": 0,
+        "total_real_mass": 0.0,
+        "total_dustbin_mass": 0.0,
+        "total_grounding_shortfall": 0.0,
         "cost_stats": [],  # (min, max, mean, std) per sample
     }
 
@@ -3669,23 +4117,39 @@ def _compute_ot_loss(
             continue
 
         pred_tokens = sample_hidden.to(device=device, dtype=dtype)
-        sample_ot_loss, cost_matrix = _compute_ot_sample_loss(
-            pred_tokens=pred_tokens,
-            target_tokens=target_tokens,
-            lm_head=lm_head,
-        )
-        ot_losses.append(sample_ot_loss)
+        chunk_spans = _contiguous_true_spans(latent_mask)
+        offset = 0
+        valid_chunk_count = 0
+        for start, end in chunk_spans:
+            span_len = end - start
+            chunk_pred = pred_tokens[offset:offset + span_len]
+            offset += span_len
+            if chunk_pred.numel() == 0:
+                continue
 
-        # Collect statistics
-        stats["num_valid_samples"] += 1
-        stats["total_pred_tokens"] += cost_matrix.shape[0]
-        stats["total_target_tokens"] += cost_matrix.shape[1]
-        stats["cost_stats"].append((
-            cost_matrix.min().item(),
-            cost_matrix.max().item(),
-            cost_matrix.mean().item(),
-            cost_matrix.std().item() if cost_matrix.numel() > 1 else 0.0,
-        ))
+            chunk_ot_loss, chunk_stats = _compute_grounded_chunk_ot_loss(
+                pred_tokens=chunk_pred,
+                target_tokens=target_tokens,
+                lm_head=lm_head,
+            )
+            ot_losses.append(chunk_ot_loss)
+            valid_chunk_count += 1
+
+            stats["num_valid_chunks"] += 1
+            stats["total_pred_tokens"] += int(chunk_stats["pred_anchors"])
+            stats["total_target_tokens"] += int(chunk_stats["target_tokens"])
+            stats["total_real_mass"] += chunk_stats["real_mass"]
+            stats["total_dustbin_mass"] += chunk_stats["dustbin_mass"]
+            stats["total_grounding_shortfall"] += chunk_stats["grounding_shortfall"]
+            stats["cost_stats"].append((
+                chunk_stats["cost_min"],
+                chunk_stats["cost_max"],
+                chunk_stats["cost_mean"],
+                chunk_stats["cost_std"],
+            ))
+
+        if valid_chunk_count > 0:
+            stats["num_valid_samples"] += 1
 
     # Debug: log final result
     if not hasattr(_compute_ot_loss, '_logged_result'):
@@ -3701,13 +4165,17 @@ def _compute_ot_loss(
             cost_maxs = [s[1] for s in stats["cost_stats"]]
             cost_means = [s[2] for s in stats["cost_stats"]]
             cost_stds = [s[3] for s in stats["cost_stats"]]
+            denom = max(1, stats["num_valid_chunks"])
             stats["aggregated"] = {
                 "cost_min": min(cost_mins),
                 "cost_max": max(cost_maxs),
                 "cost_mean": sum(cost_means) / len(cost_means),
                 "cost_std": sum(cost_stds) / len(cost_stds),
-                "avg_pred_tokens": stats["total_pred_tokens"] / max(1, stats["num_valid_samples"]),
-                "avg_target_tokens": stats["total_target_tokens"] / max(1, stats["num_valid_samples"]),
+                "avg_pred_tokens": stats["total_pred_tokens"] / denom,
+                "avg_target_tokens": stats["total_target_tokens"] / denom,
+                "avg_real_mass": stats["total_real_mass"] / denom,
+                "avg_dustbin_mass": stats["total_dustbin_mass"] / denom,
+                "avg_grounding_shortfall": stats["total_grounding_shortfall"] / denom,
             }
         return loss_value, stats
     return None, None

@@ -1,7 +1,7 @@
 ### model
-# Native Qwen3-VL-2B-Thinking with latent supervision for CHIMERA thinking training.
+# Qwen3-VL-2B-Thinking with latent supervision for CHIMERA thinking training.
 # Kept aligned with r1-onevision defaults where possible.
-model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking
+model_name_or_path: /share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking
 add_special_tokens: "<latent>,<think_sep>"
 image_max_pixels: 262144
 video_max_pixels: 16384
@@ -25,7 +25,7 @@ freeze_vision_tower: true
 # - chimera image_input: user content includes <image> prompt + question image
 # - image_input: user content includes <image> prompt + question image
 # - text_input: user content is raw question text
-dataset: qwen3vl_chimera_thinking_image_input,qwen3vl_chimera_thinking_text_input
+dataset: chimera_thinking_image_input,chimera_thinking_text_input
 dataset_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/data
 template: qwen3vl_latent
 cutoff_len: 8192
@@ -37,7 +37,7 @@ dataloader_num_workers: 8
 dataloader_prefetch_factor: 4
 
 ### eval
-# eval_dataset: qwen3vl_transparent_eval
+# eval_dataset: transparent_eval
 # val_size: 0
 # per_device_eval_batch_size: 1
 # eval_strategy: steps

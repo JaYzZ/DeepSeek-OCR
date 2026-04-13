@@ -32,6 +32,7 @@ BOXED_RE = re.compile(r"\\boxed\s*{")
 FINAL_ANSWER_RE = re.compile(r"(?:final answer|answer)\s*[:：]\s*(.+)", re.IGNORECASE | re.DOTALL)
 OPTION_BLOCK_RE = re.compile(r"options?\s*:\s*(\[[^\]]+\])", re.IGNORECASE | re.DOTALL)
 THINK_RE = re.compile(r"\\<think\\>.*?\\</think\\>", re.DOTALL | re.IGNORECASE)
+PART_LABEL_RE = re.compile(r"^\(?([A-Za-z0-9]{1,4})\)?[\.\)]\s*(.+)$")
 
 
 def _extract_boxed_spans(text: str) -> list[str]:
@@ -108,6 +109,49 @@ def _normalize_choice(text: str) -> str:
     return text
 
 
+def _parse_structured_answer(text: str) -> list[tuple[str | None, str]]:
+    """Parse multipart or keyed answers into ordered answer segments."""
+    cleaned = _strip_reasoning_prefix(text)
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return []
+
+    entries: list[tuple[str | None, str]] = []
+    keyed_count = 0
+    for line in lines:
+        label: str | None = None
+        value = line
+
+        part_match = PART_LABEL_RE.match(line)
+        if part_match:
+            label = part_match.group(1).lower()
+            value = part_match.group(2).strip()
+            keyed_count += 1
+        else:
+            if line.startswith(("-", "*")):
+                value = line[1:].strip()
+            if ":" in value:
+                key, rhs = value.split(":", 1)
+                if rhs.strip() and 0 < len(key.strip()) <= 64:
+                    label = _normalize_text(key).lower()
+                    value = rhs.strip()
+                    keyed_count += 1
+
+        entries.append((label, value))
+
+    if keyed_count == 0:
+        return []
+    normalized_entries: list[tuple[str | None, str]] = []
+    for label, value in entries:
+        normalized_value = value.strip()
+        if "=" in normalized_value:
+            _, rhs = normalized_value.rsplit("=", 1)
+            if rhs.strip():
+                normalized_value = rhs.strip()
+        normalized_entries.append((label, normalized_value))
+    return normalized_entries
+
+
 @lru_cache(maxsize=4096)
 def _load_option_map(question: str) -> dict[str, str]:
     """Extract multiple choice options from question if present."""
@@ -163,7 +207,7 @@ def _text_to_sympy(expr: str) -> sympy.Expr | None:
         return None
 
 
-def _answers_equivalent(pred: str, gold: str) -> bool:
+def _scalar_answers_equivalent(pred: str, gold: str) -> bool:
     """Check if predicted answer is equivalent to ground truth."""
     pred_norm = _normalize_choice(pred)
     gold_norm = _normalize_choice(gold)
@@ -180,6 +224,25 @@ def _answers_equivalent(pred: str, gold: str) -> bool:
         return bool(sympy.simplify(pred_expr - gold_expr) == 0)
     except Exception:
         return False
+
+
+def _structured_answers_equivalent(pred: str, gold: str) -> bool:
+    pred_entries = _parse_structured_answer(pred)
+    gold_entries = _parse_structured_answer(gold)
+    if not pred_entries or not gold_entries or len(pred_entries) != len(gold_entries):
+        return False
+
+    for (_, pred_value), (_, gold_value) in zip(pred_entries, gold_entries, strict=False):
+        if not _scalar_answers_equivalent(pred_value, gold_value):
+            if _normalize_text(pred_value) != _normalize_text(gold_value):
+                return False
+    return True
+
+
+def _answers_equivalent(pred: str, gold: str) -> bool:
+    if _structured_answers_equivalent(pred, gold):
+        return True
+    return _scalar_answers_equivalent(pred, gold)
 
 
 def _build_gold_candidates(ground_truth: str, extra_info: dict[str, Any]) -> list[str]:

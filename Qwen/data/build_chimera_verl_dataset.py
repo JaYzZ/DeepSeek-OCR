@@ -9,8 +9,9 @@ Chimera dataset structure:
 - topic: Problem category (e.g., "math", "physics")
 
 For RL training, we use:
-1. question as text input (not rendered as image for RL efficiency)
-2. answer as ground truth for reward computation
+1. the pre-rendered question image when available
+2. a Chimera-specific prompt contract that matches multipart academic problems
+3. the verified final answer as the reward target
 """
 
 from __future__ import annotations
@@ -27,6 +28,13 @@ import pandas as pd
 
 DEFAULT_DATA_DIR = Path("/share/project/xiyan/huggingface/TianHongZXY/CHIMERA/Qwen3.5-397B")
 DEFAULT_OUTPUT_DIR = Path("/share/project/xiyan/sources/DeepSeek-OCR/Qwen/data/chimera_verl")
+CHIMERA_SYSTEM_PROMPT = (
+    "You are solving a challenging academic problem from a rendered question image. "
+    "Reason carefully. In the final answer, provide only the final result. "
+    "If the problem has labeled subparts, keep the part labels and provide only the final answer for each part. "
+    "If the problem has a single final answer, put it in \\boxed{}. "
+    "Do not restate the full question or include unnecessary explanation in the final answer."
+)
 
 
 def _to_python(value: Any) -> Any:
@@ -53,6 +61,31 @@ def _build_user_content(prompt_text: str, *, has_image: bool) -> str | list[dict
     ]
 
 
+def _build_problem_context(subject: str, topic: str) -> str:
+    parts: list[str] = []
+    if subject:
+        parts.append(subject)
+    if topic and topic.lower() != subject.lower():
+        parts.append(topic)
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return f"This is a {parts[0]} problem."
+    return f"This is a {parts[0]} problem about {parts[1]}."
+
+
+def _build_user_prompt_text(question: str, *, subject: str, topic: str, has_image: bool) -> str:
+    context = _build_problem_context(subject, topic)
+    if has_image:
+        base = "The image contains the full problem statement. Solve it carefully."
+        return f"{base} {context}".strip()
+
+    base = "Solve the following problem carefully."
+    if context:
+        base = f"{base} {context}"
+    return f"{base}\n\n{question}".strip()
+
+
 def _normalize_prompt(
     row: dict[str, Any],
     sample_id: str,
@@ -61,6 +94,7 @@ def _normalize_prompt(
     """Build prompt messages from the question, using pre-rendered images."""
     question = str(row.get("question") or "").strip()
     subject = str(row.get("subject") or "").strip()
+    topic = str(row.get("topic") or "").strip()
 
     # Try to use pre-rendered question image from SFT dataset
     question_image_path = chimera_images_dir / f"{sample_id}_question.png"
@@ -71,32 +105,23 @@ def _normalize_prompt(
         with open(question_image_path, "rb") as f:
             image_bytes = f.read()
         images = [{"bytes": image_bytes}]
-        if subject:
-            user_content = _build_user_content(
-                f"Solve this {subject} question shown in the image.",
-                has_image=True,
-            )
-        else:
-            user_content = _build_user_content(
-                "Solve the question shown in the image.",
-                has_image=True,
-            )
+        user_content = _build_user_content(
+            _build_user_prompt_text(question, subject=subject, topic=topic, has_image=True),
+            has_image=True,
+        )
     else:
         # Fallback to text if image not found (shouldn't happen if SFT dataset was built)
         import warnings
         warnings.warn(f"Question image not found: {question_image_path}, using text instead")
-        if subject:
-            user_content = _build_user_content(
-                f"Solve this {subject} question:\n{question}",
-                has_image=False,
-            )
-        else:
-            user_content = _build_user_content(
-                f"Solve this question:\n{question}",
-                has_image=False,
-            )
+        user_content = _build_user_content(
+            _build_user_prompt_text(question, subject=subject, topic=topic, has_image=False),
+            has_image=False,
+        )
 
-    return [{"role": "user", "content": user_content}], images
+    return [
+        {"role": "system", "content": CHIMERA_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ], images
 
 
 def _extract_equivalent_answers(answer: str, solution: str, original_solution: str) -> list[str]:
@@ -136,8 +161,10 @@ def _build_record(row: dict[str, Any], source_name: str, row_idx: int, chimera_i
     subject = str(row.get("subject") or "general").strip()
     topic = str(row.get("topic") or "").strip()
     index = int(row.get("index", row_idx))
+    correctness = row.get("correctness")
 
-    # Skip samples without required fields
+    # Skip samples without required fields. Keep verifier-failed traces because
+    # RL supervision is based on the canonical answer, not the source solution.
     if not question or not answer:
         return None
 
@@ -166,6 +193,7 @@ def _build_record(row: dict[str, Any], source_name: str, row_idx: int, chimera_i
             "question": question,
             "subject": subject,
             "topic": topic,
+            "correctness": bool(correctness) if correctness is not None else None,
             "solution": solution,
             "original_solution": original_solution,
         },

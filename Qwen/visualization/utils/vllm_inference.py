@@ -3,6 +3,7 @@ vLLM inference utilities for Qwen3-VL thinking mode.
 Handles model loading, inference with hidden states extraction, and trace collection.
 """
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -239,7 +240,15 @@ def get_default_deepvision_example() -> Dict[str, str]:
     Returns:
         Dict with image_path and question
     """
-    return {
-        "image_path": "Qwen/data/deepvision_images/deepvision_math-77k_0000000.jpg",
-        "question": "In the figure, triangle ABC is a right triangle with angle C = 90°. If point D is on side AB such that CD is perpendicular to AB, and the lengths of AC = 8 and BC = 6, find the length of CD.",
-    }
+    metadata_path = Path("Qwen/data/metadata/deepvision_103k_metadata.jsonl")
+    if metadata_path.exists():
+        with metadata_path.open("r", encoding="utf-8") as handle:
+            sample = handle.readline().strip()
+        if sample:
+            row = json.loads(sample)
+            return {
+                "image_path": row.get("query_image_path", ""),
+                "question": row.get("question", ""),
+            }
+
+    raise FileNotFoundError(f"DeepVision metadata not found or empty: {metadata_path}")
