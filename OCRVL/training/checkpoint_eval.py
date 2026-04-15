@@ -9,6 +9,7 @@ to provide qualitative monitoring of training progress.
 import json
 import logging
 from pathlib import Path
+from project_paths import hf_path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
@@ -83,8 +84,8 @@ def run_checkpoint_evaluation(
 
             # Handle DocLayNet images (absolute paths from huggingface root)
             if 'docling-project/DocLayNet' in image_path:
-                # DocLayNet: path is relative to /share/project/xiyan/huggingface/
-                doclaynet_base = "/share/project/xiyan/huggingface"
+                # DocLayNet: path is relative to the shared Hugging Face mirror root.
+                doclaynet_base = str(hf_path())
                 full_path = Path(doclaynet_base) / image_path
                 if full_path.exists():
                     image = Image.open(full_path).convert('RGB')

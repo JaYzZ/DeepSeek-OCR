@@ -43,6 +43,7 @@ import random
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Iterator
 import pandas as pd
+from project_paths import hf_path
 
 logger = logging.getLogger(__name__)
 
@@ -433,7 +434,7 @@ class RollingCacheDataset(IterableDataset):
 
 def create_rolling_cache_dataloader(
     dataset_type: str = "fineweb",
-    fineweb_path: str = "/share/project/xiyan/huggingface/HuggingFaceFW/fineweb-edu",
+    fineweb_path: str = str(hf_path("HuggingFaceFW", "fineweb-edu")),
     fineweb_subset: str = "10BT",
     cache_size: int = 10000,
     encoder_device: str = "cuda:0",

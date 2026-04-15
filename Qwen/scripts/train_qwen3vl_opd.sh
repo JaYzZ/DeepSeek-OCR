@@ -3,8 +3,8 @@
 #
 # Usage:
 #   bash Qwen/scripts/train_qwen3vl_opd.sh
-#   bash Qwen/scripts/train_qwen3vl_opd.sh Qwen/configs/distillation/qwen3vl_opd_continuous.yaml
-#   OUTPUT_DIR=/path/to/run bash Qwen/scripts/train_qwen3vl_opd.sh Qwen/configs/distillation/qwen3vl_opd_continuous.yaml
+#   bash Qwen/scripts/train_qwen3vl_opd.sh Qwen/configs/distillation/qwen3vl_opd.yaml
+#   OUTPUT_DIR=/path/to/run bash Qwen/scripts/train_qwen3vl_opd.sh Qwen/configs/distillation/qwen3vl_opd.yaml
 
 set -euo pipefail
 
@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-DEFAULT_CONFIG="$REPO_ROOT/Qwen/configs/distillation/qwen3vl_opd_continuous.yaml"
+DEFAULT_CONFIG="$REPO_ROOT/Qwen/configs/distillation/qwen3vl_opd.yaml"
 
 CONFIG_PATH="${1:-$DEFAULT_CONFIG}"
 if [ "${1:-}" != "" ]; then

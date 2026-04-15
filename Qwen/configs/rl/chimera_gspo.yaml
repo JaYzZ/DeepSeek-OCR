@@ -1,10 +1,10 @@
 custom_reward_function:
-  path: ${oc.env:DEEPSEEK_OCR_ROOT}/Qwen/verl/chimera_gspo_reward.py
+  path: ${oc.env:ROOT_DIR,/share/project/xiyan}/sources/DeepSeek-OCR/Qwen/verl/chimera_gspo_reward.py
   name: compute_score_batch
 
 data:
-  train_files: ${oc.env:TRAIN_FILE,/share/project/xiyan/sources/DeepSeek-OCR/Qwen/data/chimera_verl/train.parquet}
-  val_files: ${oc.env:VAL_FILE,/share/project/xiyan/sources/DeepSeek-OCR/Qwen/data/chimera_verl/val.parquet}
+  train_files: ${oc.env:TRAIN_FILE,Qwen/data/chimera_verl/train.parquet}
+  val_files: ${oc.env:VAL_FILE,Qwen/data/chimera_verl/val.parquet}
   gen_batch_size: ${oc.decode:${oc.env:GEN_BATCH_SIZE,${gpu_adapt:${trainer.n_gpus_per_node},32,64,128,256,128}}}
   train_batch_size: ${oc.decode:${oc.env:TRAIN_BATCH_SIZE,${gpu_adapt:${trainer.n_gpus_per_node},32,64,64,64,64}}}
   val_batch_size: ${oc.decode:${oc.env:VAL_BATCH_SIZE,64}}

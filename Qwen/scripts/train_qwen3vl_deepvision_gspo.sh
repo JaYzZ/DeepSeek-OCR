@@ -5,6 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PROJECT_ROOT="${ROOT_DIR:-/share/project/xiyan}"
 source "$SCRIPT_DIR/qwen3vl_common.sh"
 PYTHON_BIN="$(qwen3vl_require_python_bin "$REPO_ROOT")"
 
@@ -19,7 +20,7 @@ fi
 
 PROJECT_BASE_CONFIG="${PROJECT_BASE_CONFIG:-$REPO_ROOT/Qwen/configs/rl/deepvision_gspo.yaml}"
 PROJECT_CONFIG="${PROJECT_CONFIG:-}"
-MODEL_PATH="${MODEL_PATH:-/share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking}"
+MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/sources/DeepSeek-OCR/Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking}"
 DATA_DIR="${DATA_DIR:-$REPO_ROOT/Qwen/data/deepvision_103k_verl}"
 TRAIN_FILE="${TRAIN_FILE:-$DATA_DIR/train.parquet}"
 VAL_FILE="${VAL_FILE:-$DATA_DIR/val.parquet}"
@@ -124,7 +125,7 @@ qwen3vl_copy_if_present "$PROJECT_CONFIG" "$OUTPUT_DIR"
 
 exec > >(qwen3vl_sanitize_log_stream | tee -a "$LOG_FILE") 2>&1
 
-export DEEPSEEK_OCR_ROOT="$REPO_ROOT"
+export ROOT_DIR="$PROJECT_ROOT"
 export MODEL_PATH
 export VLLM_MODEL_PATH="${VLLM_MODEL_PATH:-$MODEL_PATH}"
 export TRAIN_FILE

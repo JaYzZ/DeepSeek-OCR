@@ -12,12 +12,13 @@ import pathlib
 import torch
 from donut import DonutProcessor, VisionEncoderDecoderModel
 from PIL import Image
+from project_paths import hf_path
 
 
 def main() -> None:
     repo_root = pathlib.Path(__file__).resolve().parent.parent / "donut"
     sample_image = repo_root / "misc" / "sample_image_cord_test_receipt_00004.png"
-    local_model_dir = pathlib.Path("/share/project/xiyan/huggingface/naver-clova-ix/donut-base-finetuned-cord-v2")
+    local_model_dir = hf_path("naver-clova-ix", "donut-base-finetuned-cord-v2")
     model_id = str(local_model_dir) if local_model_dir.is_dir() else "naver-clova-ix/donut-base-finetuned-cord-v2"
 
     if not sample_image.is_file():

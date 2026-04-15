@@ -24,8 +24,8 @@ system:
 ### validation
 validation:
   validation_images: true
-  llava_image_base: /share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images
-  doclaynet_png_base: /share/project/xiyan/huggingface/docling-project/DocLayNet/PNG
+  llava_image_base: ../../huggingface/liuhaotian/LLaVA-Instruct-150K/images
+  doclaynet_png_base: ../../huggingface/docling-project/DocLayNet/PNG
 
 ### phase1 (alignment)
 phase1:
@@ -59,8 +59,8 @@ phase2:
     lora_dropout: 0.05
     do_eval: true
   dataset:
-    llava_json_path: /share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json
-    llava_image_dir: /share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images
+    llava_json_path: ../../huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json
+    llava_image_dir: ../../huggingface/liuhaotian/LLaVA-Instruct-150K/images
     render_questions: true
   train:
     per_device_train_batch_size: 4
@@ -80,8 +80,8 @@ phase3:
     finetuning_type: lora
     do_eval: true
   dataset:
-    thinking_jsonl: /share/project/xiyan/huggingface/Xkev/LLaVA-CoT-100k/train.jsonl
-    thinking_image_dir: /share/project/xiyan/huggingface
+    thinking_jsonl: ../../huggingface/Xkev/LLaVA-CoT-100k/train.jsonl
+    thinking_image_dir: ../../huggingface
   train:
     per_device_train_batch_size: 4
     gradient_accumulation_steps: 8

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Centralized Evaluation Script for All Qwen Benchmarks
+Centralized evaluation script for the Qwen benchmark suite.
 
-Runs all 4 benchmarks (MathVision, MMMU, RealWorldQA, ODinW-13) with 100 samples each.
-Automatically selects 4 free GPUs and saves results to timestamped directories.
+Runs the default benchmark set (MathVision, MMMU, RealWorldQA) with a shared
+inference path and optional LoRA loading.
 
 Usage:
     python run_all_benchmarks.py [--num-samples N] [--gpus GPU_ID,GPU_ID,...] [--skip-infer] [--skip-eval]
-    tmux new-session -d -s benchmark -c /share/project/xiyan/sources/DeepSeek-OCR "bash -lc 'python -u Qwen/evaluation/run_all_benchmarks.py --start-server --lora-path Qwen/checkpoints/qwen3vl-2b/lora/r1_onevision_thinking/run_20260221_223934/checkpoint-1812 --num-samples 100 --gpus 0,1,2,3 2>&1 | tee /tmp/bench.log'"
+    tmux new-session -d -s benchmark -c $ROOT_DIR/sources/DeepSeek-OCR "bash -lc 'python -u Qwen/evaluation/run_all_benchmarks.py --start-server --lora-path Qwen/checkpoints/qwen3vl-2b/lora/r1_onevision_thinking/run_20260221_223934/checkpoint-1812 --num-samples 100 --gpus 0,1,2,3 2>&1 | tee /tmp/bench.log'"
 """
 
 import os
@@ -34,14 +34,15 @@ from tqdm import tqdm
 from PIL import Image
 from transformers import AutoProcessor
 import pandas as pd
+from project_paths import hf_path
 
-# Add repo/evaluation directories to path for imports
 _EVAL_DIR = Path(__file__).parent
 _REPO_ROOT = _EVAL_DIR.parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
-sys.path.insert(0, str(_EVAL_DIR))
-from config import get_data_path, QWEN3_VL_2B_THINKING
-from utils import select_compatible_tensor_parallel_gpus
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from Qwen.evaluation.config import QWEN3_VL_2B_THINKING, get_data_path
+from Qwen.evaluation.utils import select_compatible_tensor_parallel_gpus
 from Qwen.inference.vllm_utils import (
     apply_runtime_env_for_thinking,
     cleanup_vllm_engine_processes,
@@ -49,7 +50,7 @@ from Qwen.inference.vllm_utils import (
     resolve_lora_artifacts,
 )
 
-LOCAL_JUDGE_DEFAULT_MODEL = "/share/project/xiyan/huggingface/Qwen/Qwen2.5-VL-7B-Instruct"
+LOCAL_JUDGE_DEFAULT_MODEL = str(hf_path("Qwen", "Qwen2.5-VL-7B-Instruct"))
 EXPLORE_TEMPERATURE = 0.7
 EXPLORE_MAX_TOKENS = 8192
 EXPLORE_N = 8
@@ -624,34 +625,34 @@ def run_server_inference(
         os.environ.setdefault("LMUData", str(Path(__file__).parent / "data"))
 
         # Import through the full package path so relative imports inside benchmark modules work.
-        from Qwen.evaluation.MathVision.dataset_utils import (
+        from Qwen.evaluation.mathvision.dataset_utils import (
             load_dataset as load_mathv_dataset,
             dump_image as mathv_dump_image,
         )
-        from Qwen.evaluation.MathVision.run_mathv import build_mathv_prompt
-        from Qwen.evaluation.MathVision.eval_utils import post_check as mathvision_post_check
+        from Qwen.evaluation.mathvision.run_mathv import build_mathv_prompt
+        from Qwen.evaluation.mathvision.eval_utils import post_check as mathvision_post_check
         from Qwen.evaluation.mmmu.dataset_utils import (
             load_dataset as load_mmmu_dataset,
             dump_image as mmmu_dump_image,
         )
         from Qwen.evaluation.mmmu.run_mmmu import build_mmmu_prompt
-        from Qwen.evaluation.RealWorldQA.dataset_utils import (
+        from Qwen.evaluation.realworldqa.dataset_utils import (
             load_dataset as load_realworldqa_dataset,
             dump_image as realworldqa_dump_image,
         )
-        from Qwen.evaluation.RealWorldQA.run_realworldqa import build_realworldqa_prompt
-        from Qwen.evaluation.M3CoT.dataset_utils import (
+        from Qwen.evaluation.realworldqa.run_realworldqa import build_realworldqa_prompt
+        from Qwen.evaluation.m3cot.dataset_utils import (
             load_dataset as load_m3cot_dataset,
             deterministic_limit as limit_m3cot_dataset,
             dump_image as m3cot_dump_image,
         )
-        from Qwen.evaluation.M3CoT.run_m3cot import build_m3cot_prompt
-        from Qwen.evaluation.ScienceQA.dataset_utils import (
+        from Qwen.evaluation.m3cot.run_m3cot import build_m3cot_prompt
+        from Qwen.evaluation.scienceqa.dataset_utils import (
             load_dataset as load_scienceqa_dataset,
             deterministic_limit as limit_scienceqa_dataset,
             dump_image as scienceqa_dump_image,
         )
-        from Qwen.evaluation.ScienceQA.run_scienceqa import build_scienceqa_prompt
+        from Qwen.evaluation.scienceqa.run_scienceqa import build_scienceqa_prompt
 
         # Load processor
         model_path = server_info.get("model", QWEN3_VL_2B_THINKING)
@@ -1127,7 +1128,7 @@ def run_inference(
     """
     benchmark_configs = {
         "MathVision": {
-            "script": "MathVision/run_mathv.py",
+            "script": "mathvision/run_mathv.py",
             "dataset": "MathVision",
             "output": "mathvision_inference.jsonl",
             "use_num_samples": True,
@@ -1142,7 +1143,7 @@ def run_inference(
             "limit_at_eval": True      # Keep optional eval limiting as well
         },
         "RealWorldQA": {
-            "script": "RealWorldQA/run_realworldqa.py",
+            "script": "realworldqa/run_realworldqa.py",
             "dataset": "RealWorldQA",
             "output": "realworldqa_inference.jsonl",
             # RealWorldQA now supports limiting inference via --num-samples / --limit.
@@ -1150,21 +1151,21 @@ def run_inference(
             "limit_at_eval": True      # Keep optional eval limiting as well
         },
         "M3CoT": {
-            "script": "M3CoT/run_m3cot.py",
+            "script": "m3cot/run_m3cot.py",
             "dataset": "M3CoT",
             "output": "m3cot_inference.jsonl",
             "use_num_samples": True,
             "limit_at_eval": False
         },
         "ScienceQA": {
-            "script": "ScienceQA/run_scienceqa.py",
+            "script": "scienceqa/run_scienceqa.py",
             "dataset": "ScienceQA",
             "output": "scienceqa_inference.jsonl",
             "use_num_samples": True,
             "limit_at_eval": False
         },
         "ODinW-13": {
-            "script": "ODinW-13/run_odinw.py",
+            "script": "odinw/run_odinw.py",
             "dataset": None,
             "output": "odinw_inference.jsonl",
             "use_num_samples": False,  # ODinW uses --limit instead
@@ -1317,7 +1318,7 @@ def run_evaluation(
     """
     benchmark_configs = {
         "MathVision": {
-            "script": "MathVision/run_mathv.py",
+            "script": "mathvision/run_mathv.py",
             "dataset": "MathVision",
             "output": "mathvision_eval_result.csv",
             "result_key": "mathvision_eval_result_eval_score.csv",
@@ -1333,7 +1334,7 @@ def run_evaluation(
             "eval_model": "gpt-3.5-turbo-0125",
         },
         "RealWorldQA": {
-            "script": "RealWorldQA/run_realworldqa.py",
+            "script": "realworldqa/run_realworldqa.py",
             "dataset": "RealWorldQA",
             "output": "realworldqa_eval_result.csv",
             "result_key": "realworldqa_eval_result_acc.json",
@@ -1341,7 +1342,7 @@ def run_evaluation(
             "eval_model": "gpt-4o",
         },
         "M3CoT": {
-            "script": "M3CoT/run_m3cot.py",
+            "script": "m3cot/run_m3cot.py",
             "dataset": "M3CoT",
             "output": "m3cot_eval_result.json",
             "result_key": None,
@@ -1349,7 +1350,7 @@ def run_evaluation(
             "eval_model": None,
         },
         "ScienceQA": {
-            "script": "ScienceQA/run_scienceqa.py",
+            "script": "scienceqa/run_scienceqa.py",
             "dataset": "ScienceQA",
             "output": "scienceqa_eval_result.json",
             "result_key": None,
@@ -1357,7 +1358,7 @@ def run_evaluation(
             "eval_model": None,
         },
         "ODinW-13": {
-            "script": "ODinW-13/run_odinw.py",
+            "script": "odinw/run_odinw.py",
             "dataset": None,
             "output": "odinw_eval_result.json",
             "result_key": None,
@@ -1575,7 +1576,7 @@ def evaluate_multiple_choice_exploration(
     if benchmark == "MMMU":
         from Qwen.evaluation.mmmu.eval_utils import build_judge as build_mc_judge, eval_single_sample as eval_mc_single_sample
     elif benchmark == "RealWorldQA":
-        from Qwen.evaluation.RealWorldQA.eval_utils import build_judge as build_mc_judge, eval_single_sample as eval_mc_single_sample
+        from Qwen.evaluation.realworldqa.eval_utils import build_judge as build_mc_judge, eval_single_sample as eval_mc_single_sample
     else:
         payload = {"benchmark": benchmark, "error": f"Unsupported multiple-choice exploration benchmark: {benchmark}"}
         with open(stats_file, "w", encoding="utf-8") as f:
@@ -1686,7 +1687,7 @@ def evaluate_mathvision_exploration(
     logger: "BenchmarkLogger" = None,
 ) -> Dict:
     """Evaluate MathVision explore candidates using the same extraction/scoring path as benchmark eval."""
-    from Qwen.evaluation.MathVision.eval_utils import (
+    from Qwen.evaluation.mathvision.eval_utils import (
         build_judge as build_mathvision_judge,
         eval_single_sample as mathvision_eval_single_sample,
         post_check as mathvision_post_check,
@@ -2232,12 +2233,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run all benchmarks with 100 samples each, auto-select 4 GPUs
+  # Run the default benchmark set with 100 samples each
   python run_all_benchmarks.py --num-samples 100
 
   # Run with LoRA checkpoint from training
   python run_all_benchmarks.py --num-samples 100 \\
-      --model-path Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking \\
+      --model-path $ROOT_DIR/huggingface/Qwen/Qwen3-VL-2B-Thinking \\
       --enable-lora \\
       --lora-path Qwen/checkpoints/qwen3vl-2b/lora/r1_onevision_thinking/run_20260209_235504/checkpoint-1000
 
@@ -2266,7 +2267,7 @@ Examples:
     parser.add_argument(
         "--model-path",
         type=str,
-        default=str(Path("/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking")),
+        default=str(hf_path("Qwen", "Qwen3-VL-2B-Thinking")),
         help="Path to the model"
     )
     parser.add_argument(

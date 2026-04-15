@@ -1,0 +1,89 @@
+runtime_env_config: Qwen/configs/qwen3vl_runtime_env.yaml
+
+system_prompt: ""
+image_max_pixels: 262144
+video_max_pixels: 16384
+
+model:
+  model_name_or_path: ../../huggingface/Qwen/Qwen3-VL-2B-Thinking
+  adapter_name_or_path: null
+  dtype: bf16
+  attn_implementation: flash_attention_2
+  freeze_vision_tower: true
+  gradient_checkpointing: true
+
+lora:
+  enable: true
+  rank: 8
+  alpha: 16
+  dropout: 0.05
+  target_modules: q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj
+
+data:
+  # Change only this field to switch among r1_onevision_thinking,
+  # deepvision_thinking, chimera_thinking_image_input, or any comma mix.
+  dataset_names: r1_onevision_thinking,deepvision_thinking
+  # Leave null to derive the manifest path from dataset_names automatically.
+  opsd_manifest: null
+  overwrite_manifest: false
+
+prompts:
+  max_teacher_rationale_images: 0
+  student_user: |
+    Answer the question.
+
+    Question:
+    {question_text}
+  teacher_user: |
+    Answer the question. You may use the reference images as guidance, but answer in your own words.
+
+    Question:
+    {question_text}
+
+teacher:
+  strategy: fixed
+
+loss:
+  type: sampled_reverse_kl
+  temperature: 1.0
+  beta: 0.5
+  top_k: 0
+  token_clip: 0.05
+
+generation:
+  max_new_tokens: 8192
+  do_sample: true
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 20
+  repetition_penalty: 1.0
+
+rollout:
+  enable: true
+  backend: vllm
+  tensor_parallel_size: 1
+  sync_steps: 1
+  gpu_memory_utilization: 0.35
+  enable_sleep_mode: false
+  enforce_eager: false
+  max_images_per_prompt: 10
+  max_model_len: 16384
+
+training:
+  output_dir: Qwen/checkpoints/qwen3vl-2b/lora/opsd_continuous
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  num_workers: 4
+  drop_last: true
+  seed: 42
+  learning_rate: 1.0e-5
+  weight_decay: 0.0
+  num_train_epochs: 1
+  max_steps: -1
+  warmup_ratio: 0.05
+  save_steps: 10
+  save_total_limit: 2
+  logging_steps: 1
+  bf16: true
+  max_length: 16384
+  max_grad_norm: 1.0

@@ -12,6 +12,7 @@ Usage:
 import json
 import sys
 from pathlib import Path
+from project_paths import get_deepseek_ocr_dir
 
 # OCR tasks to include
 OCR_TASKS = {
@@ -67,7 +68,7 @@ def filter_ocr_subset(
 
 
 def main():
-    base_dir = Path("/share/project/xiyan/sources/DeepSeek-OCR")
+    base_dir = get_deepseek_ocr_dir()
 
     # Use Qwen3VL-converted data (bbox coordinates in [0, 1000] format)
     input_path = base_dir / "OCRVL/data/ocrvl_unified_sft_qwen3vl.jsonl"

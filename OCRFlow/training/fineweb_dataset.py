@@ -23,6 +23,7 @@ import logging
 import pandas as pd
 from glob import glob
 import random
+from project_paths import hf_path
 
 logger = logging.getLogger(__name__)
 
@@ -324,7 +325,7 @@ if __name__ == "__main__":
     # Test dataset
     print("Testing FineWebEduVistokDataset...")
 
-    data_root = "/share/project/xiyan/huggingface/HuggingFaceFW/fineweb-edu"
+    data_root = str(hf_path("HuggingFaceFW", "fineweb-edu"))
     cache_dir = "./test_cache"
 
     try:

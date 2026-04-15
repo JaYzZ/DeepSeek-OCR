@@ -11,24 +11,16 @@ Output: ./results/feature_vis/images/ with categorized samples
 """
 
 import os
-import sys
-from pathlib import Path
 import random
+from pathlib import Path
+
+import json
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-import json
+from Renderer import VelloRenderer
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-# Try to import Vello renderer, fallback to PIL
-try:
-    from Renderer import VelloRenderer
-    HAS_VELLO = True
-    print("Using Vello renderer for text generation")
-except ImportError:
-    HAS_VELLO = False
-    print("Vello not available, using PIL for text generation")
+HAS_VELLO = True
+print("Using Vello renderer for text generation")
 
 
 class VisualizationDataGenerator:

@@ -6,7 +6,7 @@ This script merges the LoRA adapter weights with the base OCRQwen3VL model
 and exports it as a complete checkpoint that can be loaded directly in vLLM.
 
 The merged checkpoint can then be used with:
-    python eval_ocrqwen3vl.py --model-type ocrqwen3vl --checkpoint <merged_path> --lora-path None
+    python -m OCRVL.evaluation.run_ocrqwen3vl_evaluation --model-type ocrqwen3vl --checkpoint <merged_path> --lora-path None
 
 Usage:
     python export_merged_checkpoint.py \\
@@ -135,7 +135,7 @@ def export_merged_model(
     logger.info(f"Merged checkpoint saved to: {output_path}")
     logger.info("")
     logger.info("Usage:")
-    logger.info(f"  python eval_ocrqwen3vl.py \\")
+    logger.info(f"  python -m OCRVL.evaluation.run_ocrqwen3vl_evaluation \\")
     logger.info(f"      --benchmark m3cot \\")
     logger.info(f"      --model-type ocrqwen3vl \\")
     logger.info(f"      --checkpoint {output_path} \\")

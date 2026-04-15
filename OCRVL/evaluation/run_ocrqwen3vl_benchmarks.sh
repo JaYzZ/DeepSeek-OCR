@@ -158,13 +158,7 @@ mkdir -p "${OUTPUT_DIR}"
 # Run benchmarks
 # ============================================================================
 
-EVAL_SCRIPT="${REPO_ROOT}/OCRVL/evaluation/eval_ocrqwen3vl.py"
-
-# Check eval script exists
-if [[ ! -f "${EVAL_SCRIPT}" ]]; then
-    echo "❌ Error: Evaluation script not found: ${EVAL_SCRIPT}"
-    exit 1
-fi
+EVAL_MODULE="OCRVL.evaluation.run_ocrqwen3vl_evaluation"
 
 # Convert comma-separated benchmarks to array
 IFS=',' read -ra BENCH_ARRAY <<< "${BENCHMARKS}"
@@ -179,7 +173,7 @@ for benchmark in "${BENCH_ARRAY[@]}"; do
     echo "================================================================================"
 
     # Build command
-    CMD="python ${EVAL_SCRIPT}"
+    CMD="python -m ${EVAL_MODULE}"
     CMD+=" --benchmark ${benchmark}"
     CMD+=" --checkpoint ${CHECKPOINT}"
     CMD+=" --model-type ${MODEL_TYPE}"

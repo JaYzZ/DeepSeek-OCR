@@ -11,19 +11,22 @@ This script:
 Output: ./results/feature_vis/plots/pairs/
 """
 
-import sys
+import argparse
 import json
-from pathlib import Path
 import pickle
+import sys
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 import numpy as np
-import torch
 import matplotlib.pyplot as plt
+import torch
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler
 import umap
 import seaborn as sns
-from typing import Dict, List, Tuple
-import argparse
 
 # Set style
 sns.set_style("whitegrid")
@@ -231,9 +234,6 @@ class PairwiseVisualizer:
             self._draw_pair_lines(ax, embedding, max_lines=max_lines)
 
         # Create legend elements
-        from matplotlib.patches import Patch
-        from matplotlib.lines import Line2D
-
         legend_elements = []
         # Category colors
         for cat in sorted(np.unique(self.categories)):

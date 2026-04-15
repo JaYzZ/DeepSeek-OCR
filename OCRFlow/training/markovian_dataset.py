@@ -50,6 +50,7 @@ from typing import Optional, List, Dict, Iterator, Tuple
 import logging
 import random
 import hashlib
+from project_paths import hf_path
 
 logger = logging.getLogger(__name__)
 
@@ -474,9 +475,9 @@ class MarkovianChunkDataset(IterableDataset):
 def create_markovian_dataloader(
     dataset_type: str = "fineweb",
     model_path: str = "deepseek-ai/DeepSeek-OCR",
-    fineweb_path: str = "/share/project/xiyan/huggingface/HuggingFaceFW/fineweb-edu",
+    fineweb_path: str = str(hf_path("HuggingFaceFW", "fineweb-edu")),
     fineweb_subset: Optional[str] = "10BT",
-    openwebmath_path: str = "/share/project/xiyan/huggingface/open-web-math/open-web-math",
+    openwebmath_path: str = str(hf_path("open-web-math", "open-web-math")),
     fineweb_weight: float = 0.7,
     openwebmath_weight: float = 0.3,
     batch_size: int = 8,

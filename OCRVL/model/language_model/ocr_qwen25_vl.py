@@ -22,6 +22,8 @@ from typing import Any, Iterable, List, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image
 from transformers import AutoModelForCausalLM
 from transformers.cache_utils import Cache
 from transformers.generation.utils import GenerateOutput
@@ -37,6 +39,7 @@ from transformers.utils import is_torchdynamo_compiling
 
 from OCRInfer.encoder.dpsk_ocr_encoder import DPSKOCREncoder
 from OCRInfer.utils.model_paths import resolve_model_path
+from OCRVL.dpsk_encoder import get_dpsk_encoder
 
 def _load_text_renderer():
     """Load text_renderer.py directly from the vendored DeepSeek-OCR server tree."""
@@ -138,8 +141,6 @@ def _pool_ref_to_ocr_grid(
     ref_embeds: torch.Tensor, ref_grid_thw: torch.LongTensor, ocr_grid_thw: torch.LongTensor
 ) -> torch.Tensor:
     """Average-pool reference ViT tokens to OCR visual grid size."""
-    import torch.nn.functional as F
-
     _, ref_h, ref_w = (int(ref_grid_thw[0]), int(ref_grid_thw[1]), int(ref_grid_thw[2]))
     _, ocr_h, ocr_w = (int(ocr_grid_thw[0]), int(ocr_grid_thw[1]), int(ocr_grid_thw[2]))
     visual_len = ref_h * ref_w
@@ -226,8 +227,6 @@ class OCRQwen25VLModel(Qwen2_5_VLModel):
         ocr_image_embeds = None
         ref_image_embeds = None
         if ocr_image_features is None and ocr_pixel_values is not None:
-            from OCRVL.dpsk_encoder import get_dpsk_encoder
-
             encoder = get_dpsk_encoder()
             with torch.no_grad():
                 feats = encoder.encode_pixel_values(ocr_pixel_values)
@@ -530,8 +529,6 @@ class Qwen25VLOCRTextAdapter:
         use_vello_renderer: bool = True,
         render_texts=None,
     ) -> None:
-        from PIL import Image  # local import keeps import-time optional deps minimal
-
         self.chunk_tokens = chunk_tokens
         self.render_width = render_width
         self.render_height = render_height
@@ -555,8 +552,6 @@ class Qwen25VLOCRTextAdapter:
         self._render_texts = render_texts or self._build_renderer(use_vello_renderer)
 
     def _build_renderer(self, use_vello_renderer: bool):
-        from PIL import Image
-
         if use_vello_renderer and VelloRenderer is not None:
             try:
                 vello = VelloRenderer(

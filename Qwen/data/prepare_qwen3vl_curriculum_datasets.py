@@ -171,7 +171,7 @@ def build_deepvision_thinking_concise(max_chars: int = 96, max_lines: int = 2) -
     return count, stats
 
 
-def build_r1_onevision_thinking_concise() -> tuple[int, Counter]:
+def build_r1onevision_thinking_concise() -> tuple[int, Counter]:
     stats = Counter()
 
     def rows():
@@ -222,7 +222,7 @@ def main() -> int:
             "r1_onevision_thinking_concise",
             R1OV_THINKING_CONCISE,
             [R1OV_SRC, SCRIPT_PATH],
-            build_r1_onevision_thinking_concise,
+            build_r1onevision_thinking_concise,
         ),
     ]
 

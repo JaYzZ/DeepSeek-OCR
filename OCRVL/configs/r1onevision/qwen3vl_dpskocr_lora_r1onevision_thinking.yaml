@@ -9,7 +9,7 @@
 #
 # Format: Question <think><latent><think_sep>...</think> Answer
 # Each <latent> token will be replaced with pre-encoded OCR features during training
-model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/OCRVL/checkpoints/OCR-Qwen3-VL-2B-Thinking
+model_name_or_path: OCRVL/checkpoints/OCR-Qwen3-VL-2B-Thinking
 image_max_pixels: 262144
 video_max_pixels: 16384
 trust_remote_code: true

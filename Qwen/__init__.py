@@ -8,7 +8,6 @@ LLaMA-Factory latent integration path.
 from __future__ import annotations
 
 import os
-import warnings
 
 
 def _latent_patches_enabled() -> bool:
@@ -16,14 +15,7 @@ def _latent_patches_enabled() -> bool:
 
 
 if _latent_patches_enabled():
-    try:
-        from .llamafactory.integration import _patch_once  # noqa: F401
-    except ImportError as exc:
-        warnings.warn(
-            f"[Qwen3VL] Failed to import latent integration patches: {exc}",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+    from .llamafactory.integration import _patch_once  # noqa: F401
 
 
 __all__ = []

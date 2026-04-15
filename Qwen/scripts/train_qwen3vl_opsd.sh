@@ -3,9 +3,9 @@
 #
 # Usage:
 #   bash Qwen/scripts/train_qwen3vl_opsd.sh
-#   bash Qwen/scripts/train_qwen3vl_opsd.sh Qwen/configs/distillation/qwen3vl_opsd_continuous.yaml
-#   OUTPUT_DIR=/path/to/run bash Qwen/scripts/train_qwen3vl_opsd.sh Qwen/configs/distillation/qwen3vl_opsd_continuous.yaml
-#   bash Qwen/scripts/train_qwen3vl_opsd.sh Qwen/configs/distillation/qwen3vl_opsd_continuous.yaml --datasets chimera_thinking_image_input
+#   bash Qwen/scripts/train_qwen3vl_opsd.sh Qwen/configs/distillation/qwen3vl_opsd.yaml
+#   OUTPUT_DIR=/path/to/run bash Qwen/scripts/train_qwen3vl_opsd.sh Qwen/configs/distillation/qwen3vl_opsd.yaml
+#   bash Qwen/scripts/train_qwen3vl_opsd.sh Qwen/configs/distillation/qwen3vl_opsd.yaml --datasets chimera_thinking_image_input
 
 set -euo pipefail
 
@@ -16,7 +16,7 @@ cd "$REPO_ROOT"
 
 PYTHON_BIN="$(qwen3vl_require_python_bin "$REPO_ROOT")"
 
-DEFAULT_CONFIG="$REPO_ROOT/Qwen/configs/distillation/qwen3vl_opsd_continuous.yaml"
+DEFAULT_CONFIG="$REPO_ROOT/Qwen/configs/distillation/qwen3vl_opsd.yaml"
 DEFAULT_RUNTIME_ENV_CONFIG="$REPO_ROOT/Qwen/configs/qwen3vl_runtime_env.yaml"
 DEFAULT_ACCELERATE_CONFIG="$REPO_ROOT/Qwen/configs/distillation/accelerate_zero2.yaml"
 

@@ -2,42 +2,31 @@ import os
 import sys
 import json
 import argparse
+from pathlib import Path
+import string
+import time
+
 import pandas as pd
 import numpy as np
-import time
 from tqdm import tqdm
-from typing import List, Dict, Any
 import torch
-import warnings
-import string
-import traceback
 
-# Add parent directory to path to import shared config
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-from config import resolve_path, get_data_path, get_results_path, QWEN3_VL_2B_THINKING
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from Qwen.evaluation.config import (
+    QWEN3_VL_2B_THINKING,
+    get_data_path,
+)
+from Qwen.evaluation.mmmu.dataset_utils import MMMU_preproc, dump_image, load_dataset
+from Qwen.evaluation.mmmu.eval_utils import build_judge, eval_single_sample
 from Qwen.inference.vllm_utils import normalize_media_path, resolve_lora_artifacts
-
-# vLLM imports
-from vllm import LLM, SamplingParams
-
-# Import LoRARequest for vLLM LoRA support
-try:
-    from vllm.v1.engine import LoRARequest
-    HAS_LORA_REQUEST = True
-except ImportError:
-    HAS_LORA_REQUEST = False
-    LoRARequest = None
-# Note: Image preprocessing now handled by vLLM internally
 from transformers import AutoProcessor
+from vllm import LLM, SamplingParams
+from vllm.v1.engine import LoRARequest
 
-# Local imports from refactored files
-try:
-    from .dataset_utils import load_dataset, dump_image, MMMU_preproc
-    from .eval_utils import build_judge, eval_single_sample
-except ImportError:
-    from dataset_utils import load_dataset, dump_image, MMMU_preproc
-    from eval_utils import build_judge, eval_single_sample
+HAS_LORA_REQUEST = True
 
 # Set vLLM multiprocessing method
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'

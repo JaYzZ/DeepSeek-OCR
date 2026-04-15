@@ -1,7 +1,7 @@
 ### model
 # Qwen3-VL-2B-Thinking with latent supervision for CHIMERA thinking training.
 # Kept aligned with r1-onevision defaults where possible.
-model_name_or_path: /share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking
+model_name_or_path: ../../huggingface/Qwen/Qwen3-VL-2B-Thinking
 add_special_tokens: "<latent>,<think_sep>"
 image_max_pixels: 262144
 video_max_pixels: 16384
@@ -26,7 +26,7 @@ freeze_vision_tower: true
 # - image_input: user content includes <image> prompt + question image
 # - text_input: user content is raw question text
 dataset: chimera_thinking_image_input,chimera_thinking_text_input
-dataset_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/data
+dataset_dir: Qwen/data
 template: qwen3vl_latent
 cutoff_len: 8192
 max_samples: null
@@ -45,7 +45,7 @@ dataloader_prefetch_factor: 4
 # predict_with_generate: false
 
 ### output
-output_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/qwen3vl-2b/lora/chimera_thinking
+output_dir: Qwen/checkpoints/qwen3vl-2b/lora/chimera_thinking
 logging_steps: 10
 save_steps: 500
 plot_loss: true

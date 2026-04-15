@@ -30,6 +30,7 @@ import random
 import logging
 from typing import Optional, Dict, List, Iterator, Any
 from dataclasses import dataclass
+from project_paths import hf_path
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +48,13 @@ class DatasetConfig:
 # Default dataset configurations
 DEFAULT_CONFIGS = {
     "fineweb": DatasetConfig(
-        path="/share/project/xiyan/huggingface/HuggingFaceFW/fineweb-edu",
+        path=str(hf_path("HuggingFaceFW", "fineweb-edu")),
         weight=0.7,
         min_tokens=100,
         max_tokens=1200,
     ),
     "openwebmath": DatasetConfig(
-        path="/share/project/xiyan/huggingface/open-web-math/open-web-math",
+        path=str(hf_path("open-web-math", "open-web-math")),
         weight=0.3,
         min_tokens=100,
         max_tokens=1200,
@@ -337,11 +338,11 @@ def create_multi_dataloaders(
     if datasets is None:
         datasets = {
             "fineweb": {
-                "path": "/share/project/xiyan/huggingface/HuggingFaceFW/fineweb-edu",
+                "path": str(hf_path("HuggingFaceFW", "fineweb-edu")),
                 "weight": 0.7,
             },
             "openwebmath": {
-                "path": "/share/project/xiyan/huggingface/open-web-math/open-web-math",
+                "path": str(hf_path("open-web-math", "open-web-math")),
                 "weight": 0.3,
             },
         }

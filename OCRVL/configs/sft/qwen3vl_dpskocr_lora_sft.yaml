@@ -2,7 +2,7 @@
 # Unified checkpoint with both language model and DeepSeek-OCR encoder in one directory
 # - Root: Qwen3-VL language model (model.safetensors)
 # - dpsk_ocr_encoder/: DeepSeek-OCR vision encoder (model-00001-of-000001.safetensors)
-model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/OCRVL/checkpoints/OCR-Qwen3-VL-2B
+model_name_or_path: OCRVL/checkpoints/OCR-Qwen3-VL-2B
 image_max_pixels: 262144
 video_max_pixels: 16384
 trust_remote_code: true

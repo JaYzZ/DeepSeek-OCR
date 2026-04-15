@@ -39,13 +39,14 @@
 #   This script will automatically create a tmux session named 'ocrvl_llava'
 
 set -e  # Exit on error
+PROJECT_ROOT="${ROOT_DIR:-/share/project/xiyan}"
 
 # Ensure we're using the correct Python environment
 # If not in ocrflow env, try to activate it
-OCRFLOW_PYTHON="/share/project/xiyan/envs/ocrflow/bin/python"
+OCRFLOW_PYTHON="${PROJECT_ROOT}/envs/ocrflow/bin/python"
 if [ -f "$OCRFLOW_PYTHON" ]; then
     # Add ocrflow bin to PATH to ensure we use correct python/pip
-    export PATH="/share/project/xiyan/envs/ocrflow/bin:$PATH"
+    export PATH="${PROJECT_ROOT}/envs/ocrflow/bin:$PATH"
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -88,14 +89,14 @@ GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
 TMUX_SESSION_NAME="${TMUX_SESSION_NAME:-ocrvl_llava}"
 
 TIMESTAMP="${TIMESTAMP:-$(date '+%Y%m%d_%H%M%S')}"
-ROOT_DIR="${ROOT_DIR:-OCRVL/checkpoints/llava_${TIMESTAMP}}"
-PHASE1_OUTPUT_DIR="${PHASE1_OUTPUT_DIR:-${ROOT_DIR}/alignment}"
-PHASE2_OUTPUT_DIR="${PHASE2_OUTPUT_DIR:-${ROOT_DIR}/instruction}"
-PHASE3_OUTPUT_DIR="${PHASE3_OUTPUT_DIR:-${ROOT_DIR}/thinking}"
+RUN_OUTPUT_DIR="${RUN_OUTPUT_DIR:-OCRVL/checkpoints/llava_${TIMESTAMP}}"
+PHASE1_OUTPUT_DIR="${PHASE1_OUTPUT_DIR:-${RUN_OUTPUT_DIR}/alignment}"
+PHASE2_OUTPUT_DIR="${PHASE2_OUTPUT_DIR:-${RUN_OUTPUT_DIR}/instruction}"
+PHASE3_OUTPUT_DIR="${PHASE3_OUTPUT_DIR:-${RUN_OUTPUT_DIR}/thinking}"
 
 VALIDATION_IMAGES="${VALIDATION_IMAGES:-true}"
-LLAVA_IMAGE_BASE="${LLAVA_IMAGE_BASE:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images}"
-DOCLAYNET_BASE="${DOCLAYNET_BASE:-/share/project/xiyan/huggingface/docling-project/DocLayNet/PNG}"
+LLAVA_IMAGE_BASE="${LLAVA_IMAGE_BASE:-${PROJECT_ROOT}/huggingface/liuhaotian/LLaVA-Instruct-150K/images}"
+DOCLAYNET_BASE="${DOCLAYNET_BASE:-${PROJECT_ROOT}/huggingface/docling-project/DocLayNet/PNG}"
 
 # Phase defaults (if not provided by config/env)
 PHASE1_LORA="${PHASE1_LORA:-0}"
@@ -119,8 +120,8 @@ PHASE2_GRAD_ACCUM="${PHASE2_GRADIENT_ACCUMULATION_STEPS:-${PHASE2_GRAD_ACCUM:-4}
 PHASE2_LORA_R="${PHASE2_LORA_RANK:-${PHASE2_LORA_R:-8}}"
 PHASE2_LORA_ALPHA="${PHASE2_LORA_ALPHA:-16}"
 PHASE2_LORA_DROPOUT="${PHASE2_LORA_DROPOUT:-0.05}"
-PHASE2_LLAVA_JSON_PATH="${PHASE2_LLAVA_JSON_PATH:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json}"
-PHASE2_LLAVA_IMAGE_DIR="${PHASE2_LLAVA_IMAGE_DIR:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images}"
+PHASE2_LLAVA_JSON_PATH="${PHASE2_LLAVA_JSON_PATH:-${PROJECT_ROOT}/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json}"
+PHASE2_LLAVA_IMAGE_DIR="${PHASE2_LLAVA_IMAGE_DIR:-${PROJECT_ROOT}/huggingface/liuhaotian/LLaVA-Instruct-150K/images}"
 
 PHASE3_LORA="${PHASE3_LORA:-1}"
 PHASE3_LR="${PHASE3_LR:-1e-4}"
@@ -129,8 +130,8 @@ PHASE3_THINKING_LOSS_WEIGHT="${PHASE3_THINKING_LOSS_WEIGHT:-1.0}"
 PHASE3_MAX_SAMPLES="${PHASE3_MAX_SAMPLES:-100000}"
 PHASE3_BATCH_SIZE="${PHASE3_PER_DEVICE_TRAIN_BATCH_SIZE:-${PHASE3_BATCH_SIZE:-4}}"
 PHASE3_GRAD_ACCUM="${PHASE3_GRADIENT_ACCUMULATION_STEPS:-${PHASE3_GRAD_ACCUM:-4}}"
-PHASE3_THINKING_JSONL="${PHASE3_THINKING_JSONL:-/share/project/xiyan/huggingface/Xkev/LLaVA-CoT-100k/train.jsonl}"
-PHASE3_THINKING_IMAGE_DIR="${PHASE3_THINKING_IMAGE_DIR:-/share/project/xiyan/huggingface}"
+PHASE3_THINKING_JSONL="${PHASE3_THINKING_JSONL:-${PROJECT_ROOT}/huggingface/Xkev/LLaVA-CoT-100k/train.jsonl}"
+PHASE3_THINKING_IMAGE_DIR="${PHASE3_THINKING_IMAGE_DIR:-${PROJECT_ROOT}/huggingface}"
 
 # ============================================================================
 # Helper Functions
@@ -156,14 +157,14 @@ main() {
     log_info "========================================================================"
     log_info ""
     log_info "Training run: llava_${TIMESTAMP}"
-    log_info "Root directory: $ROOT_DIR"
+    log_info "Run output directory: $RUN_OUTPUT_DIR"
     log_info "Config: $CONFIG_PATH"
     log_info ""
 
     # Copy validation images once at the start
     if [ "$VALIDATION_IMAGES" = "true" ]; then
-        log_info "Copying validation images to ${ROOT_DIR}/validation_images..."
-        mkdir -p "${ROOT_DIR}/validation_images"
+        log_info "Copying validation images to ${RUN_OUTPUT_DIR}/validation_images..."
+        mkdir -p "${RUN_OUTPUT_DIR}/validation_images"
 
         # COCO images (10 images)
         declare -a VALIDATION_COPIES=(
@@ -187,7 +188,7 @@ main() {
             SRC="${entry%%|*}"
             DST="${entry##*|}"
             if [ -f "$SRC" ]; then
-                cp "$SRC" "${ROOT_DIR}/validation_images/$DST"
+                cp "$SRC" "${RUN_OUTPUT_DIR}/validation_images/$DST"
                 COPIED=$((COPIED + 1))
             else
                 log_info "⚠️  Missing validation image, skipping: $SRC"
@@ -206,21 +207,21 @@ main() {
     log_info "  - LR=$PHASE1_LR (constant)"
     log_info "  - Dataset: $PHASE1_DATASET_TYPE (BLIP3o=$PHASE1_BLIP3O_DATASET, pct=$PHASE1_DATASET_PCT)"
     log_info "  - Epochs: ${PHASE1_NUM_EPOCHS}"
-    log_info "  - Output: ${ROOT_DIR}/alignment/"
+    log_info "  - Output: ${RUN_OUTPUT_DIR}/alignment/"
     log_info ""
     log_info "Phase 2: Instruction Tuning (Connector + LoRA)"
     log_info "  - LORA=$PHASE2_LORA (connector + LoRA on Qwen3VL)"
     log_info "  - LR=$PHASE2_LR (constant)"
     log_info "  - RENDER=$PHASE2_RENDER"
     log_info "  - Dataset: LLaVA-150K x ${PHASE2_NUM_EPOCHS} epochs"
-    log_info "  - Output: ${ROOT_DIR}/instruction/"
+    log_info "  - Output: ${RUN_OUTPUT_DIR}/instruction/"
     log_info ""
     log_info "Phase 3: Thinking Training (Thinking Projection + LoRA)"
     log_info "  - LORA=$PHASE3_LORA (thinking projection + LoRA)"
     log_info "  - LR=$PHASE3_LR"
     log_info "  - Thinking loss weight: $PHASE3_THINKING_LOSS_WEIGHT"
     log_info "  - Dataset: LLaVA-CoT-100K x ${PHASE3_NUM_EPOCHS} epoch"
-    log_info "  - Output: ${ROOT_DIR}/thinking/"
+    log_info "  - Output: ${RUN_OUTPUT_DIR}/thinking/"
     if [ "$ENABLE_PHASE3" = "true" ]; then
         log_info "  - Status: ENABLED"
     else
@@ -382,12 +383,12 @@ main() {
     log_info "========================================================================"
     log_info ""
     log_info "Training run: llava_${TIMESTAMP}"
-    log_info "Root directory: $ROOT_DIR"
+    log_info "Run output directory: $RUN_OUTPUT_DIR"
     log_info ""
-    log_info "Phase 1 checkpoint: ${ROOT_DIR}/alignment/step_latest"
-    log_info "Phase 2 checkpoint: ${ROOT_DIR}/instruction/step_latest"
+    log_info "Phase 1 checkpoint: ${RUN_OUTPUT_DIR}/alignment/step_latest"
+    log_info "Phase 2 checkpoint: ${RUN_OUTPUT_DIR}/instruction/step_latest"
     if [ "$ENABLE_PHASE3" = "true" ]; then
-        log_info "Phase 3 checkpoint: ${ROOT_DIR}/thinking/step_latest"
+        log_info "Phase 3 checkpoint: ${RUN_OUTPUT_DIR}/thinking/step_latest"
         log_info ""
         log_info "Final model: $FINAL_CHECKPOINT (Phase 3)"
     else

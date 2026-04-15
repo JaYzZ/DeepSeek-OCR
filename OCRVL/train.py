@@ -71,30 +71,18 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 from PIL import Image
+from peft import LoraConfig, get_peft_model, PeftModel
+import swanlab
+import wandb
 
-# Optional imports
-try:
-    import wandb
-    HAS_WANDB = True
-except ImportError:
-    HAS_WANDB = False
-
-try:
-    from peft import LoraConfig, get_peft_model, PeftModel
-    HAS_PEFT = True
-except ImportError:
-    HAS_PEFT = False
-
-try:
-    import swanlab
-    HAS_SWANLAB = True
-except ImportError:
-    HAS_SWANLAB = False
-    swanlab = None
+HAS_WANDB = True
+HAS_PEFT = True
+HAS_SWANLAB = True
 
 # Add project root
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
+from project_paths import hf_path
 
 # ============================================================================
 # CUDA Configuration for Better Error Detection
@@ -672,10 +660,10 @@ def save_checkpoint(model, optimizer, scaler, global_step, output_dir, args, che
                             eval_image_base = f"{eval_image_base}/liuhaotian/LLaVA-Instruct-150K/images"
                     elif hasattr(args, 'blip3o_base_path'):
                         # For BLIP3o training, eval samples should still use LLaVA images
-                        eval_image_base = "/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images"
+                        eval_image_base = str(hf_path("liuhaotian", "LLaVA-Instruct-150K", "images"))
                     else:
                         # Fallback to default LLaVA images path
-                        eval_image_base = "/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images"
+                        eval_image_base = str(hf_path("liuhaotian", "LLaVA-Instruct-150K", "images"))
 
                     run_checkpoint_evaluation(
                         model=model,
@@ -2110,7 +2098,7 @@ def main():
                        choices=["short", "long", "60k", "mixed"],
                        help="BLIP3o dataset variant: short (concise), long (detailed), 60k (curated), or mixed")
     parser.add_argument("--blip3o_base_path", type=str,
-                       default="/share/project/xiyan/huggingface/BLIP3o",
+                       default=str(hf_path("BLIP3o")),
                        help="Base path to BLIP3o datasets")
     parser.add_argument("--blip3o_mix_ratio", type=float, default=0.5,
                        help="For 'mixed': ratio of short to long captions (0=all long, 1=all short)")
@@ -2130,10 +2118,10 @@ def main():
 
     # LLaVA-Instruct-150K dataset configuration
     parser.add_argument("--llava_json_path", type=str,
-                       default="/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_instruct_150k.json",
+                       default=str(hf_path("liuhaotian", "LLaVA-Instruct-150K", "llava_instruct_150k.json")),
                        help="Path to llava_instruct_150k.json")
     parser.add_argument("--llava_image_dir", type=str,
-                       default="/share/project/xiyan/huggingface",
+                       default=str(hf_path()),
                        help="Base directory containing datasets (e.g., huggingface root). For 665K, images span coco/vg/gqa/textvqa/ocr_vqa.")
     parser.add_argument("--llava_image_index", type=str, default=None,
                        help="Optional JSON mapping from dataset-relative image path (e.g. 'coco/train2017/xxxx.jpg') to absolute local file path.")
@@ -2144,10 +2132,10 @@ def main():
 
     # Thinking (LLaVA-CoT) dataset configuration
     parser.add_argument("--thinking_jsonl_path", type=str,
-                       default="/share/project/xiyan/huggingface/Xkev/LLaVA-CoT-100k/train.jsonl",
+                       default=str(hf_path("Xkev", "LLaVA-CoT-100k", "train.jsonl")),
                        help="Path to LLaVA-CoT JSONL file")
     parser.add_argument("--thinking_image_dir", type=str,
-                       default="/share/project/xiyan/huggingface",
+                       default=str(hf_path()),
                        help="Base directory containing LLaVA-CoT images")
     parser.add_argument("--thinking_loss_weight", type=float, default=1.0,
                        help="Weight for thinking alignment loss (MSE between projected hidden states and OCR-encoded reasoning)")
@@ -2156,7 +2144,7 @@ def main():
 
     # DocLayNet dataset configuration
     parser.add_argument("--doclaynet_data_dir", type=str,
-                       default="/share/project/xiyan/huggingface/docling-project/DocLayNet",
+                       default=str(hf_path("docling-project", "DocLayNet")),
                        help="Root directory of extracted DocLayNet_core.zip (contains COCO/ and PNG/ subdirectories)")
     parser.add_argument("--doclaynet_split", type=str, default="train",
                        choices=["train", "val", "test"],

@@ -23,6 +23,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
+from project_paths import hf_path
 
 # Add repository root to path for Renderer import
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -421,13 +422,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--llava-json",
         type=str,
-        default="/share/project/xiyan/huggingface/liuhaotian/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json",
+        default=str(hf_path("liuhaotian", "LLaVA-Pretrain", "blip_laion_cc_sbu_558k.json")),
         help="Path to LLaVA JSON file",
     )
     parser.add_argument(
         "--llava-images",
         type=str,
-        default="/share/project/xiyan/huggingface/liuhaotian/LLaVA-Pretrain/images",
+        default=str(hf_path("liuhaotian", "LLaVA-Pretrain", "images")),
         help="Path to LLaVA images directory",
     )
     parser.add_argument(

@@ -23,6 +23,7 @@
 #   LORA=0 RESUME_CHECKPOINT=OCRVL/checkpoints/.../step_786 bash OCRVL/scripts/train_instruction.sh
 
 set -e  # Exit on error
+PROJECT_ROOT="${ROOT_DIR:-/share/project/xiyan}"
 
 # ============================================================================
 # Configuration - Override with environment variables
@@ -40,8 +41,8 @@ LORA_ALPHA="${LORA_ALPHA:-16}"  # LoRA alpha (typically 2x rank)
 LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
 
 # LLaVA-Instruct dataset paths (default to 665K mix with proper images/ directory)
-LLAVA_JSON_PATH="${LLAVA_JSON_PATH:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json}"
-LLAVA_IMAGE_DIR="${LLAVA_IMAGE_DIR:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images}"
+LLAVA_JSON_PATH="${LLAVA_JSON_PATH:-${PROJECT_ROOT}/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json}"
+LLAVA_IMAGE_DIR="${LLAVA_IMAGE_DIR:-${PROJECT_ROOT}/huggingface/liuhaotian/LLaVA-Instruct-150K/images}"
 LLAVA_IMAGE_INDEX="${LLAVA_IMAGE_INDEX:-}"  # Optional: path to prebuilt image index JSON
 
 # Dataset configuration

@@ -5,14 +5,20 @@ Direct vLLM integration for OCRVL without HuggingFace export overhead.
 Loads base Qwen3-VL model in vLLM and applies OCRVL connectors on-the-fly.
 """
 
+import gc
+import json
 import logging
 from pathlib import Path
 from typing import List, Optional, Union
 
 import torch
 import torch.nn as nn
+from OCRInfer.utils.model_paths import resolve_model_path
+from Qwen.decoder.grid_thw_utils import get_ocr_grid_thw
+from Qwen.decoder.vllm_embedding_fix import apply_vllm_embedding_fix
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
+from vllm.lora.request import LoRARequest
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +82,6 @@ class OCRVLProcessor:
             enable_lora: Enable LoRA adapters if present (auto-detect if None)
         """
         # Fix vLLM embedding handling for multi-modal
-        from .vllm_embedding_fix import apply_vllm_embedding_fix
         apply_vllm_embedding_fix()
 
         self.checkpoint_path = Path(checkpoint_path)
@@ -134,7 +139,6 @@ class OCRVLProcessor:
             logger.info(f"  Status: Enabled")
 
             # Load LoRA config for logging
-            import json
             with open(lora_config) as f:
                 lora_cfg = json.load(f)
             logger.info(f"  LoRA rank (r): {lora_cfg.get('r', 'N/A')}")
@@ -218,7 +222,6 @@ class OCRVLProcessor:
         logger.info("Initializing vLLM engine...")
 
         # Resolve model path (handle HF or local mirror)
-        from OCRInfer.utils.model_paths import resolve_model_path
         self.base_model_path = resolve_model_path(base_model)
 
         # Initialize tokenizer for building inputs
@@ -264,7 +267,6 @@ class OCRVLProcessor:
 
             # CRITICAL: Pre-load LoRA adapters into vLLM engine
             # This must be done before generation - passing LoRARequest to generate() alone isn't enough
-            from vllm.lora.request import LoRARequest
             lora_request = LoRARequest(
                 lora_name=self.lora_request_name,
                 lora_int_id=self.lora_int_id,
@@ -381,8 +383,6 @@ class OCRVLProcessor:
         Returns:
             Generated text (str if single prompt, List[str] if batch)
         """
-        from .grid_thw_utils import get_ocr_grid_thw
-
         # Determine if this is multi-image for single prompt or batch
         is_single_prompt = isinstance(prompts, str)
         is_tensor_input = isinstance(visual_embeddings, torch.Tensor)
@@ -526,7 +526,6 @@ class OCRVLProcessor:
         # Prepare LoRA request if enabled
         lora_request = None
         if self.use_lora:
-            from vllm.lora.request import LoRARequest
             lora_request = LoRARequest(
                 lora_name=self.lora_request_name,
                 lora_int_id=self.lora_int_id,
@@ -574,8 +573,6 @@ class OCRVLProcessor:
                 del self.llm
             except Exception:
                 pass
-            import gc
-            import torch
             gc.collect()
             try:
                 torch.cuda.empty_cache()

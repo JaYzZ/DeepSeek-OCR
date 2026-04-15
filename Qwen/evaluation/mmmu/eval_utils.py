@@ -1,19 +1,16 @@
 import os
-import requests
-import time
+import copy
 import random
 import string
-import copy
+import time
 import traceback
+
 import pandas as pd
+import requests
 from PIL import Image
-from typing import List, Dict, Tuple, Any
-try:
-    from .common_utils import encode_image_to_base64
-    from ..utils import normalize_chat_api_url, strip_thinking_tokens
-except ImportError:
-    from common_utils import encode_image_to_base64
-    from utils import normalize_chat_api_url, strip_thinking_tokens
+
+from Qwen.evaluation.mmmu.common_utils import encode_image_to_base64
+from Qwen.evaluation.utils import normalize_chat_api_url, strip_thinking_tokens
 
 class OpenAIWrapper:
     """Wrapper for OpenAI API."""

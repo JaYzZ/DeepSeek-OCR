@@ -22,6 +22,7 @@ import os
 import sys
 from pathlib import Path
 from typing import List, Dict, Any
+from project_paths import get_deepseek_ocr_dir
 
 # Add parent directories to path
 script_dir = Path(__file__).parent
@@ -133,7 +134,7 @@ def main():
     )
     parser.add_argument(
         "--base-dir",
-        default="/share/project/xiyan/sources/DeepSeek-OCR",
+        default=str(get_deepseek_ocr_dir()),
         help="Base directory",
     )
     parser.add_argument(

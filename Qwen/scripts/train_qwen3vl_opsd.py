@@ -32,21 +32,17 @@ import torch.nn.functional as F
 import yaml
 from accelerate import Accelerator
 from PIL import Image
+from peft import LoraConfig, PeftModel, get_peft_model
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForVision2Seq, AutoProcessor, AutoTokenizer, GenerationConfig
-
-try:
-    from peft import LoraConfig, PeftModel, get_peft_model
-except ImportError:  # pragma: no cover - environment-specific
-    LoraConfig = None
-    PeftModel = None
-    get_peft_model = None
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from Qwen.data.build_qwen3vl_opd_text_dataset import build_manifest as build_text_manifest
+from Qwen.data.build_qwen3vl_opsd_dataset import build_manifest as build_image_manifest
 from Qwen.llamafactory.integration import (
     LatentVAE,
     _align_module_to_model_dtype_device,
@@ -155,12 +151,14 @@ def _resolve_path(value: str | None, *, base_dir: Path) -> Path | None:
     return path
 
 
-def _default_manifest_path(dataset_names: str) -> Path:
+def _default_manifest_path(dataset_names: str, manifest_builder: str = "opsd") -> Path:
     parts = [item.strip() for item in dataset_names.split(",") if item.strip()]
     if not parts:
         raise ValueError("data.dataset_names must be non-empty")
     slug = "__".join(parts)
-    return (REPO_ROOT / "Qwen" / "data" / "opsd" / f"{slug}_opsd.jsonl").resolve()
+    builder = manifest_builder.strip().lower()
+    suffix = "opd_text" if builder in {"opd_text", "opsd_text", "text"} else "opsd"
+    return (REPO_ROOT / "Qwen" / "data" / "opsd" / f"{slug}_{suffix}.jsonl").resolve()
 
 
 def _assistant_answer(text: str) -> str:
@@ -177,12 +175,20 @@ def _format_user_prompt(
     num_question_images: int,
     num_rationale_images: int,
     question_text: str,
+    **extra_fields: Any,
 ) -> str:
-    return template.format(
-        num_question_images=num_question_images,
-        num_rationale_images=num_rationale_images,
-        question_text=question_text,
-    ).strip()
+    values = {
+        "num_question_images": num_question_images,
+        "num_rationale_images": num_rationale_images,
+        "question_text": question_text,
+    }
+    values.update(extra_fields)
+
+    class _SafeDict(dict):
+        def __missing__(self, key: str) -> str:
+            return "{" + key + "}"
+
+    return template.format_map(_SafeDict(values)).strip()
 
 
 def _load_image(path: str) -> Image.Image:
@@ -1200,7 +1206,13 @@ def _maybe_prepare_manifest(config: dict[str, Any]) -> None:
     if manifest_path.exists() and not bool(data_cfg.get("overwrite_manifest", False)):
         return
 
-    from Qwen.data.build_qwen3vl_opsd_dataset import build_manifest
+    builder_name = str(data_cfg.get("manifest_builder", "opsd")).strip().lower()
+    if builder_name in {"opsd", "image", "images", "opd_vcr"}:
+        build_manifest = build_image_manifest
+    elif builder_name in {"opd_text", "opsd_text", "text"}:
+        build_manifest = build_text_manifest
+    else:
+        raise ValueError(f"Unsupported data.manifest_builder={builder_name!r}")
 
     datasets = [item.strip() for item in str(data_cfg["dataset_names"]).split(",") if item.strip()]
     total, per_dataset = build_manifest(datasets, manifest_path)
@@ -1670,10 +1682,11 @@ def _resolve_config_paths(config: dict[str, Any]) -> dict[str, Any]:
         config["runtime_env_config"] = str(runtime_env_config)
 
     manifest_value = config["data"].get("opsd_manifest")
+    manifest_builder = str(config["data"].get("manifest_builder", "opsd"))
     if manifest_value:
         manifest_path = _resolve_path(manifest_value, base_dir=REPO_ROOT)
     else:
-        manifest_path = _default_manifest_path(str(config["data"]["dataset_names"]))
+        manifest_path = _default_manifest_path(str(config["data"]["dataset_names"]), manifest_builder)
     config["data"]["opsd_manifest"] = str(manifest_path)
 
     output_dir = _resolve_path(config["training"]["output_dir"], base_dir=REPO_ROOT)

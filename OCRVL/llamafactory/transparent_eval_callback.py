@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import shutil
-import sys
 import time
 import traceback
 from datetime import datetime
@@ -24,21 +23,11 @@ from PIL import Image
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 from transformers.integrations import is_fsdp_managed_module
+from project_paths import get_deepseek_ocr_dir
 
 logger = logging.getLogger(__name__)
 
-# Add OCRVL scripts to path for composite image generation
-_REPO_ROOT = Path(__file__).parent.parent.parent
-_SCRIPTS_DIR = _REPO_ROOT / "OCRVL" / "scripts"
-if str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
-
-# Import composite image generation function
-try:
-    from generate_composite_images import generate_composite_images
-except ImportError as e:
-    logger.warning(f"Could not import composite image generation: {e}")
-    generate_composite_images = None
+from OCRVL.scripts.generate_composite_images import generate_composite_images
 
 
 class TransparentEvalCallback(TrainerCallback):
@@ -64,7 +53,7 @@ class TransparentEvalCallback(TrainerCallback):
         self.max_new_tokens = int(os.environ.get("TRANSPARENT_EVAL_MAX_NEW_TOKENS", "128"))
         self.temperature = float(os.environ.get("TRANSPARENT_EVAL_TEMPERATURE", "0.0"))
         self.limit = os.environ.get("TRANSPARENT_EVAL_LIMIT", "")
-        self.repo_root = os.environ.get("OCRVL_REPO_ROOT", "/share/project/xiyan/sources/DeepSeek-OCR")
+        self.project_dir = str(get_deepseek_ocr_dir())
 
         logger.info(f"[TransparentEval] Initialized - will auto-enable when eval_dataset='ocrvl_transparent_eval'")
         logger.info(f"[TransparentEval] Config: max_tokens={self.max_new_tokens}, temp={self.temperature}, limit={self.limit}")
@@ -136,7 +125,7 @@ class TransparentEvalCallback(TrainerCallback):
             print(msg, flush=True)
 
         # Load samples (all ranks need this for FSDP)
-        metadata_path = Path(self.repo_root) / "OCRVL/data/ocrvl_transparent_eval.metadata.json"
+        metadata_path = Path(self.project_dir) / "OCRVL/data/ocrvl_transparent_eval.metadata.json"
         if not metadata_path.exists():
             if is_main:
                 logger.warning(f"[TransparentEval] Metadata not found: {metadata_path}")
@@ -152,7 +141,7 @@ class TransparentEvalCallback(TrainerCallback):
         # Load full samples from JSONL to get ground_truth (from assistant message)
         # This is needed because unified SFT format doesn't have ground_truth field
         full_samples = {}
-        jsonl_path = Path(self.repo_root) / "OCRVL/data/ocrvl_transparent_eval.jsonl"
+        jsonl_path = Path(self.project_dir) / "OCRVL/data/ocrvl_transparent_eval.jsonl"
         if jsonl_path.exists():
             with open(jsonl_path, 'r') as f:
                 for line in f:
@@ -284,7 +273,7 @@ class TransparentEvalCallback(TrainerCallback):
             try:
                 images = []
                 for img_path in sample['images']:
-                    full_path = Path(self.repo_root) / img_path
+                    full_path = Path(self.project_dir) / img_path
                     if full_path.exists():
                         images.append(Image.open(full_path).convert('RGB'))
 
@@ -522,7 +511,7 @@ class TransparentEvalCallback(TrainerCallback):
             images = result.get('images', [])
 
             for img_idx, img_path in enumerate(images):
-                src = Path(self.repo_root) / img_path
+                src = Path(self.project_dir) / img_path
                 if src.exists():
                     # Name: {sample_id}_img{idx}{ext}
                     ext = src.suffix
@@ -662,7 +651,7 @@ class TransparentEvalCallback(TrainerCallback):
             generate_composite_images(
                 results_json=results_json,
                 output_dir=output_dir,
-                repo_root=Path(self.repo_root),
+                repo_root=Path(self.project_dir),
             )
 
         except Exception as e:

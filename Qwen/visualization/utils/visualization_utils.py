@@ -3,9 +3,12 @@ Visualization utilities for Qwen3-VL thinking mode.
 t-SNE computation, attention heatmap helpers, token display utilities.
 """
 
+import base64
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 import numpy as np
 from sklearn.manifold import TSNE
-from typing import List, Dict, Any, Optional
 
 
 def compute_tsne(
@@ -215,9 +218,6 @@ def encode_image_to_base64(image_path: str) -> str:
     Returns:
         Base64 encoded string
     """
-    import base64
-    from pathlib import Path
-
     with open(image_path, 'rb') as f:
         img_bytes = f.read()
     return base64.b64encode(img_bytes).decode('utf-8')
@@ -232,5 +232,4 @@ def decode_base64_to_image(base64_str: str) -> bytes:
     Returns:
         Image bytes
     """
-    import base64
     return base64.b64decode(base64_str)

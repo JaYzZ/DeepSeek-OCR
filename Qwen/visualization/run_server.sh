@@ -2,8 +2,9 @@
 # Qwen3-VL Thinking Mode Visualization Server Startup Script
 
 # Default values
+PROJECT_ROOT="${ROOT_DIR:-/share/project/xiyan}"
 LORA_PATH="${LORA_PATH:-}"
-MODEL_PATH="${MODEL_PATH:-Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking}"
+MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/huggingface/Qwen/Qwen3-VL-2B-Thinking}"
 PORT="${PORT:-8501}"
 HOST="${HOST:-0.0.0.0}"
 
@@ -31,7 +32,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --lora-path PATH      Path to LoRA adapter (default: none)"
-            echo "  --model-path PATH     Path to base model (default: Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking)"
+            echo "  --model-path PATH     Path to base model (default: $ROOT_DIR/huggingface/Qwen/Qwen3-VL-2B-Thinking)"
             echo "  --port PORT          Port to run server on (default: 8501)"
             echo "  --host HOST          Host to bind to (default: 0.0.0.0)"
             echo ""
@@ -72,17 +73,19 @@ echo "Server: http://$HOST:$PORT"
 echo "======================================"
 echo ""
 
-# Run the server
-cd "$(dirname "$0")"
-PYTHON_BIN="/share/project/xiyan/envs/ocrflow/bin/python"
+# Run the server from repo root so package imports stay canonical.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "${REPO_ROOT}"
+PYTHON_BIN="$PROJECT_ROOT/envs/ocrflow/bin/python"
 if [ -n "$LORA_PATH" ]; then
-    "$PYTHON_BIN" app.py \
+    "$PYTHON_BIN" -m Qwen.visualization.app \
         --model-path "$MODEL_PATH" \
         --lora-path "$LORA_PATH" \
         --port "$PORT" \
         --host "$HOST"
 else
-    "$PYTHON_BIN" app.py \
+    "$PYTHON_BIN" -m Qwen.visualization.app \
         --model-path "$MODEL_PATH" \
         --port "$PORT" \
         --host "$HOST"

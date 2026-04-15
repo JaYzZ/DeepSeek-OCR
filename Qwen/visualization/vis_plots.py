@@ -1,30 +1,18 @@
-#!/usr/bin/env python3
-"""
-Visualization plot types.
-
-Provides unified plotting functions for:
-- PCA visualizations of spatial features
-- t-SNE/UMAP embeddings
-- Feature comparison plots
-- Single image multi-layer visualizations
-"""
-
-import sys
-from pathlib import Path
-from typing import Optional, Union, List, Dict, Tuple
 from dataclasses import dataclass
-import numpy as np
-import torch
-from PIL import Image
+from typing import Dict, List, Optional, Tuple, Union
+
 import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
 import seaborn as sns
+from sklearn.manifold import TSNE
+from sklearn.preprocessing import StandardScaler
+import torch
+import umap
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from vis_core import PathManager
-from vis_features import FeatureData
-from vis_tools import get_pca_map
+from .vis_core import PathManager
+from .vis_features import FeatureData, extract_sam_comparison
+from .vis_tools import get_pca_map
 
 
 # Set style
@@ -267,9 +255,6 @@ class EmbeddingVisualizer:
         perplexity: int = 30,
     ):
         """Plot t-SNE embedding."""
-        from sklearn.manifold import TSNE
-        from sklearn.preprocessing import StandardScaler
-
         # Scale features
         scaler = StandardScaler()
         features_scaled = scaler.fit_transform(features)
@@ -327,13 +312,9 @@ class EmbeddingVisualizer:
         min_dist: float = 0.1,
     ):
         """Plot UMAP embedding."""
-        try:
-            import umap
-        except ImportError:
+        if umap is None:
             print("UMAP not installed. Install with: pip install umap-learn")
             return None
-
-        from sklearn.preprocessing import StandardScaler
 
         # Scale features
         scaler = StandardScaler()
@@ -390,8 +371,6 @@ def plot_sam_single_image(
     output_dir: Optional[Path] = None,
 ) -> Path:
     """Quick SAM pipeline visualization for single image."""
-    from vis_features import extract_sam_comparison
-
     # Load image
     image = Image.open(image_path).convert('RGB')
 

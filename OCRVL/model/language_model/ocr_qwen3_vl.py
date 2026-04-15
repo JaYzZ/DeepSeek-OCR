@@ -22,18 +22,28 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 import importlib.util
+import shutil
+import warnings
 from typing import Any, Iterable, List, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image
 from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoModelForCausalLM
 from transformers.cache_utils import Cache
 from transformers.generation.utils import GenerateOutput
 
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
+from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+    Qwen3VLForConditionalGeneration,
+    Qwen3VLModel,
+    Qwen3VLModelOutputWithPast,
+    Qwen3VLCausalLMOutputWithPast,
+)
+from transformers.utils import is_torchdynamo_compiling
 
 logger = logging.getLogger(__name__)
 
@@ -56,13 +66,6 @@ class OCRQwen3VLConfig(Qwen3VLConfig):
         """
         super().__init__(*args, **kwargs)
         self.dpsk_ocr_model_name_or_path = dpsk_ocr_model_name_or_path
-from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-    Qwen3VLForConditionalGeneration,
-    Qwen3VLModel,
-    Qwen3VLModelOutputWithPast,
-    Qwen3VLCausalLMOutputWithPast,
-)
-from transformers.utils import is_torchdynamo_compiling
 
 from OCRInfer.encoder.dpsk_ocr_encoder import DPSKOCREncoder
 from OCRInfer.utils.model_paths import resolve_model_path
@@ -120,7 +123,6 @@ class DPSKVisionTowerAdapter(nn.Module):
         # AGGRESSIVE dtype enforcement: Fix any float32 parameters on EVERY forward pass
         # This is necessary because FSDP + eval can reset dtypes on different ranks
         # The check is fast (only checks dtype, doesn't convert if already correct)
-        import torch.nn as nn
         fixed = 0
 
         # Convert the DPSK encoder itself
@@ -297,8 +299,6 @@ def _pool_ref_to_ocr_grid(
     ref_embeds: torch.Tensor, ref_grid_thw: torch.LongTensor, ocr_grid_thw: torch.LongTensor
 ) -> torch.Tensor:
     """Average-pool reference ViT tokens to OCR visual grid size."""
-    import torch.nn.functional as F
-
     _, ref_h, ref_w = (int(ref_grid_thw[0]), int(ref_grid_thw[1]), int(ref_grid_thw[2]))
     _, ocr_h, ocr_w = (int(ocr_grid_thw[0]), int(ocr_grid_thw[1]), int(ocr_grid_thw[2]))
     visual_len = ref_h * ref_w
@@ -549,8 +549,6 @@ class OCRQwen3VLModel(Qwen3VLModel):
             )
 
             if visual is not None and not is_dpsk_adapter:
-                import logging
-                logger = logging.getLogger(__name__)
                 logger.error(f"[OCRVL] visual type check failed: type(visual)={type(visual)}, hasattr dpsk_encoder={hasattr(visual, 'dpsk_encoder') if visual is not None else 'N/A'}")
                 raise ValueError(f"self.visual is not a DPSKVisionTowerAdapter (got {type(visual).__name__}). DPSK encoder initialization failed.")
 
@@ -989,8 +987,6 @@ class OCRQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
         This ensures FSDP treats the entire model uniformly since all components
         were loaded from the same checkpoint.
         """
-        import torch.nn as nn
-
         cfg = self.config
         state_path = os.path.join(checkpoint_path, cfg.dpsk_encoder_state_path)
 
@@ -1061,7 +1057,6 @@ class OCRQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
         unfreeze_env = os.environ.get("OCRVL_UNFREEZE_DPSK_ENCODER", "0").strip() in {"1", "true", "yes"}
         if unfreeze_env:
             if self._is_main_process():
-                import warnings
                 warnings.warn(
                     "OCRVL_UNFREEZE_DPSK_ENCODER is set - DPSK encoder will be trainable. "
                     "This is NOT recommended for normal training as it will destroy the pre-trained OCR capabilities."
@@ -1075,8 +1070,6 @@ class OCRQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if visual is not None and isinstance(visual, DPSKVisionTowerAdapter):
             visual.dpsk_encoder.requires_grad_(False)
             if self._is_main_process():
-                import logging
-                logger = logging.getLogger(__name__)
                 logger.info(
                     "[OCRVL] ✓ Frozen DPSK OCR encoder (401M params). "
                     "This preserves pre-trained OCR capabilities during training. "
@@ -1120,8 +1113,6 @@ class OCRQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args: Any, **kwargs: Any):  # type: ignore[override]
         # Log that our from_pretrained is being called
-        import logging
-        logger = logging.getLogger(__name__)
         logger.info(f"[OCRVL] OCRQwen3VLForConditionalGeneration.from_pretrained called with: {pretrained_model_name_or_path}")
         logger.info(f"[OCRVL] Loading model with DPSK encoder freeze and connector early initialization")
 
@@ -1501,8 +1492,6 @@ class Qwen3VLOCRTextAdapter:
         render_texts=None,
         use_deepstack: bool = True,
     ) -> None:
-        from PIL import Image  # local import keeps import-time optional deps minimal
-
         self.chunk_tokens = chunk_tokens
         self.render_width = render_width
         self.render_height = render_height
@@ -1526,8 +1515,6 @@ class Qwen3VLOCRTextAdapter:
         self._render_texts = render_texts or self._build_renderer(use_vello_renderer)
 
     def _build_renderer(self, use_vello_renderer: bool):
-        from PIL import Image
-
         if use_vello_renderer and VelloRenderer is not None:
             try:
                 vello = VelloRenderer(

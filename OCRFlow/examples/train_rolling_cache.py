@@ -68,6 +68,7 @@ from torch.amp import autocast, GradScaler
 # Add project root
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
+from project_paths import hf_path
 
 from OCRFlow.models.markovian_chunk_decoder import create_chunk_decoder
 from OCRFlow.training.rolling_cache_dataset import (
@@ -333,7 +334,7 @@ def main():
 
     # Dataset
     parser.add_argument("--fineweb_path", type=str,
-                        default="/share/project/xiyan/huggingface/HuggingFaceFW/fineweb-edu")
+                        default=str(hf_path("HuggingFaceFW", "fineweb-edu")))
     parser.add_argument("--fineweb_subset", type=str, default="10BT")
 
     # Batch sizes (optimized for 80GB H100 based on benchmarks)

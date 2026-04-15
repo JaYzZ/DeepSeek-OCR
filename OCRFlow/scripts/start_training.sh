@@ -12,8 +12,9 @@ MAX_STEPS="${2:-100000}"
 
 # Paths
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
-PYTHON="/share/project/xiyan/envs/ocrflow/bin/python"
+DEEPSEEK_OCR_DIR="$( cd "$SCRIPT_DIR/../.." && pwd )"
+PROJECT_ROOT="${ROOT_DIR:-/share/project/xiyan}"
+PYTHON="$PROJECT_ROOT/envs/ocrflow/bin/python"
 
 # Check existing session
 if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
@@ -28,9 +29,10 @@ echo "  Session: $SESSION_NAME"
 echo ""
 
 # Create tmux session and start training
-tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_ROOT"
+tmux new-session -d -s "$SESSION_NAME" -c "$DEEPSEEK_OCR_DIR"
 tmux send-keys -t "$SESSION_NAME" "export CUDA_VISIBLE_DEVICES=$GPU_IDS" C-m
-tmux send-keys -t "$SESSION_NAME" "export PYTHONPATH=$PROJECT_ROOT:\$PYTHONPATH" C-m
+tmux send-keys -t "$SESSION_NAME" "export ROOT_DIR=$PROJECT_ROOT" C-m
+tmux send-keys -t "$SESSION_NAME" "export PYTHONPATH=$DEEPSEEK_OCR_DIR:\$PYTHONPATH" C-m
 tmux send-keys -t "$SESSION_NAME" "$PYTHON examples/train_rolling_cache.py --gpu-ids $GPU_IDS --max_steps $MAX_STEPS --save_interval 10000 --cache_size 5000 --encode_batch_size 24 --train_batch_size 128 --output_dir ./checkpoints/rolling_cache" C-m
 
 echo "✓ Training started in tmux!"

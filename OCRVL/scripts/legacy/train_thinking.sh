@@ -24,6 +24,7 @@
 #   MAX_SAMPLES        - Max samples to load (default: 100000)
 
 set -e  # Exit on error
+PROJECT_ROOT="${ROOT_DIR:-/share/project/xiyan}"
 
 # ============================================================================
 # Configuration
@@ -59,8 +60,8 @@ SAVE_INTERVAL="${SAVE_INTERVAL:-1000}"      # Save every 1000 steps
 LOG_INTERVAL="${LOG_INTERVAL:-100}"         # Log every 100 steps
 
 # Dataset configuration
-THINKING_JSONL="${THINKING_JSONL:-/share/project/xiyan/huggingface/Xkev/LLaVA-CoT-100k/train.jsonl}"
-THINKING_IMAGE_DIR="${THINKING_IMAGE_DIR:-/share/project/xiyan/huggingface}"
+THINKING_JSONL="${THINKING_JSONL:-${PROJECT_ROOT}/huggingface/Xkev/LLaVA-CoT-100k/train.jsonl}"
+THINKING_IMAGE_DIR="${THINKING_IMAGE_DIR:-${PROJECT_ROOT}/huggingface}"
 
 # Model paths
 DPSK_MODEL_PATH="${DPSK_MODEL_PATH:-deepseek-ai/DeepSeek-OCR}"

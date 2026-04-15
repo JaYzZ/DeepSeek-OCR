@@ -3,20 +3,17 @@ vLLM inference utilities for Qwen3-VL thinking mode.
 Handles model loading, inference with hidden states extraction, and trace collection.
 """
 
-import json
-import os
-import sys
-from pathlib import Path
-from typing import Dict, Any, Optional, List
-import numpy as np
-
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-
-import torch
-from PIL import Image
 import base64
 from io import BytesIO
+import json
+import os
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import torch
+from PIL import Image
+from vllm_thinking.trace_store import get_request_trace
+import yaml
 
 
 def load_runtime_env(config_path: str = "Qwen/configs/qwen3vl_runtime_env.yaml") -> Dict[str, Any]:
@@ -28,8 +25,6 @@ def load_runtime_env(config_path: str = "Qwen/configs/qwen3vl_runtime_env.yaml")
     Returns:
         Config dictionary
     """
-    import yaml
-
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
@@ -152,8 +147,6 @@ def collect_trace_data(
     Returns:
         Processed data with tokens, hidden states, attention, etc.
     """
-    from vllm_thinking.trace_store import get_request_trace
-
     trace = get_request_trace("current")  # or get by specific request ID
     if not trace:
         return {}

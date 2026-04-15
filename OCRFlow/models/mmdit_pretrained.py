@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 from diffusers import QwenImageTransformer2DModel
 from typing import Optional, Tuple
+from project_paths import hf_path
 
 
 def unpatch_channels_to_spatial(x: torch.Tensor, patch_size: int = 4) -> torch.Tensor:
@@ -95,7 +96,7 @@ class MMDiTOCRFlowPretrained(nn.Module):
 
     def __init__(
         self,
-        qwen_model_path: str = "/share/project/xiyan/huggingface/Qwen/Qwen-Image",
+        qwen_model_path: str = str(hf_path("Qwen", "Qwen-Image")),
         freeze_backbone: bool = False,
         patch_size: int = 4,
     ):
@@ -299,7 +300,7 @@ class MMDiTOCRFlowPretrained(nn.Module):
 
 
 def create_mmdit_ocrflow_pretrained(
-    qwen_model_path: str = "/share/project/xiyan/huggingface/Qwen/Qwen-Image",
+    qwen_model_path: str = str(hf_path("Qwen", "Qwen-Image")),
     freeze_backbone: bool = False,
     patch_size: int = 4,
 ) -> MMDiTOCRFlowPretrained:

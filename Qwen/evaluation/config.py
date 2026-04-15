@@ -8,6 +8,7 @@ when run from the evaluation root directory.
 import os
 from dotenv import load_dotenv
 from pathlib import Path
+from project_paths import hf_path
 
 # Get the evaluation root directory
 # This works whether script is run directly or as a module
@@ -17,7 +18,7 @@ _EVAL_ROOT = _SCRIPT_DIR
 # Paths
 ENV_FILE = _EVAL_ROOT / ".env"
 DATA_ROOT = _EVAL_ROOT / "data"
-MODEL_ROOT = Path("/share/project/xiyan/huggingface/Qwen")
+MODEL_ROOT = hf_path("Qwen")
 
 # Load environment variables from .env
 if ENV_FILE.exists():

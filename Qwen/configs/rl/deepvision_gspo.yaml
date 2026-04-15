@@ -1,5 +1,5 @@
 custom_reward_function:
-  path: ${oc.env:DEEPSEEK_OCR_ROOT}/Qwen/verl/deepvision_gspo_reward.py
+  path: ${oc.env:ROOT_DIR,/share/project/xiyan}/sources/DeepSeek-OCR/Qwen/verl/deepvision_gspo_reward.py
   name: compute_score_batch
 
 data:

@@ -13,7 +13,7 @@
 # Goal: Enhance OCR capabilities on top of general VQA/caption foundation
 #
 # Uses DeepSeek-OCR encoder with DPSKOCRCrossAttentionEncoder for combining features.
-model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/OCRVL/checkpoints/OCR-Qwen3-VL-2B-Thinking
+model_name_or_path: OCRVL/checkpoints/OCR-Qwen3-VL-2B-Thinking
 image_max_pixels: 262144
 video_max_pixels: 16384
 trust_remote_code: true
@@ -52,7 +52,7 @@ freeze_vision_tower: true
 #
 # This creates OCRVL/data/ocrvl_ocr_supplement.jsonl without rebuilding from source.
 dataset: ocrvl_ocr_supplement
-dataset_dir: /share/project/xiyan/sources/DeepSeek-OCR/OCRVL/data
+dataset_dir: OCRVL/data
 template: ocrvl_qwen3_vl_nothink
 cutoff_len: 2048
 max_samples: null
@@ -70,7 +70,7 @@ eval_steps: 500
 predict_with_generate: true
 
 ### output
-output_dir: /share/project/xiyan/sources/DeepSeek-OCR/OCRVL/checkpoints/llamafactory/qwen3vl-2b/lora/ocr_supplement
+output_dir: OCRVL/checkpoints/llamafactory/qwen3vl-2b/lora/ocr_supplement
 logging_steps: 10
 save_steps: 500
 plot_loss: true
@@ -106,4 +106,4 @@ ddp_find_unused_parameters: false
 ddp_timeout: 180000000
 
 # Load from checkpoint-5000 (weights only, no optimizer state)
-adapter_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/OCRVL/checkpoints/llamafactory/qwen3vl-2b/lora/run_20260126_134122/checkpoint-5000
+adapter_name_or_path: OCRVL/checkpoints/llamafactory/qwen3vl-2b/lora/run_20260126_134122/checkpoint-5000

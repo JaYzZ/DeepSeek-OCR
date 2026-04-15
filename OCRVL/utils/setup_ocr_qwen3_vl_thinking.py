@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from project_paths import hf_path
 
 
 def setup_ocr_qwen3_vl_thinking(
@@ -140,7 +141,7 @@ def main():
     # Default paths
     script_dir = Path(__file__).parent.parent
     source_instruct = script_dir / "checkpoints" / "OCR-Qwen3-VL-2B"
-    source_thinking = Path("/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking")
+    source_thinking = hf_path("Qwen", "Qwen3-VL-2B-Thinking")
     target_dir = script_dir / "checkpoints" / "OCR-Qwen3-VL-2B-Thinking"
 
     # Verify sources exist

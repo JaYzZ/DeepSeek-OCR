@@ -19,7 +19,7 @@ import traceback
 from collections import OrderedDict, defaultdict
 from typing import Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import swanlab
 
 import torch
 import torch.distributed as dist
@@ -50,11 +50,6 @@ from llamafactory.train.sft.trainer import CustomSeq2SeqTrainer
 from Qwen.llamafactory.transparent_eval_callback import QwenTransparentEvalCallback
 from Qwen.llamafactory.curriculum_callback import QwenCurriculumCallback
 from Qwen.llamafactory.runtime_env import get_flag
-
-try:
-    import swanlab  # type: ignore
-except ImportError:
-    swanlab = None
 
 logger = logging.getLogger(__name__)
 debug_enabled = os.environ.get("LLAMAFACTORY_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -493,8 +488,6 @@ def _patch_loader_file_extension_filter(logger: logging.Logger) -> None:
         if _is_rank0():
             logger.info("[Qwen3VL Loader] Patched os.listdir to filter files when loading datasets")
 
-    except ImportError as e:
-        logger.warning(f"[Qwen3VL Loader] Failed to import loader module: {e}")
     except Exception as e:
         logger.warning(f"[Qwen3VL Loader] Failed to patch loader: {e}")
 

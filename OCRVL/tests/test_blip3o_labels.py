@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """Test BLIP3o dataset label creation fix"""
-import sys
-from pathlib import Path
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
 
 import torch
-from transformers import AutoTokenizer
 from OCRVL.data.blip3o_dataset import BLIP3oAlignmentDataset
 from OCRVL.model.language_model.ocr_qwen3_vl import Qwen3VLOCRTextAdapter
+from transformers import AutoTokenizer
+
 
 def test_label_creation():
     """Test that labels are created correctly (vision tokens masked)"""

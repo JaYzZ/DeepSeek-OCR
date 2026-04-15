@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Key Principals
 1. DO NOT write random new .md to the repo, summarization should be in the chat
 2. DO NOT change any other reference repo's content, edit is forbidden
-3. DO NOT change the environment installation, the conda env is /share/project/xiyan/envs/ocrflow, any pip install should be passed for user validation
+3. DO NOT change the environment installation, the conda env is $ROOT_DIR/envs/ocrflow, any pip install should be passed for user validation
 4. DO NOT do this: `torch_dtype` is deprecated! Use `dtype` instead!
 5. **DO NOT use git commands that modify files** - `git checkout`, `git reset`, `git revert` without explicit approval
 6. **Import rules**: Always use absolute imports (e.g., `from vllm_thinking.runner_patch import ...`) NOT relative imports. Place all imports at the top of the file, never use inline/wild imports inside functions.

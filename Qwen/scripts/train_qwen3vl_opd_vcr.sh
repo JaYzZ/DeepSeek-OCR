@@ -3,7 +3,7 @@
 #
 # Usage:
 #   bash Qwen/scripts/train_qwen3vl_opd_vcr.sh
-#   bash Qwen/scripts/train_qwen3vl_opd_vcr.sh Qwen/configs/distillation/qwen3vl_opd_vcr_continuous.yaml
+#   bash Qwen/scripts/train_qwen3vl_opd_vcr.sh Qwen/configs/distillation/qwen3vl_opd_vcr.yaml
 
 set -euo pipefail
 
@@ -14,7 +14,7 @@ cd "$REPO_ROOT"
 
 PYTHON_BIN="$(qwen3vl_require_python_bin "$REPO_ROOT")"
 
-DEFAULT_CONFIG="$REPO_ROOT/Qwen/configs/distillation/qwen3vl_opd_vcr_continuous.yaml"
+DEFAULT_CONFIG="$REPO_ROOT/Qwen/configs/distillation/qwen3vl_opd_vcr.yaml"
 DEFAULT_RUNTIME_ENV_CONFIG="$REPO_ROOT/Qwen/configs/qwen3vl_runtime_env.yaml"
 DEFAULT_ACCELERATE_CONFIG="$REPO_ROOT/Qwen/configs/distillation/accelerate_zero2.yaml"
 

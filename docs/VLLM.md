@@ -4,14 +4,14 @@ This document is repo-focused. It explains how this repo uses upstream vLLM, whe
 
 Upstream repo:
 
-- `/share/project/xiyan/sources/vllm`
+- `$ROOT_DIR/sources/vllm`
 
 Repo-local overlay:
 
-- `/share/project/xiyan/sources/DeepSeek-OCR/vllm_thinking_plugin`
-- `/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/vllm_server.py`
-- `/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/vllm_utils.py`
-- `/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/backfill_transparent_eval.py`
+- `$ROOT_DIR/sources/DeepSeek-OCR/vllm_thinking_plugin`
+- `$ROOT_DIR/sources/DeepSeek-OCR/Qwen/scripts/vllm_server.py`
+- `$ROOT_DIR/sources/DeepSeek-OCR/Qwen/scripts/vllm_utils.py`
+- `$ROOT_DIR/sources/DeepSeek-OCR/Qwen/scripts/backfill_transparent_eval.py`
 
 The operating rule is:
 
@@ -23,7 +23,7 @@ The operating rule is:
 
 The common serving entrypoint is:
 
-- [`Qwen/scripts/vllm_server.py`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/vllm_server.py)
+- [`Qwen/scripts/vllm_server.py`](../Qwen/scripts/vllm_server.py)
 
 That script:
 
@@ -44,10 +44,10 @@ Backfill and benchmark paths use the same general contract:
 
 Main files:
 
-- [`vllm_thinking_plugin/vllm_thinking/__init__.py`](/share/project/xiyan/sources/DeepSeek-OCR/vllm_thinking_plugin/vllm_thinking/__init__.py)
-- [`vllm_thinking_plugin/vllm_thinking/runner_patch.py`](/share/project/xiyan/sources/DeepSeek-OCR/vllm_thinking_plugin/vllm_thinking/runner_patch.py)
-- [`vllm_thinking_plugin/vllm_thinking/qwen3vl_patch_embed_patch.py`](/share/project/xiyan/sources/DeepSeek-OCR/vllm_thinking_plugin/vllm_thinking/qwen3vl_patch_embed_patch.py)
-- [`vllm_thinking_plugin/setup.py`](/share/project/xiyan/sources/DeepSeek-OCR/vllm_thinking_plugin/setup.py)
+- [`vllm_thinking_plugin/vllm_thinking/__init__.py`](../vllm_thinking_plugin/vllm_thinking/__init__.py)
+- [`vllm_thinking_plugin/vllm_thinking/runner_patch.py`](../vllm_thinking_plugin/vllm_thinking/runner_patch.py)
+- [`vllm_thinking_plugin/vllm_thinking/qwen3vl_patch_embed_patch.py`](../vllm_thinking_plugin/vllm_thinking/qwen3vl_patch_embed_patch.py)
+- [`vllm_thinking_plugin/setup.py`](../vllm_thinking_plugin/setup.py)
 
 This is our actual vLLM patch layer.
 
@@ -71,11 +71,11 @@ Those remain upstream.
 
 The plugin entrypoint is exposed by:
 
-- [`vllm_thinking_plugin/setup.py`](/share/project/xiyan/sources/DeepSeek-OCR/vllm_thinking_plugin/setup.py)
+- [`vllm_thinking_plugin/setup.py`](../vllm_thinking_plugin/setup.py)
 
 The runtime bootstrap is:
 
-- [`vllm_thinking_plugin/vllm_thinking/__init__.py`](/share/project/xiyan/sources/DeepSeek-OCR/vllm_thinking_plugin/vllm_thinking/__init__.py)
+- [`vllm_thinking_plugin/vllm_thinking/__init__.py`](../vllm_thinking_plugin/vllm_thinking/__init__.py)
 
 Its logic is:
 
@@ -92,7 +92,7 @@ This means the plugin has two layers:
 
 File:
 
-- [`vllm_thinking_plugin/vllm_thinking/qwen3vl_patch_embed_patch.py`](/share/project/xiyan/sources/DeepSeek-OCR/vllm_thinking_plugin/vllm_thinking/qwen3vl_patch_embed_patch.py)
+- [`vllm_thinking_plugin/vllm_thinking/qwen3vl_patch_embed_patch.py`](../vllm_thinking_plugin/vllm_thinking/qwen3vl_patch_embed_patch.py)
 
 Purpose:
 
@@ -107,7 +107,7 @@ It is not the right place for generation-mode logic.
 
 File:
 
-- [`vllm_thinking_plugin/vllm_thinking/runner_patch.py`](/share/project/xiyan/sources/DeepSeek-OCR/vllm_thinking_plugin/vllm_thinking/runner_patch.py)
+- [`vllm_thinking_plugin/vllm_thinking/runner_patch.py`](../vllm_thinking_plugin/vllm_thinking/runner_patch.py)
 
 Purpose:
 
@@ -124,11 +124,11 @@ This is the most version-sensitive part of the vLLM overlay.
 
 Shared env loader:
 
-- [`Qwen/scripts/vllm_utils.py`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/vllm_utils.py)
+- [`Qwen/scripts/vllm_utils.py`](../Qwen/scripts/vllm_utils.py)
 
 Shared runtime yaml:
 
-- [`Qwen/configs/qwen3vl_runtime_env.yaml`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/configs/qwen3vl_runtime_env.yaml)
+- [`Qwen/configs/qwen3vl_runtime_env.yaml`](../Qwen/configs/qwen3vl_runtime_env.yaml)
 
 Important env values for vLLM:
 
@@ -149,7 +149,7 @@ If token ids or thinking behavior change in training, these values must stay ali
 
 Server wrapper:
 
-- [`Qwen/scripts/vllm_server.py`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/vllm_server.py)
+- [`Qwen/scripts/vllm_server.py`](../Qwen/scripts/vllm_server.py)
 
 This file owns:
 
@@ -172,7 +172,7 @@ This is not the right place for low-level decode loop patching.
 
 Main file:
 
-- [`Qwen/scripts/backfill_transparent_eval.py`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/backfill_transparent_eval.py)
+- [`Qwen/scripts/backfill_transparent_eval.py`](../Qwen/scripts/backfill_transparent_eval.py)
 
 This script uses the same vLLM-side conventions:
 
@@ -270,7 +270,7 @@ Reasons:
 
 Most fragile repo-local file:
 
-- [`vllm_thinking_plugin/vllm_thinking/runner_patch.py`](/share/project/xiyan/sources/DeepSeek-OCR/vllm_thinking_plugin/vllm_thinking/runner_patch.py)
+- [`vllm_thinking_plugin/vllm_thinking/runner_patch.py`](../vllm_thinking_plugin/vllm_thinking/runner_patch.py)
 
 Why:
 
@@ -290,11 +290,11 @@ When changing it:
 
 If vLLM behavior is wrong, inspect in this order:
 
-1. [`Qwen/scripts/vllm_server.py`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/vllm_server.py)
-2. [`Qwen/scripts/vllm_utils.py`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/vllm_utils.py)
-3. [`Qwen/configs/qwen3vl_runtime_env.yaml`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/configs/qwen3vl_runtime_env.yaml)
-4. [`vllm_thinking_plugin/vllm_thinking/__init__.py`](/share/project/xiyan/sources/DeepSeek-OCR/vllm_thinking_plugin/vllm_thinking/__init__.py)
-5. [`vllm_thinking_plugin/vllm_thinking/runner_patch.py`](/share/project/xiyan/sources/DeepSeek-OCR/vllm_thinking_plugin/vllm_thinking/runner_patch.py)
+1. [`Qwen/scripts/vllm_server.py`](../Qwen/scripts/vllm_server.py)
+2. [`Qwen/scripts/vllm_utils.py`](../Qwen/scripts/vllm_utils.py)
+3. [`Qwen/configs/qwen3vl_runtime_env.yaml`](../Qwen/configs/qwen3vl_runtime_env.yaml)
+4. [`vllm_thinking_plugin/vllm_thinking/__init__.py`](../vllm_thinking_plugin/vllm_thinking/__init__.py)
+5. [`vllm_thinking_plugin/vllm_thinking/runner_patch.py`](../vllm_thinking_plugin/vllm_thinking/runner_patch.py)
 6. relevant upstream code under `../vllm/vllm`
 
 ## Short Policy

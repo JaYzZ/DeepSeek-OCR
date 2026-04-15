@@ -4,13 +4,13 @@ This document is repo-focused. It explains how this repo uses upstream LlamaFact
 
 Upstream repo:
 
-- `/share/project/xiyan/sources/LlamaFactory`
+- `$ROOT_DIR/sources/LlamaFactory`
 
 Repo-local overlay:
 
-- `/share/project/xiyan/sources/DeepSeek-OCR/Qwen/llamafactory`
-- `/share/project/xiyan/sources/DeepSeek-OCR/sitecustomize.py`
-- `/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/train_*.sh`
+- `$ROOT_DIR/sources/DeepSeek-OCR/Qwen/llamafactory`
+- `$ROOT_DIR/sources/DeepSeek-OCR/sitecustomize.py`
+- `$ROOT_DIR/sources/DeepSeek-OCR/Qwen/scripts/train_*.sh`
 
 The operating rule is:
 
@@ -22,8 +22,8 @@ The operating rule is:
 
 Training usually starts from one of:
 
-- [`Qwen/scripts/train_qwen3vl_r1onevision.sh`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/train_qwen3vl_r1onevision.sh)
-- [`Qwen/scripts/train_qwen3vl_chimera.sh`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/train_qwen3vl_chimera.sh)
+- [`Qwen/scripts/train_qwen3vl_r1onevision.sh`](../Qwen/scripts/train_qwen3vl_r1onevision.sh)
+- [`Qwen/scripts/train_qwen3vl_chimera.sh`](../Qwen/scripts/train_qwen3vl_chimera.sh)
 
 These wrappers:
 
@@ -35,7 +35,7 @@ These wrappers:
 
 Because this repo root is on `PYTHONPATH`, Python imports:
 
-- [`sitecustomize.py`](/share/project/xiyan/sources/DeepSeek-OCR/sitecustomize.py)
+- [`sitecustomize.py`](../sitecustomize.py)
 
 That file is the patch entrypoint.
 
@@ -43,7 +43,7 @@ That file is the patch entrypoint.
 
 File:
 
-- [`sitecustomize.py`](/share/project/xiyan/sources/DeepSeek-OCR/sitecustomize.py)
+- [`sitecustomize.py`](../sitecustomize.py)
 
 Purpose:
 
@@ -60,10 +60,10 @@ This is the main reason we can keep upstream LlamaFactory untouched.
 
 Main files:
 
-- [`Qwen/llamafactory/integration.py`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/llamafactory/integration.py)
-- [`Qwen/llamafactory/vae_callback.py`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/llamafactory/vae_callback.py)
-- [`Qwen/llamafactory/curriculum_callback.py`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/llamafactory/curriculum_callback.py)
-- [`Qwen/llamafactory/transparent_eval_callback.py`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/llamafactory/transparent_eval_callback.py)
+- [`Qwen/llamafactory/integration.py`](../Qwen/llamafactory/integration.py)
+- [`Qwen/llamafactory/vae_callback.py`](../Qwen/llamafactory/vae_callback.py)
+- [`Qwen/llamafactory/curriculum_callback.py`](../Qwen/llamafactory/curriculum_callback.py)
+- [`Qwen/llamafactory/transparent_eval_callback.py`](../Qwen/llamafactory/transparent_eval_callback.py)
 
 This is our actual integration layer.
 
@@ -119,9 +119,9 @@ Dataset builders in this repo create fields upstream LlamaFactory does not nativ
 
 Main builders:
 
-- [`Qwen/scripts/build_r1_onevision_thinking.py`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/build_r1_onevision_thinking.py)
-- [`Qwen/scripts/build_chimera_thinking.py`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/build_chimera_thinking.py)
-- [`Qwen/scripts/build_deepvision_thinking.py`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/build_deepvision_thinking.py)
+- [`Qwen/data/build_r1onevision_thinking.py`](../Qwen/data/build_r1onevision_thinking.py)
+- [`Qwen/data/build_chimera_thinking.py`](../Qwen/data/build_chimera_thinking.py)
+- [`Qwen/data/build_deepvision_thinking.py`](../Qwen/data/build_deepvision_thinking.py)
 
 Important extra fields:
 
@@ -133,7 +133,7 @@ Important extra fields:
 
 The meaning of those fields is implemented in:
 
-- [`Qwen/llamafactory/integration.py`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/llamafactory/integration.py)
+- [`Qwen/llamafactory/integration.py`](../Qwen/llamafactory/integration.py)
 
 So if a dataset field changes, the first place to inspect is our repo-local integration layer, not upstream LlamaFactory.
 
@@ -141,7 +141,7 @@ So if a dataset field changes, the first place to inspect is our repo-local inte
 
 Shared runtime env yaml:
 
-- [`Qwen/configs/qwen3vl_runtime_env.yaml`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/configs/qwen3vl_runtime_env.yaml)
+- [`Qwen/configs/qwen3vl_runtime_env.yaml`](../Qwen/configs/qwen3vl_runtime_env.yaml)
 
 The training wrappers export those values as environment variables, such as:
 
@@ -160,7 +160,7 @@ If training behavior changes and inference must stay aligned, this file is usual
 
 The trainer patching entrypoint is inside:
 
-- [`Qwen/llamafactory/integration.py`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/llamafactory/integration.py)
+- [`Qwen/llamafactory/integration.py`](../Qwen/llamafactory/integration.py)
 
 Important design:
 
@@ -211,7 +211,7 @@ Examples:
 
 Edit:
 
-- dataset builder in `Qwen/scripts/build_*.py`
+- dataset builder in `Qwen/data/build_*.py`
 - `Qwen/llamafactory/integration.py`
 
 Examples:
@@ -254,7 +254,7 @@ Reasons:
 
 Most fragile repo-local file:
 
-- [`Qwen/llamafactory/integration.py`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/llamafactory/integration.py)
+- [`Qwen/llamafactory/integration.py`](../Qwen/llamafactory/integration.py)
 
 Why:
 
@@ -273,10 +273,10 @@ When changing it:
 
 If training behavior is wrong, inspect in this order:
 
-1. [`Qwen/scripts/train_qwen3vl_r1onevision.sh`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/train_qwen3vl_r1onevision.sh)
-2. [`Qwen/configs/qwen3vl_runtime_env.yaml`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/configs/qwen3vl_runtime_env.yaml)
-3. [`sitecustomize.py`](/share/project/xiyan/sources/DeepSeek-OCR/sitecustomize.py)
-4. [`Qwen/llamafactory/integration.py`](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/llamafactory/integration.py)
+1. [`Qwen/scripts/train_qwen3vl_r1onevision.sh`](../Qwen/scripts/train_qwen3vl_r1onevision.sh)
+2. [`Qwen/configs/qwen3vl_runtime_env.yaml`](../Qwen/configs/qwen3vl_runtime_env.yaml)
+3. [`sitecustomize.py`](../sitecustomize.py)
+4. [`Qwen/llamafactory/integration.py`](../Qwen/llamafactory/integration.py)
 5. the relevant upstream path under `../LlamaFactory/src/llamafactory`
 
 ## Short Policy

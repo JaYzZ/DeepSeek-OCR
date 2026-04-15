@@ -130,7 +130,7 @@ maturin 1.4.0 (or newer)
 ### 5.1 Navigate to Vello Renderer Directory
 
 ```bash
-cd /share/project/xiyan/sources/DeepSeek-OCR/Renderer
+cd $ROOT_DIR/sources/DeepSeek-OCR/Renderer
 ```
 
 ### 5.2 Build and Install
@@ -218,7 +218,7 @@ print(f'✓ Rendered {len(images)} multilingual images')
 ### 7.1 Benchmark All Renderers
 
 ```bash
-cd /share/project/xiyan/sources/DeepSeek-OCR/OCRFlow
+cd $ROOT_DIR/sources/DeepSeek-OCR/OCRFlow
 python scripts/benchmark_renderers.py
 ```
 

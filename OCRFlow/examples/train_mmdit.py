@@ -55,19 +55,16 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
+import swanlab
 
-# SwanLab for experiment tracking
-try:
-    import swanlab
-    SWANLAB_AVAILABLE = True
-except ImportError:
-    SWANLAB_AVAILABLE = False
+SWANLAB_AVAILABLE = True
 
 # Add project root to path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from OCRFlow.models.mmdit_scratch import create_mmdit_scratch
+from project_paths import hf_path
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,9 +78,9 @@ def parse_args():
 
     # Dataset
     parser.add_argument("--dataset_type", type=str, default="fineweb", choices=["fineweb", "openwebmath", "multi"])
-    parser.add_argument("--fineweb_path", type=str, default="/share/project/xiyan/huggingface/HuggingFaceFW/fineweb-edu")
+    parser.add_argument("--fineweb_path", type=str, default=str(hf_path("HuggingFaceFW", "fineweb-edu")))
     parser.add_argument("--fineweb_subset", type=str, default="10BT", choices=["10BT", "100BT", "350BT"])
-    parser.add_argument("--openwebmath_path", type=str, default="/share/project/xiyan/huggingface/open-web-math/open-web-math")
+    parser.add_argument("--openwebmath_path", type=str, default=str(hf_path("open-web-math", "open-web-math")))
     parser.add_argument("--fineweb_weight", type=float, default=0.7)
     parser.add_argument("--openwebmath_weight", type=float, default=0.3)
     parser.add_argument("--cache_dir", type=str, default=None)

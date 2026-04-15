@@ -23,6 +23,7 @@ from PIL import Image
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 from transformers.integrations import is_fsdp_managed_module
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from project_paths import get_deepseek_ocr_dir
 
 logger = logging.getLogger(__name__)
 _WARNED_KEYS: set[str] = set()
@@ -59,7 +60,7 @@ class QwenTransparentEvalCallback(TrainerCallback):
         self.max_new_tokens = int(os.environ.get("QWEN3VL_TRANSPARENT_EVAL_MAX_NEW_TOKENS", "2048"))
         self.temperature = float(os.environ.get("QWEN3VL_TRANSPARENT_EVAL_TEMPERATURE", "0.0"))
         self.limit = os.environ.get("QWEN3VL_TRANSPARENT_EVAL_LIMIT", "")
-        self.repo_root = os.environ.get("REPO_ROOT", "/share/project/xiyan/sources/DeepSeek-OCR")
+        self.repo_root = str(get_deepseek_ocr_dir())
 
         logger.info("[QwenTransparentEval] Initialized - will auto-enable when eval_dataset='transparent_eval'")
         logger.info(f"[QwenTransparentEval] Config: max_tokens={self.max_new_tokens}, temp={self.temperature}, limit={self.limit}")

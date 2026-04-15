@@ -11,19 +11,17 @@ Shows 1x3 layout:
 import argparse
 import base64
 import json
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import List, Dict
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from markdown import markdown
 
-try:
-    from markdown import markdown
-    HAS_MARKDOWN = True
-except ImportError:
-    HAS_MARKDOWN = False
-    markdown = lambda x: x  # Fallback: return as-is
+HAS_MARKDOWN = True
 
 
 def load_jsonl_samples(jsonl_path: Path, num_samples: int = 5) -> List[Dict]:
@@ -143,9 +141,6 @@ def render_markdown_html(md_text: str, width: int = 600) -> np.ndarray:
     """
 
     # Try to use wkhtmltoimage if available
-    import subprocess
-    import tempfile
-
     with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False) as f:
         html_path = f.name
         f.write(full_html)

@@ -46,6 +46,7 @@ from tqdm import tqdm
 # Add project root
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
+from project_paths import hf_path
 
 logging.basicConfig(
     level=logging.INFO,
@@ -145,10 +146,10 @@ def main():
     parser.add_argument("--dataset_type", type=str, default="fineweb",
                        choices=["fineweb", "openwebmath", "multi"])
     parser.add_argument("--fineweb_path", type=str,
-                       default="/share/project/xiyan/huggingface/HuggingFaceFW/fineweb-edu")
+                       default=str(hf_path("HuggingFaceFW", "fineweb-edu")))
     parser.add_argument("--fineweb_subset", type=str, default="10BT")
     parser.add_argument("--openwebmath_path", type=str,
-                       default="/share/project/xiyan/huggingface/open-web-math/open-web-math")
+                       default=str(hf_path("open-web-math", "open-web-math")))
 
     # Chunking
     parser.add_argument("--target_words", type=int, default=500)

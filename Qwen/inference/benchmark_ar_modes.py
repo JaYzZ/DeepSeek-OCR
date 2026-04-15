@@ -5,6 +5,7 @@ import time
 import argparse
 
 os.environ["VLLM_THINKING"] = "1"
+from project_paths import hf_path
 
 from PIL import Image
 from qwen_vl_utils import process_vision_info
@@ -12,7 +13,7 @@ from transformers import AutoProcessor, AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.v1.engine import LoRARequest
 
-BASE_MODEL = "/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking"
+BASE_MODEL = str(hf_path("Qwen", "Qwen3-VL-2B-Thinking"))
 
 
 def run_benchmark(llm, tokenizer, processor, image, question, num_runs=20, use_continuous_ar=True, lora_request=None):
@@ -85,7 +86,7 @@ def main():
     processor = AutoProcessor.from_pretrained(BASE_MODEL, trust_remote_code=True)
 
     # Test image
-    image = Image.open("/share/project/xiyan/huggingface/liuhaotian/LLaVA-Pretrain/images/00293/002933218.jpg").convert('RGB')
+    image = Image.open(hf_path("liuhaotian", "LLaVA-Pretrain", "images", "00293", "002933218.jpg")).convert('RGB')
     question = "What's in this image?"
 
     print(f"\n{'='*60}")

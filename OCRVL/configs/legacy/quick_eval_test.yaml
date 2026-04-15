@@ -2,7 +2,7 @@
 ### Changes: max_samples=50, eval_steps=10, save_steps=10, max_steps=30
 
 ### model
-model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/OCRVL/checkpoints/OCR-Qwen3-VL-2B
+model_name_or_path: OCRVL/checkpoints/OCR-Qwen3-VL-2B
 image_max_pixels: 262144
 video_max_pixels: 16384
 trust_remote_code: true

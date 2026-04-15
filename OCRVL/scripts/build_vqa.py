@@ -29,10 +29,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Tuple
 
 from PIL import Image
+from Renderer import VELLO_AVAILABLE, VelloRenderer
 
 # Add repository root to path
 _REPO_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
+from project_paths import hf_path
 
 
 VQA_INSTRUCTION_TEMPLATES = [
@@ -50,16 +52,11 @@ def _get_vello_renderer(image_size=(640, 640), preserve_newlines=False):
     """Get cached Vello renderer instance"""
     global _vello_renderer
     if _vello_renderer is None:
-        try:
-            from Renderer import VelloRenderer, VELLO_AVAILABLE
-            if VELLO_AVAILABLE:
-                _vello_renderer = VelloRenderer(width=image_size[0], height=image_size[1], padding=20, preserve_newlines=preserve_newlines)
-                print(f"[Vello] VelloRenderer initialized (size={image_size})")
-            else:
-                print(f"[Vello] VelloRenderer not available")
-                return None
-        except ImportError:
-            print(f"[Vello] Failed to import VelloRenderer")
+        if VELLO_AVAILABLE:
+            _vello_renderer = VelloRenderer(width=image_size[0], height=image_size[1], padding=20, preserve_newlines=preserve_newlines)
+            print(f"[Vello] VelloRenderer initialized (size={image_size})")
+        else:
+            print(f"[Vello] VelloRenderer not available")
             return None
     return _vello_renderer
 
@@ -407,13 +404,13 @@ def main():
     parser.add_argument(
         "--llava-json",
         type=str,
-        default="/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json",
+        default=str(hf_path("liuhaotian", "LLaVA-Instruct-150K", "llava_v1_5_mix665k.json")),
         help="Path to LLaVA-Instruct JSON file",
     )
     parser.add_argument(
         "--llava-images",
         type=str,
-        default="/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images",
+        default=str(hf_path("liuhaotian", "LLaVA-Instruct-150K", "images")),
         help="Path to LLaVA images directory",
     )
     parser.add_argument(

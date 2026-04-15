@@ -18,11 +18,13 @@ Current implementation state:
 
 - Qwen3-VL now defaults to the original Hugging Face checkpoint, not the old linearized checkpoint.
 - Patch-embed is fixed by monkey-patching the original Qwen3-VL path; the linearized option is retained only for compatibility.
+- Qwen-owned Qwen-VL encoder helpers now live under [Qwen/encoder](encoder).
+- Qwen-owned generic vLLM decoders now live under [Qwen/decoder](decoder).
 - R1-OneVision SFT now runs a 3-stage curriculum split by the wrapper.
 - Stage 2 is true main-path `vae` training without normal token CE.
 - Stage 3 keeps the frozen VAE active in forward/loss so LoRA realigns to the trained latent policy.
 - The SFT wrapper now explicitly hands `vae.safetensors` from stage 2 into later stages.
-- The Qwen shell launchers share a common helper library at [qwen3vl_common.sh](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/qwen3vl_common.sh), so command syntax stayed stable while duplicated bootstrap logic was removed.
+- The Qwen shell launchers share a common helper library at [qwen3vl_common.sh](scripts/qwen3vl_common.sh), so command syntax stayed stable while duplicated bootstrap logic was removed.
 
 ## Active Launch Commands
 
@@ -44,15 +46,15 @@ tmux new-session -d -s chimera_gspo 'INIT_LORA_PATH=Qwen/checkpoints/qwen3vl-2b/
 
 Entry files:
 
-- [train_qwen3vl_r1onevision.sh](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/train_qwen3vl_r1onevision.sh)
-- [qwen3vl_r1onevision_thinking.yaml](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/configs/qwen3vl_r1onevision_thinking.yaml)
-- [qwen3vl_runtime_env.yaml](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/configs/qwen3vl_runtime_env.yaml)
-- [train_qwen3vl_dataset_mix.sh](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/train_qwen3vl_dataset_mix.sh)
-- [integration.py](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/llamafactory/integration.py)
+- [train_qwen3vl_r1onevision.sh](scripts/train_qwen3vl_r1onevision.sh)
+- [qwen3vl_r1onevision_thinking.yaml](configs/qwen3vl_r1onevision_thinking.yaml)
+- [qwen3vl_runtime_env.yaml](configs/qwen3vl_runtime_env.yaml)
+- [train_qwen3vl_dataset_mix.sh](scripts/train_qwen3vl_dataset_mix.sh)
+- [integration.py](llamafactory/integration.py)
 
 The wrapper:
 
-- requires `/share/project/xiyan/envs/ocrflow/bin/python`
+- requires `$ROOT_DIR/envs/ocrflow/bin/python`
 - snapshots the main config and runtime env config into the run directory
 - materializes dataset mixtures and optional per-dataset ratios
 - sets latent-runtime env vars used by training, backfill, and benchmark subprocesses
@@ -65,11 +67,11 @@ The wrapper:
 
 Entry files:
 
-- [train_qwen3vl_chimera_gspo.sh](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/train_qwen3vl_chimera_gspo.sh)
-- [chimera_gspo.yaml](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/configs/rl/chimera_gspo.yaml)
-- [run_verl_ppo.py](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/verl/run_verl_ppo.py)
-- [chimera_gspo_reward.py](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/verl/chimera_gspo_reward.py)
-- [build_chimera_verl_dataset.py](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/data/build_chimera_verl_dataset.py)
+- [train_qwen3vl_chimera_gspo.sh](scripts/train_qwen3vl_chimera_gspo.sh)
+- [chimera_gspo.yaml](configs/rl/chimera_gspo.yaml)
+- [run_verl_ppo.py](verl/run_verl_ppo.py)
+- [chimera_gspo_reward.py](verl/chimera_gspo_reward.py)
+- [build_chimera_verl_dataset.py](data/build_chimera_verl_dataset.py)
 
 The RL wrapper:
 
@@ -84,11 +86,11 @@ The RL wrapper:
 
 ### Model and Training Config
 
-The default training config is [qwen3vl_r1onevision_thinking.yaml](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/configs/qwen3vl_r1onevision_thinking.yaml).
+The default training config is [qwen3vl_r1onevision_thinking.yaml](configs/qwen3vl_r1onevision_thinking.yaml).
 
 Current defaults:
 
-- base model: `/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking`
+- base model: `$ROOT_DIR/huggingface/Qwen/Qwen3-VL-2B-Thinking`
 - stage: `sft`
 - finetuning: LoRA
 - LoRA rank/alpha/dropout: `8 / 16 / 0.05`
@@ -111,7 +113,7 @@ Important wrapper behavior:
 
 ### Dataset Contract
 
-The config references dataset `r1_onevision_thinking`, which is defined in [dataset_info.json](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/data/dataset_info.json) and currently points to:
+The config references dataset `r1_onevision_thinking`, which is defined in [dataset_info.json](data/dataset_info.json) and currently points to:
 
 - `Qwen/data/sft/r1ov_thinking.jsonl`
 
@@ -125,27 +127,23 @@ Expected fields:
 - `cot_chunk_token_ids`
 - `num_latent_steps`
 
-Current dataset-info caveat:
-
-- [dataset_info.json](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/data/dataset_info.json) still maps `cot_token_ids`, while the active builder and latent training path use `cot_chunk_token_ids`. Treat `cot_chunk_token_ids` as the real contract in the code path.
-
 ### Building the SFT Dataset
 
 Builder:
 
-- [build_r1_onevision_thinking.py](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/data/build_r1_onevision_thinking.py)
+- [build_r1onevision_thinking.py](data/build_r1onevision_thinking.py)
 
 Recommended two-phase build:
 
 ```bash
-python Qwen/data/build_r1_onevision_thinking.py --render-only --all
-CUDA_VISIBLE_DEVICES=0 python Qwen/data/build_r1_onevision_thinking.py --encode-only --all
+python Qwen/data/build_r1onevision_thinking.py --render-only --all
+CUDA_VISIBLE_DEVICES=0 python Qwen/data/build_r1onevision_thinking.py --encode-only --all
 ```
 
 Multi-GPU encode example:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 python Qwen/data/build_r1_onevision_thinking.py --encode-only --all --num-gpus 4
+CUDA_VISIBLE_DEVICES=0,1,2,3 python Qwen/data/build_r1onevision_thinking.py --encode-only --all --num-gpus 4
 ```
 
 Builder behavior:
@@ -173,11 +171,11 @@ At train time:
 4. Latent-region CE can also supervise the expanded positions.
 5. Hidden-state latent losses are computed on shifted hidden states around those positions.
 
-Implementation lives in [integration.py](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/llamafactory/integration.py).
+Implementation lives in [integration.py](llamafactory/integration.py).
 
 ### Loss Terms
 
-The runtime env config in [qwen3vl_runtime_env.yaml](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/configs/qwen3vl_runtime_env.yaml) is the shared source of truth for latent-runtime behavior used by:
+The runtime env config in [qwen3vl_runtime_env.yaml](configs/qwen3vl_runtime_env.yaml) is the shared source of truth for latent-runtime behavior used by:
 
 - training wrappers
 - transparent backfill
@@ -202,13 +200,13 @@ What each loss term means in the active implementation:
 - `vae`: latent VAE negative log-likelihood against `latent_ground_truth`
 - `vae_ce`: second forward pass with sampled latent embeddings inserted, reusing the same CE targets
 
-The second forward implementation is in `_compute_pred_embed_forward_loss` inside [integration.py](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/llamafactory/integration.py).
+The second forward implementation is in `_compute_pred_embed_forward_loss` inside [integration.py](llamafactory/integration.py).
 
 ### Curriculum and Stage Splitting
 
 The SFT wrapper does not just pass the config through unchanged. It can split training into separate stage runs based on runtime curriculum boundaries.
 
-Current runtime defaults from [qwen3vl_runtime_env.yaml](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/configs/qwen3vl_runtime_env.yaml):
+Current runtime defaults from [qwen3vl_runtime_env.yaml](configs/qwen3vl_runtime_env.yaml):
 
 - `curriculum_enable: 1`
 - `curriculum_epochs: 0,1,2`
@@ -248,8 +246,8 @@ If training succeeds, the wrapper can launch:
 
 Relevant scripts:
 
-- [backfill_transparent_eval.py](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/inference/backfill_transparent_eval.py)
-- [run_all_benchmarks.py](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/evaluation/run_all_benchmarks.py)
+- [backfill_transparent_eval.py](inference/backfill_transparent_eval.py)
+- [run_all_benchmarks.py](evaluation/run_all_benchmarks.py)
 
 Current runtime defaults:
 
@@ -270,11 +268,11 @@ The wrapper also emits:
 
 Builder:
 
-- [build_chimera_verl_dataset.py](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/data/build_chimera_verl_dataset.py)
+- [build_chimera_verl_dataset.py](data/build_chimera_verl_dataset.py)
 
 Default source data:
 
-- `/share/project/xiyan/huggingface/TianHongZXY/CHIMERA/Qwen3.5-397B`
+- `$ROOT_DIR/huggingface/TianHongZXY/CHIMERA/Qwen3.5-397B`
 
 Default output:
 
@@ -284,7 +282,7 @@ Default output:
 Build command:
 
 ```bash
-/share/project/xiyan/envs/ocrflow/bin/python Qwen/data/build_chimera_verl_dataset.py --data-dir "/share/project/xiyan/huggingface/TianHongZXY/CHIMERA/Qwen3.5-397B"
+$ROOT_DIR/envs/ocrflow/bin/python Qwen/data/build_chimera_verl_dataset.py --data-dir "$ROOT_DIR/huggingface/TianHongZXY/CHIMERA/Qwen3.5-397B"
 ```
 
 Builder behavior:
@@ -306,12 +304,12 @@ Each RL record includes:
 
 ### RL Launcher Defaults
 
-The active wrapper is [train_qwen3vl_chimera_gspo.sh](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/train_qwen3vl_chimera_gspo.sh).
+The active wrapper is [train_qwen3vl_chimera_gspo.sh](scripts/train_qwen3vl_chimera_gspo.sh).
 
 Current defaults:
 
 - base config: `Qwen/configs/rl/chimera_gspo.yaml`
-- base model: `/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking`
+- base model: `$ROOT_DIR/huggingface/Qwen/Qwen3-VL-2B-Thinking`
 - dataset dir: `Qwen/data/chimera_verl`
 - images dir: `Qwen/data/chimera_images`
 - output dir: `Qwen/checkpoints/qwen3vl-2b/verl/chimera_gspo/run_*`
@@ -331,7 +329,7 @@ The wrapper:
 
 ### RL Config Semantics
 
-The project config is [chimera_gspo.yaml](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/configs/rl/chimera_gspo.yaml).
+The project config is [chimera_gspo.yaml](configs/rl/chimera_gspo.yaml).
 
 Key settings:
 
@@ -393,7 +391,7 @@ This allows the vLLM thinking plugin to find the same adapter directory, includi
 
 Reward implementation:
 
-- [chimera_gspo_reward.py](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/verl/chimera_gspo_reward.py)
+- [chimera_gspo_reward.py](verl/chimera_gspo_reward.py)
 
 Behavior:
 
@@ -419,7 +417,7 @@ The RL wrapper exports:
 - `VLLM_WORKER_MULTIPROC_METHOD=spawn`
 - `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1`
 
-[run_verl_ppo.py](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/verl/run_verl_ppo.py) then:
+[run_verl_ppo.py](verl/run_verl_ppo.py) then:
 
 - loads VERL's generated PPO base config
 - merges one or more project config overlays
@@ -463,37 +461,37 @@ Inference is intentionally not identical to SFT training:
 
 Do not assume the inference path emits the same placeholder formatting as the training target.
 
-## Linearized Qwen3-VL Base Checkpoint
+## Linearized Patch-Embed Compatibility
 
 This repo supports a linearized version of the Qwen3-VL patch embedding:
 
-- converter: [convert_qwen3vl_patch_embed_to_linear.py](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/modeling/convert_qwen3vl_patch_embed_to_linear.py)
+- converter: [convert_qwen3vl_patch_embed_to_linear.py](compat/convert_qwen3vl_patch_embed_to_linear.py)
 - default converted checkpoint: `Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking`
 
 Converter example:
 
 ```bash
-python Qwen/modeling/convert_qwen3vl_patch_embed_to_linear.py \
-  --src /share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking \
+python Qwen/compat/convert_qwen3vl_patch_embed_to_linear.py \
+  --src $ROOT_DIR/huggingface/Qwen/Qwen3-VL-2B-Thinking \
   --dst Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking
 ```
 
-This is the default base path used by both the active SFT and active Chimera RL wrappers.
+This converted checkpoint is optional. The active SFT, RL, evaluation, and visualization paths now default to the original Hugging Face Qwen3-VL checkpoint and apply compatibility patches at runtime.
 
 ## Key Files
 
 SFT:
 
-- [train_qwen3vl_r1onevision.sh](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/train_qwen3vl_r1onevision.sh)
-- [qwen3vl_r1onevision_thinking.yaml](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/configs/qwen3vl_r1onevision_thinking.yaml)
-- [qwen3vl_runtime_env.yaml](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/configs/qwen3vl_runtime_env.yaml)
-- [build_r1_onevision_thinking.py](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/data/build_r1_onevision_thinking.py)
-- [integration.py](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/llamafactory/integration.py)
+- [train_qwen3vl_r1onevision.sh](scripts/train_qwen3vl_r1onevision.sh)
+- [qwen3vl_r1onevision_thinking.yaml](configs/qwen3vl_r1onevision_thinking.yaml)
+- [qwen3vl_runtime_env.yaml](configs/qwen3vl_runtime_env.yaml)
+- [build_r1onevision_thinking.py](data/build_r1onevision_thinking.py)
+- [integration.py](llamafactory/integration.py)
 
 RL:
 
-- [train_qwen3vl_chimera_gspo.sh](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/scripts/train_qwen3vl_chimera_gspo.sh)
-- [chimera_gspo.yaml](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/configs/rl/chimera_gspo.yaml)
-- [run_verl_ppo.py](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/verl/run_verl_ppo.py)
-- [build_chimera_verl_dataset.py](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/data/build_chimera_verl_dataset.py)
-- [chimera_gspo_reward.py](/share/project/xiyan/sources/DeepSeek-OCR/Qwen/verl/chimera_gspo_reward.py)
+- [train_qwen3vl_chimera_gspo.sh](scripts/train_qwen3vl_chimera_gspo.sh)
+- [chimera_gspo.yaml](configs/rl/chimera_gspo.yaml)
+- [run_verl_ppo.py](verl/run_verl_ppo.py)
+- [build_chimera_verl_dataset.py](data/build_chimera_verl_dataset.py)
+- [chimera_gspo_reward.py](verl/chimera_gspo_reward.py)

@@ -45,6 +45,8 @@ from typing import Optional, Tuple, List
 import pandas as pd
 import torch
 import logging
+from Renderer import VelloRenderer
+from project_paths import get_deepseek_ocr_dir, hf_path
 
 # Add parent directory to path for imports
 script_dir = Path(__file__).parent.parent
@@ -55,13 +57,7 @@ sys.path.insert(0, str(repo_root))
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
-# Try to import VelloRenderer
-try:
-    from Renderer import VelloRenderer
-    VELLO_AVAILABLE = True
-except ImportError:
-    VELLO_AVAILABLE = False
-    logger.warning("VelloRenderer not available. Install with: cd Renderer && maturin develop --release")
+VELLO_AVAILABLE = True
 
 
 def get_hash_filename(dataset_name: str, sample_id: str, suffix: str) -> str:
@@ -484,10 +480,10 @@ Output Format:
     parser.add_argument('--max-samples', type=int, default=None,
                         help='Limit samples per dataset (for testing)')
     parser.add_argument('--base-dir',
-                        default='/share/project/xiyan/sources/DeepSeek-OCR',
+                        default=str(get_deepseek_ocr_dir()),
                         help='Base directory of OCRVL repository')
     parser.add_argument('--data-dir',
-                        default='/share/project/xiyan/huggingface/Fancy-MLLM/R1-Onevision',
+                        default=str(hf_path('Fancy-MLLM', 'R1-Onevision')),
                         help='Path to R1-Onevision data')
     parser.add_argument('--output-dir',
                         default='OCRVL/llamafactory/data',

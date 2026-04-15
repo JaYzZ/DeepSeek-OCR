@@ -1,17 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import numpy as np
 from PIL import Image
 import torch
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+from verl.utils.dataset.rl_dataset import RLHFDataset
 
 from Qwen.data import build_chimera_verl_dataset as chimera_build
 from Qwen.verl import chimera_gspo_reward
@@ -91,8 +84,6 @@ def test_build_chimera_record_keeps_incorrect_trace_rows(tmp_path):
 
 def test_rlhf_dataset_patch_preserves_structured_multimodal_content():
     _patch_rlhf_dataset_message_builder()
-
-    from verl.utils.dataset.rl_dataset import RLHFDataset
 
     dummy_dataset = object.__new__(RLHFDataset)
     dummy_dataset.prompt_key = "prompt"

@@ -1,11 +1,12 @@
 #!/bin/bash
 
 qwen3vl_require_python_bin() {
-    local repo_root="$1"
-    local python_bin="$repo_root/../../envs/ocrflow/bin/python"
+    local _deepseek_ocr_dir="$1"
+    local project_root="${ROOT_DIR:-/share/project/xiyan}"
+    local python_bin="$project_root/envs/ocrflow/bin/python"
     if [ ! -x "$python_bin" ]; then
         echo "❌ Python not found or not executable: $python_bin" >&2
-        echo "   Please ensure OCRFlow env exists at: $repo_root/../../envs/ocrflow" >&2
+        echo "   Please ensure OCRFlow env exists at: $project_root/envs/ocrflow" >&2
         return 1
     fi
     printf '%s\n' "$python_bin"

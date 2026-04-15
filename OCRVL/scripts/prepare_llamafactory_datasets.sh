@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PROJECT_ROOT="${ROOT_DIR:-/share/project/xiyan}"
 
 DATA_DIR="$REPO_ROOT/OCRVL/llamafactory/data"
 mkdir -p "$DATA_DIR"
@@ -13,8 +14,8 @@ if [ ! -f "$DATA_DIR/dataset_info.json" ]; then
   exit 1
 fi
 
-LLAVA_SRC="${LLAVA_SRC:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json}"
-COT_SRC="${COT_SRC:-/share/project/xiyan/huggingface/Xkev/LLaVA-CoT-100k/train.jsonl}"
+LLAVA_SRC="${LLAVA_SRC:-${PROJECT_ROOT}/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json}"
+COT_SRC="${COT_SRC:-${PROJECT_ROOT}/huggingface/Xkev/LLaVA-CoT-100k/train.jsonl}"
 
 if [ ! -f "$LLAVA_SRC" ]; then
   echo "ERROR: LLAVA_SRC not found: $LLAVA_SRC" >&2
@@ -34,4 +35,3 @@ echo "  - $DATA_DIR/llava_cot_100k_train.jsonl -> $COT_SRC"
 echo ""
 echo "Use with LlamaFactory configs:"
 echo "  dataset_dir: $DATA_DIR"
-

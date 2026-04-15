@@ -11,10 +11,11 @@ from typing import Any
 
 import datasets
 import pandas as pd
+from project_paths import deepseek_ocr_path, hf_path
 
 
-DEFAULT_DATA_DIR = Path("/share/project/xiyan/huggingface/skylenage/DeepVision-103K")
-DEFAULT_OUTPUT_DIR = Path("/share/project/xiyan/sources/DeepSeek-OCR/Qwen/data/deepvision_103k_verl")
+DEFAULT_DATA_DIR = hf_path("skylenage", "DeepVision-103K")
+DEFAULT_OUTPUT_DIR = deepseek_ocr_path("Qwen", "data", "deepvision_103k_verl")
 
 
 def _to_python(value: Any) -> Any:

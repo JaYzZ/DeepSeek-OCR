@@ -25,6 +25,7 @@ import json
 import sys
 from pathlib import Path
 from typing import Dict, Iterator, Optional
+from project_paths import sources_path
 
 # Add parent directory to path
 script_dir = Path(__file__).parent.parent
@@ -148,18 +149,18 @@ def main():
 Examples:
     # Build unified dataset from all splits
     python OCRVL/scripts/build_hiertext_bbox_ocr.py \\
-        --hiertext-dir /share/project/xiyan/sources/hiertext \\
+        --hiertext-dir $ROOT_DIR/sources/hiertext \\
         --output OCRVL/llamafactory/data/hiertext_unified.jsonl
 
     # Build with limited samples for testing
     python OCRVL/scripts/build_hiertext_bbox_ocr.py \\
-        --hiertext-dir /share/project/xiyan/sources/hiertext \\
+        --hiertext-dir $ROOT_DIR/sources/hiertext \\
         --output OCRVL/llamafactory/data/hiertext_unified.jsonl \\
         --max-samples 100
         """
     )
 
-    parser.add_argument('--hiertext-dir', default='/share/project/xiyan/sources/hiertext',
+    parser.add_argument('--hiertext-dir', default=str(sources_path('hiertext')),
                         help='Path to HierText directory containing train.jsonl, validation.jsonl, test.jsonl')
     parser.add_argument('--output', required=True,
                         help='Output unified JSONL file path')

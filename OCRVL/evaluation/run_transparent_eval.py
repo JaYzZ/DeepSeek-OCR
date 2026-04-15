@@ -6,7 +6,7 @@ Run transparent evaluation on an existing checkpoint without resuming training.
 This uses the same logic as TransparentEvalCallback but as a standalone script.
 
 Usage:
-    python run_transparent_eval_standalone.py \
+    python -m OCRVL.evaluation.run_transparent_eval \
         --checkpoint checkpoints/path/run_xyz/checkpoint-311 \
         --output checkpoints/path/run_xyz/eval_results
 """
@@ -15,21 +15,23 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+import traceback
 from pathlib import Path
 
-import torch
-from transformers import AutoTokenizer, AutoProcessor, AutoModelForVision2Seq
-
-# Add repository root to path
-_REPO_ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
-
-# Import template registration before loading model
 from OCRVL.llamafactory.qwen3_vl_ocrvl_template import register_ocrvl_qwen3_vl_template
-register_ocrvl_qwen3_vl_template()
-
 from OCRVL.llamafactory.transparent_eval_callback import TransparentEvalCallback
+from peft import PeftModel
+import torch
+from transformers import (
+    AutoModelForVision2Seq,
+    AutoProcessor,
+    AutoTokenizer,
+    TrainerState,
+    TrainingArguments,
+)
+
+_REPO_ROOT = Path(__file__).parent.parent.parent
+register_ocrvl_qwen3_vl_template()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -84,7 +86,6 @@ def main():
     os.environ["TRANSPARENT_EVAL_LIMIT"] = args.limit
     os.environ["TRANSPARENT_EVAL_MAX_NEW_TOKENS"] = str(args.max_new_tokens)
     os.environ["TRANSPARENT_EVAL_TEMPERATURE"] = str(args.temperature)
-    os.environ["REPO_ROOT"] = str(_REPO_ROOT)
 
     logger.info("="*80)
     logger.info("Standalone Transparent Evaluation")
@@ -132,7 +133,6 @@ def main():
             )
             # Load LoRA adapters
             logger.info(f"Loading LoRA adapters from: {checkpoint_path}")
-            from peft import PeftModel
             model = PeftModel.from_pretrained(model, checkpoint_path)
             model.merge_and_unload()  # Merge LoRA weights for inference
         else:
@@ -149,7 +149,6 @@ def main():
         logger.info("✓ Model loaded")
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
-        import traceback
         logger.error(traceback.format_exc())
         sys.exit(1)
 
@@ -165,8 +164,6 @@ def main():
         sys.exit(1)
 
     # Create fake TrainerState for callback
-    from transformers import TrainerState
-
     # Extract step number from checkpoint path (e.g., "checkpoint-311")
     checkpoint_name = checkpoint_path.name
     if checkpoint_name.startswith("checkpoint-"):
@@ -179,8 +176,6 @@ def main():
     state.global_step = step
 
     # Create fake TrainingArguments for callback
-    from transformers import TrainingArguments
-
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         report_to="none",
@@ -201,7 +196,6 @@ def main():
         logger.info("="*80)
     except Exception as e:
         logger.error(f"Evaluation failed: {e}")
-        import traceback
         logger.error(traceback.format_exc())
         sys.exit(1)
 

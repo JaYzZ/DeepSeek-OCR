@@ -13,7 +13,7 @@ Usage:
     from OCRFlow.training.openwebmath_dataset import create_openwebmath_dataloaders
 
     dataloader = create_openwebmath_dataloaders(
-        data_root="/share/project/xiyan/huggingface/open-web-math/open-web-math",
+        data_root="$ROOT_DIR/huggingface/open-web-math/open-web-math",
         server_url="http://localhost:8010",
         cache_dir="./vistok_cache_math",
     )
@@ -31,6 +31,7 @@ from typing import Optional, List
 import logging
 import pandas as pd
 import random
+from project_paths import hf_path
 
 logger = logging.getLogger(__name__)
 
@@ -355,7 +356,7 @@ if __name__ == "__main__":
 
     print("Testing OpenWebMathVistokDataset...")
 
-    data_root = "/share/project/xiyan/huggingface/open-web-math/open-web-math"
+    data_root = str(hf_path("open-web-math", "open-web-math"))
     cache_dir = "./test_cache_owm"
 
     try:

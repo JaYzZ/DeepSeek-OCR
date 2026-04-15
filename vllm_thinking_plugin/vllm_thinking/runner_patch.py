@@ -12,6 +12,7 @@ import sys
 import torch
 import torch.nn as nn
 from safetensors.torch import load_file
+from project_paths import hf_path
 
 from vllm_thinking.trace_store import record_request_step, reset_request_trace, save_request_trace_to_file
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -262,7 +263,7 @@ def apply_thinking_mode_patch():
                     logger.warning(f"[Thinking] Load VAE failed: {e}")
 
         # Try model path
-        model_path = os.environ.get("VLLM_MODEL_PATH", "/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking")
+        model_path = os.environ.get("VLLM_MODEL_PATH", str(hf_path("Qwen", "Qwen3-VL-2B-Thinking")))
         vae_path = os.path.join(model_path, "vae.safetensors")
         if os.path.exists(vae_path):
             try:

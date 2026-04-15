@@ -24,6 +24,7 @@ Two-phase workflow:
 """
 
 import argparse
+import io
 import json
 import logging
 import os
@@ -51,13 +52,14 @@ from Qwen.data.utils import (
     chunk_thinking_text,
     format_cot_subsequences,
 )
-from OCRVL.encoder.qwen3vl_encoder import Qwen3VLEncoder
+from Qwen.encoder import Qwen3VLEncoder
+from project_paths import hf_path
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_MODEL_PATH = "/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking"
+DEFAULT_MODEL_PATH = str(hf_path("Qwen", "Qwen3-VL-2B-Thinking"))
 PRIMARY_ANNOTATION_SOURCE = "q32-vision-anno"
 
 def _safe_name(x: str) -> str:
@@ -275,8 +277,6 @@ def main_render_only(args):
             query_path = images_dir / f"{query_name}.png"
             if not _is_valid_image_file(query_path):
                 try:
-                    import io
-
                     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
                     _atomic_save_png(img, query_path)
                 except Exception:
@@ -478,8 +478,8 @@ def main_encode_only(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Build DeepVision-103K thinking dataset for Qwen3VL")
-    parser.add_argument("--base-dir", default="/share/project/xiyan/sources/DeepSeek-OCR")
-    parser.add_argument("--data-dir", default="/share/project/xiyan/huggingface/skylenage/DeepVision-103K")
+    parser.add_argument("--base-dir", default=str(repo_root))
+    parser.add_argument("--data-dir", default=str(hf_path("skylenage", "DeepVision-103K")))
     parser.add_argument("--output-dir", default="Qwen/data")
     parser.add_argument("--images-dir", default="Qwen/data/deepvision_images")
     parser.add_argument("--metadata-file", default="metadata/deepvision_103k_metadata.jsonl")

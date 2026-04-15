@@ -23,6 +23,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+from project_paths import hf_path
 
 import torch
 from torch.amp import autocast
@@ -525,7 +526,7 @@ def main():
     parser.add_argument('--eval-samples', type=str, default='OCRVL/data/eval_samples.json',
                         help='Path to eval samples JSON')
     parser.add_argument('--image-base-dir', type=str,
-                        default='/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images',
+                        default=str(hf_path("liuhaotian", "LLaVA-Instruct-150K", "images")),
                         help='Base directory for images')
     parser.add_argument('--max-samples', type=int, default=10, help='Maximum samples to evaluate')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use')

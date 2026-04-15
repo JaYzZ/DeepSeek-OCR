@@ -6,7 +6,7 @@
 # The Thinking model includes special tokens for reasoning:
 # - <think> (151667): Opens thinking/reasoning section
 # - </think> (151668): Closes thinking/reasoning section
-model_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/OCRVL/checkpoints/OCR-Qwen3-VL-2B-Thinking
+model_name_or_path: OCRVL/checkpoints/OCR-Qwen3-VL-2B-Thinking
 image_max_pixels: 262144
 video_max_pixels: 16384
 trust_remote_code: true

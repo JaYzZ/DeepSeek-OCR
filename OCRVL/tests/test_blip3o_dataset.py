@@ -13,13 +13,14 @@ Usage:
 """
 
 import sys
-from pathlib import Path
-
-# Add project root
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
+import traceback
 
 import torch
+from project_paths import hf_path
+from OCRVL.data.blip3o_dataset import BLIP3oAlignmentDataset
+from OCRVL.model.language_model.ocr_qwen3_vl import Qwen3VLOCRTextAdapter
+from OCRVL.train import collate_fn
+from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 print("=" * 70)
@@ -29,7 +30,6 @@ print("=" * 70)
 # Test 1: Import dataset
 print("\n1. Importing BLIP3o dataset loader...")
 try:
-    from OCRVL.data.blip3o_dataset import BLIP3oAlignmentDataset
     print("✓ Import successful")
 except Exception as e:
     print(f"✗ Import failed: {e}")
@@ -39,8 +39,8 @@ except Exception as e:
 print("\n2. Loading small sample (100 samples, no OCR)...")
 try:
     dataset = BLIP3oAlignmentDataset(
-        short_caption_path="/share/project/xiyan/huggingface/BLIP3o/BLIP3o-Pretrain-Short-Caption/00000.tar",
-        long_caption_path="/share/project/xiyan/huggingface/BLIP3o/BLIP3o-Pretrain-Long-Caption/sa_000000.tar",
+        short_caption_path=str(hf_path("BLIP3o", "BLIP3o-Pretrain-Short-Caption", "00000.tar")),
+        long_caption_path=str(hf_path("BLIP3o", "BLIP3o-Pretrain-Long-Caption", "sa_000000.tar")),
         tokenizer=None,
         ocr_adapter=None,
         mix_ratio=0.5,
@@ -59,7 +59,6 @@ try:
 
 except Exception as e:
     print(f"✗ Dataset loading failed: {e}")
-    import traceback
     traceback.print_exc()
     sys.exit(1)
 
@@ -67,7 +66,7 @@ except Exception as e:
 print("\n3. Testing with tokenizer...")
 try:
     tokenizer = AutoTokenizer.from_pretrained(
-        "/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Instruct",
+        str(hf_path("Qwen", "Qwen3-VL-2B-Instruct")),
         trust_remote_code=True
     )
     print("✓ Tokenizer loaded")
@@ -78,8 +77,6 @@ except Exception as e:
 # Test 4: Load with OCR adapter (small sample)
 print("\n4. Testing with OCR adapter (may take 1-2 min to load encoder)...")
 try:
-    from OCRVL.model.language_model.ocr_qwen3_vl import Qwen3VLOCRTextAdapter
-
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     ocr_adapter = Qwen3VLOCRTextAdapter(
         encoder_model_path="deepseek-ai/DeepSeek-OCR",
@@ -90,8 +87,8 @@ try:
 
     # Create dataset with OCR
     dataset_with_ocr = BLIP3oAlignmentDataset(
-        short_caption_path="/share/project/xiyan/huggingface/BLIP3o/BLIP3o-Pretrain-Short-Caption/00000.tar",
-        long_caption_path="/share/project/xiyan/huggingface/BLIP3o/BLIP3o-Pretrain-Long-Caption/sa_000000.tar",
+        short_caption_path=str(hf_path("BLIP3o", "BLIP3o-Pretrain-Short-Caption", "00000.tar")),
+        long_caption_path=str(hf_path("BLIP3o", "BLIP3o-Pretrain-Long-Caption", "sa_000000.tar")),
         tokenizer=tokenizer,
         ocr_adapter=ocr_adapter,
         mix_ratio=0.5,
@@ -103,7 +100,6 @@ try:
 
 except Exception as e:
     print(f"✗ OCR adapter test failed: {e}")
-    import traceback
     traceback.print_exc()
     sys.exit(1)
 
@@ -131,16 +127,12 @@ try:
 
 except Exception as e:
     print(f"✗ Sample loading failed: {e}")
-    import traceback
     traceback.print_exc()
     sys.exit(1)
 
 # Test 6: Create dataloader
 print("\n6. Testing dataloader creation...")
 try:
-    from torch.utils.data import DataLoader
-    from OCRVL.train import collate_fn
-
     dataloader = DataLoader(
         dataset_with_ocr,
         batch_size=2,
@@ -157,7 +149,6 @@ try:
 
 except Exception as e:
     print(f"✗ Dataloader test failed: {e}")
-    import traceback
     traceback.print_exc()
     sys.exit(1)
 

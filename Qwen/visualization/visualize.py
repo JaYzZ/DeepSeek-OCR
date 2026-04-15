@@ -10,35 +10,36 @@ This script provides a centralized interface for all visualization tasks:
 - t-SNE/UMAP embeddings
 
 Usage:
-    python visualize.py single-image <image_path>
-    python visualize.py sam-comparison <image_path>
-    python visualize.py batch-sam <metadata_path>
-    python visualize.py layers <image_path> --encoder dpsk
-    python visualize.py embeddings <features.pkl>
+    python -m Qwen.visualization.visualize single-image <image_path>
+    python -m Qwen.visualization.visualize sam-comparison <image_path>
+    python -m Qwen.visualization.visualize batch-sam <metadata_path>
+    python -m Qwen.visualization.visualize layers <image_path> --encoder dpsk
+    python -m Qwen.visualization.visualize embeddings <features.pkl>
 """
 
-import sys
 import argparse
-from pathlib import Path
-from typing import Optional, List
 import json
+import pickle
+import sys
+import traceback
+from project_paths import get_deepseek_ocr_dir
+from pathlib import Path
 
-# Add Qwen directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
+import numpy as np
+from PIL import Image
 
-from vis_core import (
-    EncoderType, EncoderConfig, PathManager,
-    setup_logging, get_device,
+from .vis_core import EncoderType, setup_logging
+from .vis_features import (
+    FeatureSpec,
+    FeatureExtractor,
+    extract_layer_features,
 )
-from vis_features import (
-    FeatureExtractor, FeatureSpec,
-    extract_sam_comparison, extract_layer_features,
-)
-from vis_plots import (
-    SingleImageVisualizer, BatchVisualizer, EmbeddingVisualizer,
+from .vis_plots import (
+    BatchVisualizer,
+    EmbeddingVisualizer,
+    SingleImageVisualizer,
     plot_sam_single_image,
 )
-from PIL import Image
 
 
 def cmd_single_image(args):
@@ -127,8 +128,8 @@ def cmd_batch_sam(args):
     logger = setup_logging(args.verbose)
 
     # Load metadata
-    logger.info(f"Loading metadata from: {args.metadata}")
-    repo_root = Path("/share/project/xiyan/sources/DeepSeek-OCR")
+    logger.info(f"Loading metadata from: {args.metadata or 'default metadata file'}")
+    repo_root = get_deepseek_ocr_dir()
     metadata_path = repo_root / "OCRVL/llamafactory/data/ocrvl_transparent_eval.metadata.json"
 
     if args.metadata:
@@ -186,7 +187,6 @@ def cmd_batch_sam(args):
 
             except Exception as e:
                 logger.warning(f"  ✗ Failed: {e}")
-                import traceback
                 traceback.print_exc()
                 continue
 
@@ -246,8 +246,6 @@ def cmd_embeddings(args):
     """Create t-SNE/UMAP visualizations from feature file."""
     logger = setup_logging(args.verbose)
 
-    import pickle
-
     logger.info(f"Loading features from: {args.features}")
 
     with open(args.features, 'rb') as f:
@@ -297,19 +295,19 @@ def main():
         epilog="""
 Examples:
   # Visualize features for a single image
-  python visualize.py single-image image.jpg --encoder dpsk
+  python -m Qwen.visualization.visualize single-image image.jpg --encoder dpsk
 
   # SAM feature pipeline comparison
-  python visualize.py sam-comparison image.jpg
+  python -m Qwen.visualization.visualize sam-comparison image.jpg
 
   # Batch SAM visualization for transparent eval
-  python visualize.py batch-sam --metadata ocrvl_transparent_eval.metadata.json
+  python -m Qwen.visualization.visualize batch-sam --metadata ocrvl_transparent_eval.metadata.json
 
   # Multi-layer feature visualization
-  python visualize.py layers image.jpg --encoder qwen
+  python -m Qwen.visualization.visualize layers image.jpg --encoder qwen
 
   # t-SNE/UMAP embeddings from features file
-  python visualize.py embeddings features.pkl --method both
+  python -m Qwen.visualization.visualize embeddings features.pkl --method both
         """
     )
 
@@ -363,7 +361,6 @@ Examples:
             handler(args)
         except Exception as e:
             print(f"Error: {e}")
-            import traceback
             traceback.print_exc()
             sys.exit(1)
     else:

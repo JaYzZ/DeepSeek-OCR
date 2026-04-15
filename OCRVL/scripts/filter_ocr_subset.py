@@ -11,6 +11,7 @@ Can be used for both DPSK and Qwen3VL native training.
 import json
 import sys
 from pathlib import Path
+from project_paths import get_deepseek_ocr_dir
 
 # OCR tasks to include
 OCR_TASKS = {
@@ -68,7 +69,7 @@ def filter_ocr_subset(
 
 def main():
     # DPSK version - outputs to OCRVL/data
-    base_dir = Path("/share/project/xiyan/sources/DeepSeek-OCR")
+    base_dir = get_deepseek_ocr_dir()
 
     input_path = base_dir / "OCRVL/data/ocrvl_unified_sft.jsonl"
     output_path = base_dir / "OCRVL/data/ocrvl_ocr_supplement.jsonl"

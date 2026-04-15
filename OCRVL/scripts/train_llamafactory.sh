@@ -12,12 +12,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PROJECT_ROOT="${ROOT_DIR:-/share/project/xiyan}"
+cd "$REPO_ROOT"
 
 # Required python interpreter (OCRFlow env).
-PYTHON_BIN="$REPO_ROOT/../../envs/ocrflow/bin/python"
+PYTHON_BIN="$PROJECT_ROOT/envs/ocrflow/bin/python"
 if [ ! -x "$PYTHON_BIN" ]; then
   echo "❌ Python not found or not executable: $PYTHON_BIN" >&2
-  echo "   Please ensure OCRFlow env exists at: $REPO_ROOT/../../envs/ocrflow" >&2
+  echo "   Please ensure OCRFlow env exists at: $PROJECT_ROOT/envs/ocrflow" >&2
   exit 1
 fi
 
@@ -80,8 +82,8 @@ if [[ "$CONFIG_BASENAME" == *"unified_sft"* ]] || [[ "$CONFIG_BASENAME" == *"sft
         echo "========================================================================"
         echo ""
         "$PYTHON_BIN" "$REPO_ROOT/OCRVL/scripts/build_alignment_dataset_text_prompts.py" \
-            --doclaynet-json "${DOCLAYNET_JSON_PATH:-/share/project/xiyan/huggingface/docling-project/DocLayNet/DocLayNet_core_train.json}" \
-            --doclaynet-images "${DOCLAYNET_IMAGE_DIR:-/share/project/xiyan/huggingface/docling-project/DocLayNet/PNG}"
+            --doclaynet-json "${DOCLAYNET_JSON_PATH:-${PROJECT_ROOT}/huggingface/docling-project/DocLayNet/DocLayNet_core_train.json}" \
+            --doclaynet-images "${DOCLAYNET_IMAGE_DIR:-${PROJECT_ROOT}/huggingface/docling-project/DocLayNet/PNG}"
         if [ $? -ne 0 ]; then
             echo "❌ Failed to build alignment dataset"
             exit 1
@@ -101,8 +103,8 @@ if [[ "$CONFIG_BASENAME" == *"unified_sft"* ]] || [[ "$CONFIG_BASENAME" == *"sft
         if [ ! -f "$STANDARD_VQA_DATASET" ]; then
             "$PYTHON_BIN" "$REPO_ROOT/OCRVL/scripts/build_vqa.py" \
                 --mode standard \
-                --llava-json "${LLAVA_JSON:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json}" \
-                --llava-images "${LLAVA_IMAGES:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images}" \
+                --llava-json "${LLAVA_JSON:-${PROJECT_ROOT}/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json}" \
+                --llava-images "${LLAVA_IMAGES:-${PROJECT_ROOT}/huggingface/liuhaotian/LLaVA-Instruct-150K/images}" \
                 --output "$STANDARD_VQA_DATASET"
             if [ $? -ne 0 ]; then
                 echo "❌ Failed to build standard VQA dataset"
@@ -114,8 +116,8 @@ if [[ "$CONFIG_BASENAME" == *"unified_sft"* ]] || [[ "$CONFIG_BASENAME" == *"sft
         if [ ! -f "$VQA_DATASET" ]; then
             "$PYTHON_BIN" "$REPO_ROOT/OCRVL/scripts/build_vqa.py" \
                 --mode rendered \
-                --llava-json "${LLAVA_JSON:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json}" \
-                --llava-images "${LLAVA_IMAGES:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images}" \
+                --llava-json "${LLAVA_JSON:-${PROJECT_ROOT}/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json}" \
+                --llava-images "${LLAVA_IMAGES:-${PROJECT_ROOT}/huggingface/liuhaotian/LLaVA-Instruct-150K/images}" \
                 --output "$VQA_DATASET" \
                 --rendered-images-dir "$REPO_ROOT/OCRVL/data/ocrvl_rendered_conversations"
             if [ $? -ne 0 ]; then
@@ -179,8 +181,8 @@ elif [[ "$CONFIG_BASENAME" == *"alignment"* ]]; then
         echo "========================================================================"
         echo ""
         "$PYTHON_BIN" "$REPO_ROOT/OCRVL/scripts/build_alignment_dataset_text_prompts.py" \
-            --doclaynet-json "${DOCLAYNET_JSON_PATH:-/share/project/xiyan/huggingface/docling-project/DocLayNet/DocLayNet_core_train.json}" \
-            --doclaynet-images "${DOCLAYNET_IMAGE_DIR:-/share/project/xiyan/huggingface/docling-project/DocLayNet/PNG}"
+            --doclaynet-json "${DOCLAYNET_JSON_PATH:-${PROJECT_ROOT}/huggingface/docling-project/DocLayNet/DocLayNet_core_train.json}" \
+            --doclaynet-images "${DOCLAYNET_IMAGE_DIR:-${PROJECT_ROOT}/huggingface/docling-project/DocLayNet/PNG}"
         if [ $? -ne 0 ]; then
             echo "❌ Failed to build alignment dataset"
             exit 1
@@ -204,8 +206,8 @@ elif [[ "$CONFIG_BASENAME == *"llava"* ]] || [[ "$CONFIG_BASENAME == *"vqa"* ]];
         if [ ! -f "$STANDARD_VQA_DATASET" ]; then
             "$PYTHON_BIN" "$REPO_ROOT/OCRVL/scripts/build_vqa.py" \
                 --mode standard \
-                --llava-json "${LLAVA_JSON:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json}" \
-                --llava-images "${LLAVA_IMAGES:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images}" \
+                --llava-json "${LLAVA_JSON:-${PROJECT_ROOT}/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json}" \
+                --llava-images "${LLAVA_IMAGES:-${PROJECT_ROOT}/huggingface/liuhaotian/LLaVA-Instruct-150K/images}" \
                 --output "$STANDARD_VQA_DATASET"
             if [ $? -ne 0 ]; then
                 echo "❌ Failed to build standard VQA dataset"
@@ -217,8 +219,8 @@ elif [[ "$CONFIG_BASENAME == *"llava"* ]] || [[ "$CONFIG_BASENAME == *"vqa"* ]];
         if [ ! -f "$VQA_DATASET" ]; then
             "$PYTHON_BIN" "$REPO_ROOT/OCRVL/scripts/build_vqa.py" \
                 --mode rendered \
-                --llava-json "${LLAVA_JSON:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json}" \
-                --llava-images "${LLAVA_IMAGES:-/share/project/xiyan/huggingface/liuhaotian/LLaVA-Instruct-150K/images}" \
+                --llava-json "${LLAVA_JSON:-${PROJECT_ROOT}/huggingface/liuhaotian/LLaVA-Instruct-150K/llava_v1_5_mix665k.json}" \
+                --llava-images "${LLAVA_IMAGES:-${PROJECT_ROOT}/huggingface/liuhaotian/LLaVA-Instruct-150K/images}" \
                 --output "$VQA_DATASET" \
                 --rendered-images-dir "$REPO_ROOT/OCRVL/data/ocrvl_rendered_conversations"
             if [ $? -ne 0 ]; then
@@ -250,7 +252,6 @@ export DPSK_DTYPE="${DPSK_DTYPE:-bf16}"
 
 # Enable checkpoint evaluation
 export OCRVL_ENABLE_TRANSPARENT_EVAL="${OCRVL_ENABLE_TRANSPARENT_EVAL:-1}"
-export OCRVL_REPO_ROOT="$REPO_ROOT"
 export OCRVL_TRANSPARENT_EVAL_SAMPLES="${OCRVL_TRANSPARENT_EVAL_SAMPLES:-$REPO_ROOT/OCRVL/llamafactory/transparent_eval_samples.json}"
 export OCRVL_TRANSPARENT_EVAL_MAX_NEW_TOKENS="${OCRVL_TRANSPARENT_EVAL_MAX_NEW_TOKENS:-128}"
 export OCRVL_TRANSPARENT_EVAL_TEMPERATURE="${OCRVL_TRANSPARENT_EVAL_TEMPERATURE:-0.0}"

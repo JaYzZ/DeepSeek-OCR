@@ -1066,37 +1066,37 @@ Examples:
     # Build per-bbox OCR dataset from DocLayNet JSON directory
     python OCRVL/scripts/build_doclaynet_enhanced.py \\
         --mode bbox-ocr \\
-        --doclaynet-json /share/project/xiyan/huggingface/docling-project/DocLayNet/JSON \\
-        --images-dir /share/project/xiyan/huggingface/docling-project/DocLayNet/PNG \\
+        --doclaynet-json $ROOT_DIR/huggingface/docling-project/DocLayNet/JSON \\
+        --images-dir $ROOT_DIR/huggingface/docling-project/DocLayNet/PNG \\
         --output OCRVL/llamafactory/data/doclaynet_bbox_ocr.jsonl
 
     # Build with limited samples for testing
     python OCRVL/scripts/build_doclaynet_enhanced.py \\
         --mode bbox-ocr \\
-        --doclaynet-json /share/project/xiyan/huggingface/docling-project/DocLayNet/JSON \\
-        --images-dir /share/project/xiyan/huggingface/docling-project/DocLayNet/PNG \\
+        --doclaynet-json $ROOT_DIR/huggingface/docling-project/DocLayNet/JSON \\
+        --images-dir $ROOT_DIR/huggingface/docling-project/DocLayNet/PNG \\
         --output OCRVL/llamafactory/data/doclaynet_bbox_ocr_test.jsonl \\
         --max-samples 100
 
     # Build full-document OCR dataset
     python OCRVL/scripts/build_doclaynet_enhanced.py \\
         --mode full-ocr \\
-        --doclaynet-json /share/project/xiyan/huggingface/docling-project/DocLayNet/JSON \\
-        --images-dir /share/project/xiyan/huggingface/docling-project/DocLayNet/PNG \\
+        --doclaynet-json $ROOT_DIR/huggingface/docling-project/DocLayNet/JSON \\
+        --images-dir $ROOT_DIR/huggingface/docling-project/DocLayNet/PNG \\
         --output OCRVL/llamafactory/data/doclaynet_full_ocr.jsonl
 
     # Build markdown placeholder dataset
     python OCRVL/scripts/build_doclaynet_enhanced.py \\
         --mode markdown-placeholder \\
-        --doclaynet-json /share/project/xiyan/huggingface/docling-project/DocLayNet/JSON \\
-        --images-dir /share/project/xiyan/huggingface/docling-project/DocLayNet/PNG \\
+        --doclaynet-json $ROOT_DIR/huggingface/docling-project/DocLayNet/JSON \\
+        --images-dir $ROOT_DIR/huggingface/docling-project/DocLayNet/PNG \\
         --output OCRVL/llamafactory/data/doclaynet_markdown_placeholder.jsonl
 
     # Build markdown dataset using Qwen2.5-VL model (requires running server)
     python OCRVL/scripts/build_doclaynet_enhanced.py \\
         --mode markdown-model \\
-        --doclaynet-json /share/project/xiyan/huggingface/docling-project/DocLayNet/JSON \\
-        --images-dir /share/project/xiyan/huggingface/docling-project/DocLayNet/PNG \\
+        --doclaynet-json $ROOT_DIR/huggingface/docling-project/DocLayNet/JSON \\
+        --images-dir $ROOT_DIR/huggingface/docling-project/DocLayNet/PNG \\
         --output OCRVL/llamafactory/data/doclaynet_markdown.jsonl \\
         --server-url http://localhost:8000 \\
         --workers 8 \\
@@ -1105,8 +1105,8 @@ Examples:
     # Build ALL DocLayNet samples (checks for existing intermediates, builds only missing)
     python OCRVL/scripts/build_doclaynet_enhanced.py \\
         --mode all \\
-        --doclaynet-json /share/project/xiyan/huggingface/docling-project/DocLayNet/JSON \\
-        --images-dir /share/project/xiyan/huggingface/docling-project/DocLayNet/PNG \\
+        --doclaynet-json $ROOT_DIR/huggingface/docling-project/DocLayNet/JSON \\
+        --images-dir $ROOT_DIR/huggingface/docling-project/DocLayNet/PNG \\
         --output OCRVL/llamafactory/data/doclaynet_all.jsonl \\
         --server-url http://localhost:8000
 
@@ -1114,8 +1114,8 @@ Examples:
     python OCRVL/scripts/build_doclaynet_enhanced.py \\
         --mode all \\
         --rebuild \\
-        --doclaynet-json /share/project/xiyan/huggingface/docling-project/DocLayNet/JSON \\
-        --images-dir /share/project/xiyan/huggingface/docling-project/DocLayNet/PNG \\
+        --doclaynet-json $ROOT_DIR/huggingface/docling-project/DocLayNet/JSON \\
+        --images-dir $ROOT_DIR/huggingface/docling-project/DocLayNet/PNG \\
         --output OCRVL/llamafactory/data/doclaynet_all.jsonl \\
         --server-url http://localhost:8000
 

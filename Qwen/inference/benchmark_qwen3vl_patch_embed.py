@@ -14,6 +14,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from transformers import AutoModelForVision2Seq
+from project_paths import hf_path
 
 
 @dataclass(frozen=True)
@@ -99,7 +100,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model-path",
-        default="/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking",
+        default=str(hf_path("Qwen", "Qwen3-VL-2B-Thinking")),
         help="Original Qwen3-VL checkpoint path with Conv3d patch embed.",
     )
     parser.add_argument(

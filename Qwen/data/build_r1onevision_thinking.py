@@ -22,13 +22,20 @@ import re
 import shutil
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
 import pandas as pd
 import torch
 import torch.distributed as dist
 from transformers import AutoProcessor, AutoTokenizer
 from PIL import Image
+
+try:
+    import yaml  # type: ignore
+except Exception:
+    yaml = None
 
 # Setup path for local imports
 script_dir = Path(__file__).parent
@@ -46,14 +53,15 @@ from Qwen.data.utils import (
     compress_newlines,
     format_cot_subsequences,
 )
-from OCRVL.encoder.qwen3vl_encoder import Qwen3VLEncoder
+from Qwen.encoder import Qwen3VLEncoder
+from project_paths import hf_path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_MODEL_PATH = "/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking"
+DEFAULT_MODEL_PATH = str(hf_path("Qwen", "Qwen3-VL-2B-Thinking"))
 DEFAULT_TRAIN_CONFIG = repo_root / "Qwen/configs/qwen3vl_r1onevision_thinking.yaml"
 
 
@@ -63,11 +71,6 @@ def _load_cutoff_len_from_yaml(config_path: Path) -> Optional[int]:
     if not config_path.exists():
         logger.warning(f"Training config not found for cutoff_len lookup: {config_path}")
         return None
-
-    try:
-        import yaml  # type: ignore
-    except Exception:
-        yaml = None
 
     text = config_path.read_text(encoding="utf-8")
     if yaml is not None:
@@ -549,7 +552,6 @@ def main_encode_only(args, encoder):
                 except Exception as e:
                     stats['errors'] += 1
                     logger.warning(f"  Error processing sample: {e}")
-                    import traceback
                     logger.debug(traceback.format_exc())
 
             if local_rank == 0:
@@ -728,7 +730,6 @@ def main_encode_only(args, encoder):
 
     # Merge rank files on rank 0 if using multi-GPU
     if world_size > 1:
-        import torch.distributed as dist
         if dist.is_initialized():
             dist.barrier()  # Wait for all ranks to finish
 
@@ -803,10 +804,10 @@ def main():
     parser.add_argument('--max-samples', type=int, default=None,
                         help='Limit samples per dataset (for testing)')
     parser.add_argument('--base-dir',
-                        default='/share/project/xiyan/sources/DeepSeek-OCR',
+                        default=str(repo_root),
                         help='Base directory of repository')
     parser.add_argument('--data-dir',
-                        default='/share/project/xiyan/huggingface/Fancy-MLLM/R1-Onevision',
+                        default=str(hf_path("Fancy-MLLM", "R1-Onevision")),
                         help='Path to R1-Onevision data')
     parser.add_argument('--output-dir',
                         default='Qwen/data/sft',

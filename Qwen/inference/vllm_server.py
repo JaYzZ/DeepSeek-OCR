@@ -67,15 +67,10 @@ else:
 
 from vllm import LLM, SamplingParams
 from vllm.multimodal.hasher import MultiModalHasher
+from vllm.v1.engine import LoRARequest
 from transformers import AutoProcessor
 
-# Try to import LoRARequest
-try:
-    from vllm.v1.engine import LoRARequest
-    HAS_LORA_REQUEST = True
-except ImportError:
-    HAS_LORA_REQUEST = False
-    LoRARequest = None
+HAS_LORA_REQUEST = True
 
 app = FastAPI(title="vLLM Thinking Server")
 

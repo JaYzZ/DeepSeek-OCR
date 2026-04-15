@@ -1,27 +1,18 @@
-#!/usr/bin/env python3
-"""
-Feature extraction and management module.
-
-Provides unified interface for extracting features from different encoders:
-- DPSK OCR (with SAM, CLIP components)
-- Qwen3VL (with deepstack features)
-- Qwen25VL
-"""
-
-import sys
-from pathlib import Path
-from typing import Optional, Union, List, Dict, Tuple
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
+
 import torch
-from PIL import Image
 import numpy as np
+from PIL import Image
+from project_paths import hf_path
 
-# Add Qwen directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from vis_core import (
-    EncoderManager, EncoderConfig, EncoderType,
-    FeatureSpec, ImagePreprocessor,
+from .vis_core import (
+    EncoderConfig,
+    EncoderManager,
+    EncoderType,
+    FeatureSpec,
+    ImagePreprocessor,
 )
 
 
@@ -29,7 +20,7 @@ from vis_core import (
 class FeatureData:
     """Container for extracted features."""
     features: np.ndarray  # [num_tokens, hidden_dim] or [pooled_dim]
-    metadata: Dict[str, any]  # Additional info (shape, layer, etc.)
+    metadata: Dict[str, object]  # Additional info (shape, layer, etc.)
     image_path: Optional[Path] = None
 
 
@@ -53,7 +44,7 @@ class FeatureExtractor:
                 ),
                 EncoderConfig(
                     encoder_type=EncoderType.QWEN3VL,
-                    model_path="/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Instruct",
+                    model_path=str(hf_path("Qwen", "Qwen3-VL-2B-Instruct")),
                 ),
             ]
 

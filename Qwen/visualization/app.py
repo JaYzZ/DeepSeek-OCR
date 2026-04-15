@@ -16,7 +16,6 @@ import io
 import json
 import os
 import socket
-import sys
 import time
 from types import MethodType
 import uuid
@@ -25,32 +24,24 @@ from typing import Any
 
 import numpy as np
 import torch
+from project_paths import hf_path
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel
+from peft import PeftModel
 import safetensors.torch
 from tokenizers import AddedToken
 from transformers import AutoModelForVision2Seq, AutoProcessor, AutoTokenizer
 
-try:
-    from peft import PeftModel
-except ImportError:  # pragma: no cover - environment-specific
-    PeftModel = None
-
-_REPO_ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
-
 from Qwen.inference.vllm_utils import apply_runtime_env_for_thinking
 from Qwen.llamafactory.integration import LatentVAE
-
-sys.path.insert(0, str(Path(__file__).parent))
-from utils.visualization_utils import compute_tsne
+from Qwen.visualization.utils.visualization_utils import compute_tsne
 
 
-DEFAULT_MODEL_PATH = "/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking"
+DEFAULT_MODEL_PATH = str(hf_path("Qwen", "Qwen3-VL-2B-Thinking"))
 DEFAULT_LORA_PATH = (
     "Qwen/checkpoints/qwen3vl-2b/verl/chimera_gspo/"
     "run_20260401_033750/global_step_20/actor/lora_adapter"

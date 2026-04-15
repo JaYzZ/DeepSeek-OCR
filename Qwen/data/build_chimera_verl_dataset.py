@@ -24,10 +24,11 @@ from typing import Any
 
 import datasets
 import pandas as pd
+from project_paths import deepseek_ocr_path, hf_path
 
 
-DEFAULT_DATA_DIR = Path("/share/project/xiyan/huggingface/TianHongZXY/CHIMERA/Qwen3.5-397B")
-DEFAULT_OUTPUT_DIR = Path("/share/project/xiyan/sources/DeepSeek-OCR/Qwen/data/chimera_verl")
+DEFAULT_DATA_DIR = hf_path("TianHongZXY", "CHIMERA", "Qwen3.5-397B")
+DEFAULT_OUTPUT_DIR = deepseek_ocr_path("Qwen", "data", "chimera_verl")
 CHIMERA_SYSTEM_PROMPT = (
     "You are solving a challenging academic problem from a rendered question image. "
     "Reason carefully. In the final answer, provide only the final result. "

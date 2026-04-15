@@ -2,7 +2,7 @@
 """Teacher-rollout OPD trainer for Qwen3-VL continuous thinking.
 
 This variant keeps the existing off-policy setup at the data/prompt level:
-- teacher sees question images plus optional privileged rationale images
+- teacher sees question images plus optional privileged rationale context
 - student sees only question images
 
 The key difference is the supervision target:
@@ -72,6 +72,11 @@ from Qwen.scripts.train_qwen3vl_opsd import (
     _sync_training_model_to_vllm,
     _write_yaml,
 )
+
+
+QWEN3VL_VLLM_STOP_TOKEN_IDS = [151643, 151645]
+
+
 def _strip_generation_noise(text: str) -> str:
     stripped = (text or "").strip()
     stripped = stripped.replace("<|im_end|>", "").strip()
@@ -175,16 +180,20 @@ def _build_teacher_prompt_rows(config: dict[str, Any], rows: list[dict[str, Any]
     prepared: list[dict[str, Any]] = []
     for row in rows:
         question_images = list(row.get("question_images") or [])
+        teacher_rationale_text = str(row.get("teacher_rationale_text") or "").strip()
         rationale_images = _maybe_limit_images(
             list(row.get("teacher_rationale_images") or []),
             max_teacher_rationale_images,
         )
+        if teacher_rationale_text:
+            rationale_images = []
         question_text = str(row.get("student_user_text") or "").strip()
         teacher_user = _format_user_prompt(
             teacher_template,
             num_question_images=len(question_images),
             num_rationale_images=len(rationale_images),
             question_text=question_text,
+            reference_reasoning_text=teacher_rationale_text,
         )
         teacher_messages = _build_user_messages(
             system_prompt=system_prompt,
@@ -200,6 +209,7 @@ def _build_teacher_prompt_rows(config: dict[str, Any], rows: list[dict[str, Any]
                 "question_text": question_text,
                 "question_images": question_images,
                 "teacher_rationale_images": rationale_images,
+                "teacher_rationale_text": teacher_rationale_text,
                 "latent_supervision": list(row.get("latent_supervision") or []),
                 "teacher_messages": teacher_messages,
             }
@@ -376,6 +386,7 @@ def _prepare_student_training_batch(
                 "prompt_text": prompt_text,
                 "full_text": full_text,
                 "teacher_completion": _strip_generation_noise(completion),
+                "teacher_finish_reason": rollout.get("finish_reason"),
                 "teacher_thinking_chunks": thinking_chunks,
                 "assistant_target": assistant_latent_content,
                 "answer_text": answer_text,
@@ -529,8 +540,10 @@ def _save_teacher_rollout_samples(output_dir: Path, specs: list[dict[str, Any]],
                         "question_text": spec.get("question_text"),
                         "question_images": spec.get("question_images"),
                         "teacher_rationale_images": spec.get("teacher_rationale_images"),
+                        "teacher_rationale_text": spec.get("teacher_rationale_text"),
                         "prompt_text": spec.get("prompt_text"),
                         "teacher_completion": spec.get("teacher_completion"),
+                        "teacher_finish_reason": spec.get("teacher_finish_reason"),
                         "assistant_target": spec.get("assistant_target"),
                         "answer_text": spec.get("answer_text"),
                         "num_latent_steps": len(spec.get("teacher_thinking_chunks") or []),
@@ -553,11 +566,15 @@ def _prepare_teacher_rollout_runtime(config: dict[str, Any], accelerator: Accele
     rollout_cfg = copy.deepcopy(config.get("rollout") or {})
     rollout_cfg["vllm_thinking"] = bool(teacher_cfg.get("vllm_thinking", False))
     rollout_cfg["vllm_force_think"] = bool(teacher_cfg.get("vllm_force_think", False))
-    rollout_cfg["enable_sleep_mode"] = bool(rollout_cfg.get("enable_sleep_mode", True))
-    rollout_cfg["gpu_memory_utilization"] = float(rollout_cfg.get("gpu_memory_utilization", 0.35))
-    rollout_cfg["sync_steps"] = int(rollout_cfg.get("sync_steps", 1))
-    rollout_cfg["enforce_eager"] = bool(rollout_cfg.get("enforce_eager", False))
-    rollout_cfg["max_images_per_prompt"] = int(rollout_cfg.get("max_images_per_prompt", 10))
+    rollout_cfg["enable_sleep_mode"] = bool(teacher_cfg.get("enable_sleep_mode", rollout_cfg.get("enable_sleep_mode", True)))
+    rollout_cfg["gpu_memory_utilization"] = float(
+        teacher_cfg.get("gpu_memory_utilization", rollout_cfg.get("gpu_memory_utilization", 0.35))
+    )
+    rollout_cfg["sync_steps"] = int(teacher_cfg.get("sync_steps", rollout_cfg.get("sync_steps", 1)))
+    rollout_cfg["enforce_eager"] = bool(teacher_cfg.get("enforce_eager", rollout_cfg.get("enforce_eager", False)))
+    rollout_cfg["max_images_per_prompt"] = int(
+        teacher_cfg.get("max_images_per_prompt", rollout_cfg.get("max_images_per_prompt", 10))
+    )
 
     teacher_rollout_config = copy.deepcopy(config)
     teacher_rollout_config["rollout"] = rollout_cfg
@@ -598,6 +615,7 @@ def _prepare_teacher_rollout_runtime(config: dict[str, Any], accelerator: Accele
         top_k=teacher_top_k,
         repetition_penalty=teacher_repetition_penalty,
         max_tokens=teacher_max_new_tokens,
+        stop_token_ids=QWEN3VL_VLLM_STOP_TOKEN_IDS,
         skip_special_tokens=False,
         logit_bias={token_id: -100.0 for token_id in blocked_ids},
     )
@@ -644,6 +662,7 @@ def _generate_teacher_rollouts(
                 "text": candidate.text,
                 "token_ids": token_ids,
                 "decoded_text": decoded_text,
+                "finish_reason": getattr(candidate, "finish_reason", None),
             }
         )
     return rollouts
@@ -812,20 +831,10 @@ def _run_training(config: dict[str, Any]) -> None:
         weight_decay=float(train_cfg.get("weight_decay", 0.0)),
     )
 
-    num_update_steps_per_epoch = max(
-        1,
-        math.ceil(len(dataloader) / int(train_cfg["gradient_accumulation_steps"])),
-    )
     configured_epochs = float(train_cfg.get("num_train_epochs", 0))
     configured_max_steps = int(train_cfg.get("max_steps", -1))
     use_epoch_budget = configured_epochs > 0
-    if use_epoch_budget:
-        total_steps = int(math.ceil(configured_epochs * num_update_steps_per_epoch))
-    else:
-        total_steps = configured_max_steps
-        if total_steps <= 0:
-            raise ValueError("Either training.num_train_epochs must be > 0 or training.max_steps must be > 0.")
-    warmup_steps = int(total_steps * float(train_cfg.get("warmup_ratio", 0.0)))
+    total_steps = configured_max_steps
 
     def lr_lambda(step: int) -> float:
         if warmup_steps > 0 and step < warmup_steps:
@@ -833,8 +842,19 @@ def _run_training(config: dict[str, Any]) -> None:
         progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
         return 0.5 * (1.0 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
 
+    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+
+    num_update_steps_per_epoch = max(
+        1,
+        math.ceil(len(dataloader) / int(train_cfg["gradient_accumulation_steps"])),
+    )
+    if use_epoch_budget:
+        total_steps = int(math.ceil(configured_epochs * num_update_steps_per_epoch))
+    elif total_steps <= 0:
+        raise ValueError("Either training.num_train_epochs must be > 0 or training.max_steps must be > 0.")
+    warmup_steps = int(total_steps * float(train_cfg.get("warmup_ratio", 0.0)))
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
 
     rollout_engine, rollout_sampling_params, rollout_processor, rollout_sync_steps = _prepare_teacher_rollout_runtime(
         config,
@@ -877,6 +897,7 @@ def _run_training(config: dict[str, Any]) -> None:
         "continuous_tokens": 0,
         "continuous_tokens_max": 0,
         "continuous_tokens_avg": 0.0,
+        "teacher_finish_reason": "unknown",
     }
     model.train()
 
@@ -983,6 +1004,16 @@ def _run_training(config: dict[str, Any]) -> None:
                     "continuous_tokens_avg": (
                         continuous_tokens_total / float(max(1, len(per_sample_continuous_tokens)))
                     ),
+                    "teacher_finish_reason": ",".join(
+                        sorted(
+                            {
+                                str(rollout.get("finish_reason"))
+                                for rollout in teacher_rollouts
+                                if rollout.get("finish_reason") is not None
+                            }
+                        )
+                    )
+                    or "unknown",
                 }
 
                 del loss
@@ -1018,6 +1049,7 @@ def _run_training(config: dict[str, Any]) -> None:
                         f"continuous_tokens={last_stats['continuous_tokens']} "
                         f"continuous_avg={last_stats['continuous_tokens_avg']:.1f} "
                         f"continuous_max={last_stats['continuous_tokens_max']} "
+                        f"teacher_finish={last_stats['teacher_finish_reason']} "
                         f"timing=rollout:{stage_seconds['rollout']:.1f}s "
                         f"build:{stage_seconds['build']:.1f}s "
                         f"forward:{stage_seconds['forward']:.1f}s "

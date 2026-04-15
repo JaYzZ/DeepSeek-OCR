@@ -40,6 +40,7 @@ from transformers import AutoProcessor, AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.v1.engine import LoRARequest
 from vllm_thinking.runner_patch import apply_thinking_mode_patch
+from project_paths import hf_path
 
 
 if os.environ.get("VLLM_THINKING", "0").strip().lower() in {"1", "true", "yes", "on"}:
@@ -198,7 +199,7 @@ def load_model_vllm(checkpoint_path: Path, tensor_parallel_size: int = 1, gpu_me
     """Load model with vLLM - handles LoRA detection and setup."""
 
     # Fallback base model path if adapter metadata is missing.
-    OFFICIAL_BASE_MODEL = "/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking"
+    OFFICIAL_BASE_MODEL = str(hf_path("Qwen", "Qwen3-VL-2B-Thinking"))
 
     # Check for LoRA adapter
     adapter_config_path = checkpoint_path / "adapter_config.json"

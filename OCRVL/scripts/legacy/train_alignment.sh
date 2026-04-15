@@ -29,6 +29,7 @@
 #   - Provides training transparency without full benchmark overhead
 
 set -e  # Exit on error
+PROJECT_ROOT="${ROOT_DIR:-/share/project/xiyan}"
 
 # ============================================================================
 # Configuration - Override with environment variables
@@ -54,7 +55,7 @@ MIX_DOCLAYNET="${MIX_DOCLAYNET:-true}"      # Mix DocLayNet with BLIP3o (default
 
 # DocLayNet configuration
 DOCLAYNET_SPLIT="${DOCLAYNET_SPLIT:-train}"  # DocLayNet split: train, val, test
-DOCLAYNET_DATA_DIR="${DOCLAYNET_DATA_DIR:-/share/project/xiyan/huggingface/docling-project/DocLayNet}"
+DOCLAYNET_DATA_DIR="${DOCLAYNET_DATA_DIR:-${PROJECT_ROOT}/huggingface/docling-project/DocLayNet}"
 
 # Training hyperparameters
 BATCH_SIZE="${BATCH_SIZE:-8}"      # Per-GPU batch size

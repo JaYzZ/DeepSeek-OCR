@@ -26,7 +26,7 @@ Quick Start:
 
     # Or manually in tmux:
     tmux new -s training
-    cd /share/project/xiyan/sources/DeepSeek-OCR
+    cd $ROOT_DIR/sources/DeepSeek-OCR
     CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python OCRFlow/examples/train.py
     # Detach: Ctrl+B, then D
     # Reattach: tmux attach -t training
@@ -65,6 +65,7 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from OCRFlow.models.markovian_chunk_decoder import create_chunk_decoder
+from project_paths import hf_path
 from torch.amp import autocast, GradScaler
 
 logging.basicConfig(
@@ -565,7 +566,7 @@ def main():
 
     # Dataset
     parser.add_argument("--fineweb_path", type=str,
-                       default="/share/project/xiyan/huggingface/HuggingFaceFW/fineweb-edu")
+                       default=str(hf_path("HuggingFaceFW", "fineweb-edu")))
     parser.add_argument("--fineweb_subset", type=str, default="10BT")
 
     # Encoding

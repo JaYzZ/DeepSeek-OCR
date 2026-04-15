@@ -16,7 +16,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from transformers import AutoProcessor, AutoTokenizer
-from utils import (
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in os.sys.path:
+    os.sys.path.insert(0, str(_REPO_ROOT))
+
+from Qwen.evaluation.utils import (
     infer_tensor_parallel_size,
     parse_cuda_visible_devices,
     pick_compatible_tensor_parallel_size,

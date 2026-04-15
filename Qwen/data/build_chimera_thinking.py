@@ -28,6 +28,11 @@ import torch.distributed as dist
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
 
+try:
+    import yaml  # type: ignore
+except Exception:
+    yaml = None
+
 script_dir = Path(__file__).parent
 repo_root = script_dir.parent.parent
 sys.path.insert(0, str(repo_root))
@@ -41,13 +46,14 @@ from Qwen.data.utils import (
     chunk_thinking_text,
     format_cot_subsequences,
 )
-from OCRVL.encoder.qwen3vl_encoder import Qwen3VLEncoder
+from Qwen.encoder import Qwen3VLEncoder
+from project_paths import hf_path
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_MODEL_PATH = "/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking"
+DEFAULT_MODEL_PATH = str(hf_path("Qwen", "Qwen3-VL-2B-Thinking"))
 DEFAULT_TRAIN_CONFIG = repo_root / "Qwen/configs/qwen3vl_chimera_thinking.yaml"
 
 
@@ -55,11 +61,6 @@ def _load_cutoff_len_from_yaml(config_path: Path) -> Optional[int]:
     if not config_path.exists():
         logger.warning(f"Training config not found for cutoff_len lookup: {config_path}")
         return None
-
-    try:
-        import yaml  # type: ignore
-    except Exception:
-        yaml = None
 
     text = config_path.read_text(encoding="utf-8")
     if yaml is not None:
@@ -862,8 +863,8 @@ def main_all(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Build CHIMERA thinking dataset for Qwen3VL")
-    parser.add_argument("--base-dir", default="/share/project/xiyan/sources/DeepSeek-OCR")
-    parser.add_argument("--data-dir", default="/share/project/xiyan/huggingface/TianHongZXY/CHIMERA/Qwen3.5-397B")
+    parser.add_argument("--base-dir", default=str(repo_root))
+    parser.add_argument("--data-dir", default=str(hf_path("TianHongZXY", "CHIMERA", "Qwen3.5-397B")))
     parser.add_argument("--output-dir", default="Qwen/data")
     parser.add_argument("--images-dir", default="Qwen/data/chimera_images")
     parser.add_argument(

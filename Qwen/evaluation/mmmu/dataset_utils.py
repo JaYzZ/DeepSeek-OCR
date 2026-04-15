@@ -1,11 +1,14 @@
 import os
-import pandas as pd
+
 import numpy as np
-from typing import Dict, Any
-try:
-    from .common_utils import download_file, md5, toliststr, decode_base64_to_image_file
-except ImportError:
-    from common_utils import download_file, md5, toliststr, decode_base64_to_image_file
+import pandas as pd
+
+from Qwen.evaluation.mmmu.common_utils import (
+    decode_base64_to_image_file,
+    download_file,
+    md5,
+    toliststr,
+)
 
 MMMU_DATASET_URL = 'https://opencompass.openxlab.space/utils/VLMEval/MMMU_DEV_VAL.tsv'
 MMMU_DATASET_MD5 = '521afc0f3bf341e6654327792781644d'

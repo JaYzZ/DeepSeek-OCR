@@ -15,7 +15,7 @@
 # Special thinking tokens (present in base model):
 # - <think> (151667): Opens thinking/reasoning section
 # - </think> (151668): Closes thinking/reasoning section
-model_name_or_path: /share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking
+model_name_or_path: ../../huggingface/Qwen/Qwen3-VL-2B-Thinking
 image_max_pixels: 262144
 video_max_pixels: 16384
 trust_remote_code: true
@@ -48,7 +48,7 @@ freeze_vision_tower: true
 #
 # This creates Qwen/data/sft/ocrvl_ocr_supplement.jsonl without rebuilding from source.
 dataset: ocrvl_ocr_supplement
-dataset_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/data
+dataset_dir: Qwen/data
 template: qwen3_vl
 cutoff_len: 2048
 max_samples: null
@@ -60,7 +60,7 @@ dataloader_num_workers: 4
 ### eval
 # Use transparent eval (includes OCR tasks for validation)
 eval_dataset: ocrvl_transparent_eval
-eval_dataset_dir: /share/project/xiyan/sources/DeepSeek-OCR/OCRVL/data
+eval_dataset_dir: OCRVL/data
 val_size: 0
 per_device_eval_batch_size: 1
 eval_strategy: steps
@@ -68,7 +68,7 @@ eval_steps: 500
 predict_with_generate: true
 
 ### output
-output_dir: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/qwen3vl-2b/lora/ocr_supplement
+output_dir: Qwen/checkpoints/qwen3vl-2b/lora/ocr_supplement
 logging_steps: 10
 save_steps: 500
 plot_loss: true
@@ -104,4 +104,4 @@ ddp_find_unused_parameters: false
 ddp_timeout: 180000000
 
 # Load from previous unified SFT checkpoint
-adapter_name_or_path: /share/project/xiyan/sources/DeepSeek-OCR/Qwen/checkpoints/qwen3vl-2b/lora/native_unified_sft
+adapter_name_or_path: Qwen/checkpoints/qwen3vl-2b/lora/native_unified_sft

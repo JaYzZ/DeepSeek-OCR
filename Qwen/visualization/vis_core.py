@@ -9,21 +9,21 @@ Provides common functionality for:
 - Configuration management
 """
 
-import sys
-from pathlib import Path
-from typing import Optional, Union, List, Dict, Any
+import json
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
-import torch
-from PIL import Image
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
 import numpy as np
-import pickle
-import json
+import torch
+import torchvision.transforms as T
+from PIL import Image, ImageOps
+from project_paths import hf_path
 
-
-# Add project root to path (go up to DeepSeek-OCR root)
-_REPO_ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
+from OCRInfer.encoder.dpsk_ocr_encoder import DPSKOCREncoder
+from Qwen.encoder import Qwen25VLEncoder, Qwen3VLEncoder
 
 
 class EncoderType(Enum):
@@ -74,7 +74,6 @@ class EncoderManager:
     def _create_encoder(cls, config: EncoderConfig):
         """Create encoder based on type."""
         if config.encoder_type == EncoderType.DPSK:
-            from OCRInfer.encoder.dpsk_ocr_encoder import DPSKOCREncoder
             return DPSKOCREncoder(
                 model_path=config.model_path,
                 device=config.device,
@@ -84,7 +83,6 @@ class EncoderManager:
                 keep_cls_intermediate=config.keep_cls_intermediate,
             )
         elif config.encoder_type == EncoderType.QWEN3VL:
-            from OCRVL.encoder.qwen3vl_encoder import Qwen3VLEncoder
             return Qwen3VLEncoder(
                 model_name_or_path=config.model_path,
                 device=config.device,
@@ -92,7 +90,6 @@ class EncoderManager:
                 use_vllm_kernels=config.use_vllm_kernels,
             )
         elif config.encoder_type == EncoderType.QWEN25VL:
-            from OCRVL.encoder.qwen25vl_encoder import Qwen25VLEncoder
             return Qwen25VLEncoder(
                 model_name_or_path=config.model_path,
                 device=config.device,
@@ -120,14 +117,11 @@ class ImagePreprocessor:
     @staticmethod
     def pad_to_base_size(image: Image.Image, base_size: int = 640) -> Image.Image:
         """Pad image to base_size maintaining aspect ratio."""
-        from PIL import ImageOps
         return ImageOps.pad(image, (base_size, base_size), color=(128, 128, 128))
 
     @staticmethod
     def to_tensor(image: Image.Image, normalize: bool = True) -> torch.Tensor:
         """Convert PIL image to tensor."""
-        import torchvision.transforms as T
-
         if normalize:
             transform = T.Compose([
                 T.ToTensor(),
@@ -156,8 +150,8 @@ class ConfigManager:
 
     DEFAULT_ENCODERS = {
         EncoderType.DPSK: "deepseek-ai/DeepSeek-OCR",
-        EncoderType.QWEN3VL: "/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Instruct",
-        EncoderType.QWEN25VL: "/share/project/xiyan/huggingface/Qwen/Qwen2.5-VL-7B-Instruct",
+        EncoderType.QWEN3VL: str(hf_path("Qwen", "Qwen3-VL-2B-Instruct")),
+        EncoderType.QWEN25VL: str(hf_path("Qwen", "Qwen2.5-VL-7B-Instruct")),
     }
 
     @classmethod
@@ -225,7 +219,6 @@ def get_device(device_str: str = "cuda:0") -> torch.device:
 
 def setup_logging(verbose: bool = False):
     """Setup logging for visualization."""
-    import logging
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,

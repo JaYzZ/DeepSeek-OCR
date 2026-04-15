@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
 import os
-from pathlib import Path
-import sys
 from types import SimpleNamespace
 
 import pytest
+import safetensors.torch
 import torch
 from transformers.modeling_outputs import CausalLMOutputWithPast
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from Qwen.llamafactory import integration as lfi
 from Qwen.llamafactory.curriculum_callback import QwenCurriculumCallback
@@ -317,7 +311,6 @@ def test_save_vae_checkpoint_falls_back_to_runtime_handoff(tmp_path, monkeypatch
     runtime_ckpt = tmp_path / "runtime_vae.safetensors"
     output_dir = tmp_path / "saved"
     valid_state = {"good_weight": torch.ones(2, dtype=torch.bfloat16)}
-    import safetensors.torch
 
     safetensors.torch.save_file(valid_state, str(runtime_ckpt))
     monkeypatch.setenv("QWEN3VL_VAE_CHECKPOINT_PATH", str(runtime_ckpt))

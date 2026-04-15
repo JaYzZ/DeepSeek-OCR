@@ -32,6 +32,7 @@ import random
 import hashlib
 import pickle
 from dataclasses import dataclass
+from project_paths import hf_path
 
 # Text rendering is provided by ./Renderer.
 try:
@@ -451,9 +452,9 @@ class DirectEncoderDataset(IterableDataset):
 def create_direct_dataloader(
     dataset_type: str = "multi",
     model_path: str = "deepseek-ai/DeepSeek-OCR",
-    fineweb_path: str = "/share/project/xiyan/huggingface/HuggingFaceFW/fineweb-edu",
+    fineweb_path: str = str(hf_path("HuggingFaceFW", "fineweb-edu")),
     fineweb_subset: Optional[str] = None,
-    openwebmath_path: str = "/share/project/xiyan/huggingface/open-web-math/open-web-math",
+    openwebmath_path: str = str(hf_path("open-web-math", "open-web-math")),
     fineweb_weight: float = 0.7,
     openwebmath_weight: float = 0.3,
     train_data: Optional[str] = None,

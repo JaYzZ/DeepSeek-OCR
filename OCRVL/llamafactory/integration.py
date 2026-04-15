@@ -69,15 +69,11 @@ def apply_ocrvl_patches(logger) -> None:
 
 def _register_ocrvl_config(logger) -> None:
     """Register OCRQwen3VLConfig to replace Qwen3VLConfig."""
-    try:
-        from OCRVL.model.language_model.ocr_qwen3_vl import OCRQwen3VLConfig, OCRQwen3VLForConditionalGeneration
+    from OCRVL.model.language_model.ocr_qwen3_vl import OCRQwen3VLConfig, OCRQwen3VLForConditionalGeneration
 
-        AutoModelForCausalLM.register(OCRQwen3VLConfig, OCRQwen3VLForConditionalGeneration, exist_ok=True)
-        AutoModelForVision2Seq.register(OCRQwen3VLConfig, OCRQwen3VLForConditionalGeneration, exist_ok=True)
-        logger.debug("[OCRVL] Registered OCRQwen3VLConfig")
-    except ImportError as e:
-        logger.warning(f"[OCRVL] Could not register OCRQwen3VLConfig: {e}")
-        return
+    AutoModelForCausalLM.register(OCRQwen3VLConfig, OCRQwen3VLForConditionalGeneration, exist_ok=True)
+    AutoModelForVision2Seq.register(OCRQwen3VLConfig, OCRQwen3VLForConditionalGeneration, exist_ok=True)
+    logger.debug("[OCRVL] Registered OCRQwen3VLConfig")
 
     # Patch AutoConfig.from_pretrained to convert Qwen3VLConfig to OCRQwen3VLConfig
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
@@ -156,10 +152,7 @@ def _register_ocrvl_templates(logger) -> None:
 
 def _patch_fsdp_peft(logger) -> None:
     """Patch FSDP+PEFT incompatibility for custom models."""
-    try:
-        from peft.utils.other import fsdp_auto_wrap_policy as original_fsdp_auto_wrap_policy
-    except ImportError:
-        return
+    from peft.utils.other import fsdp_auto_wrap_policy as original_fsdp_auto_wrap_policy
 
     try:
         @functools.wraps(original_fsdp_auto_wrap_policy)
@@ -295,10 +288,7 @@ def _patch_trainer_for_connectors(logger) -> None:
 
 def _patch_accelerate_fsdp_save(logger) -> None:
     """Patch Accelerate FSDP + PEFT adapter-only saving on non-rank0."""
-    try:
-        from accelerate.utils import fsdp_utils as accelerate_fsdp_utils
-    except ImportError:
-        return
+    from accelerate.utils import fsdp_utils as accelerate_fsdp_utils
 
     try:
         original_get_model_state_dict = accelerate_fsdp_utils._get_model_state_dict

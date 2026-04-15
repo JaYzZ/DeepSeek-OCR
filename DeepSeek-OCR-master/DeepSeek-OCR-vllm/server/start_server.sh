@@ -10,6 +10,7 @@ GPU_MEMORY_UTILIZATION=0.9  # Optimal balance for OCRFlow training
 MAX_MODEL_LEN=8192
 SESSION_NAME="ocr_server_v1"
 LOG_FILE="/tmp/ocr_server_v1.log"
+PROJECT_ROOT="${ROOT_DIR:-/share/project/xiyan}"
 
 # Kill existing session if it exists
 tmux kill-session -t ${SESSION_NAME} 2>/dev/null && echo "✓ Stopped existing server session"
@@ -22,7 +23,7 @@ echo "  - Port: ${PORT}"
 echo "  - Log: ${LOG_FILE}"
 
 CUDA_VISIBLE_DEVICES=${GPU_DEVICES} tmux new-session -d -s ${SESSION_NAME} \
-  "cd /share/project/xiyan/sources/DeepSeek-OCR/DeepSeek-OCR-master/DeepSeek-OCR-vllm && \
+  "cd ${PROJECT_ROOT}/sources/DeepSeek-OCR/DeepSeek-OCR-master/DeepSeek-OCR-vllm && \
    python server/deepseek_ocr_server.py \
    --model-path ${MODEL_PATH} \
    --port ${PORT} \

@@ -20,6 +20,7 @@ _REPO_ROOT = _SCRIPT_DIR.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 from Qwen.inference.vllm_utils import apply_runtime_env_for_thinking, resolve_lora_artifacts
+from project_paths import hf_path
 
 def run_vllm_inference(
     model_path: str,
@@ -68,11 +69,11 @@ def run_vllm_inference(
 
         # Build command for individual benchmark script
         benchmark_scripts = {
-            "MathVision": "MathVision/run_mathv.py",
+            "MathVision": "mathvision/run_mathv.py",
             "MMMU": "mmmu/run_mmmu.py",
-            "RealWorldQA": "RealWorldQA/run_realworldqa.py",
-            "ODinW-13": "ODinW-13/run_odinw.py",
-            "M3CoT": "M3CoT/run_m3cot.py",
+            "RealWorldQA": "realworldqa/run_realworldqa.py",
+            "ODinW-13": "odinw/run_odinw.py",
+            "M3CoT": "m3cot/run_m3cot.py",
         }
 
         if benchmark not in benchmark_scripts:
@@ -171,7 +172,7 @@ def run_vllm_inference(
 
 def main():
     parser = argparse.ArgumentParser(description="Unified Inference - vLLM Backend")
-    parser.add_argument("--model-path", type=str, default="/share/project/xiyan/huggingface/Qwen/Qwen3-VL-2B-Thinking")
+    parser.add_argument("--model-path", type=str, default=str(hf_path("Qwen", "Qwen3-VL-2B-Thinking")))
     parser.add_argument("--data-dir", type=str, default=None)
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--num-samples", type=int, default=100)
