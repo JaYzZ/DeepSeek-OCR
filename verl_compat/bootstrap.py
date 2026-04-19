@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import copy
 import functools
 import logging
 import os
@@ -15,6 +16,7 @@ import torch.distributed as dist
 from omegaconf import open_dict
 from safetensors.torch import save_file
 
+from Qwen.compat.flash_attn import apply_flash_attn_varlen_compat_patch
 from .continuous_replay import _restore_policy_latent_vae, apply_continuous_replay_patches
 from .vllm_shim import TensorLoRARequest, VLLMHijack, is_version_ge
 
@@ -36,14 +38,13 @@ def patch_worker_env_vars(existing_env_vars: dict | None) -> dict:
     env_vars = dict(existing_env_vars or {})
     env_vars["PYTHONPATH"] = build_repo_pythonpath(env_vars.get("PYTHONPATH", os.environ.get("PYTHONPATH", "")))
     env_vars["QWEN3VL_APPLY_VERL_PATCHES"] = "1"
-    env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = os.environ.get(
-        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
-        "1",
-    )
 
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if cuda_visible_devices:
-        env_vars["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+    # For CUDA workers, always let Ray manage CUDA_VISIBLE_DEVICES for the
+    # actor-specific subset. Forwarding the outer subset or enabling Ray's
+    # NOSET mode exposes physical device ids to VERL worker setup, which is
+    # exactly how ordinal mismatches appear under subsets like "1" or "1,2".
+    env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
+    env_vars.pop("CUDA_VISIBLE_DEVICES", None)
 
     runtime_env_stamp = os.environ.get("QWEN3VL_RUNTIME_ENV_STAMP")
     if runtime_env_stamp:
@@ -105,7 +106,7 @@ def _patch_imported_runtime_aliases() -> None:
 
     patched_modules = []
     for module_name in (
-        "verl.workers.rollout.vllm_rollout.vllm_rollout_spmd",
+        "verl.workers.rollout.vllm_rollout.vllm_rollout",
         "verl.workers.sharding_manager.fsdp_vllm",
     ):
         module = sys.modules.get(module_name)
@@ -139,6 +140,43 @@ def _patch_ray_actor_runtime_env() -> None:
 
     compat_update_options._qwen3vl_compat_patch = True
     ray_class_with_init.update_options = compat_update_options
+
+
+def _patch_ray_visible_devices_flag_parser() -> None:
+    """Treat Ray NOSET env vars as booleans instead of generic non-empty strings."""
+
+    external_ray_utils = importlib.import_module("verl.utils.ray_utils")
+    original_ray_noset_visible_devices = external_ray_utils.ray_noset_visible_devices
+
+    if getattr(original_ray_noset_visible_devices, "_qwen3vl_compat_patch", False):
+        return
+
+    def compat_ray_noset_visible_devices(env_vars=os.environ):
+        env_names = (
+            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+            "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
+            "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES",
+            "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES",
+            "RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES",
+            "RAY_EXPERIMENTAL_NOSET_NEURON_RT_VISIBLE_CORES",
+            "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
+            "RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR",
+        )
+
+        for env_name in env_names:
+            value = env_vars.get(env_name)
+            if value is None:
+                continue
+            if str(value).strip().lower() in {"1", "true", "yes", "y", "on"}:
+                return True
+        return False
+
+    compat_ray_noset_visible_devices = functools.wraps(original_ray_noset_visible_devices)(
+        compat_ray_noset_visible_devices
+    )
+    compat_ray_noset_visible_devices.__dict__.update(original_ray_noset_visible_devices.__dict__)
+    compat_ray_noset_visible_devices._qwen3vl_compat_patch = True
+    external_ray_utils.ray_noset_visible_devices = compat_ray_noset_visible_devices
 
 
 def _patch_fsdp_checkpoint_manager() -> None:
@@ -327,10 +365,28 @@ def _patch_fsdp_update_actor_metadata() -> None:
 
 
 def _patch_rollout_correction_helper() -> None:
-    """Allow runtime rollout_correction injection on structured OmegaConf configs."""
+    """Patch rollout correction helper only for older VERL entry points.
+
+    VERL v0.17+ moved the bypass-mode setup into `apply_bypass_mode`, which
+    already injects `old_log_probs`, `policy_loss.rollout_correction`, and
+    `policy_loss.loss_mode`. Older builds exposed `apply_rollout_correction`
+    instead, so keep the repo patch only for that legacy path.
+    """
 
     external_helper = importlib.import_module("verl.trainer.ppo.rollout_corr_helper")
-    original_apply_rollout_correction = external_helper.apply_rollout_correction
+    original_apply_rollout_correction = getattr(external_helper, "apply_rollout_correction", None)
+
+    if original_apply_rollout_correction is None:
+        if hasattr(external_helper, "apply_bypass_mode"):
+            logger.info(
+                "VERL rollout correction helper already provides apply_bypass_mode; "
+                "skipping legacy apply_rollout_correction compat patch."
+            )
+            return
+        raise AttributeError(
+            "VERL rollout correction helper exposes neither apply_rollout_correction "
+            "nor apply_bypass_mode."
+        )
 
     if getattr(original_apply_rollout_correction, "_qwen3vl_compat_patch", False):
         return
@@ -362,7 +418,13 @@ def _patch_rollout_correction_helper() -> None:
 
 
 def _patch_rlhf_dataset_message_builder() -> None:
-    """Allow RL datasets to carry already-structured multimodal message content."""
+    """Preserve structured multimodal content while deferring string prompts to VERL.
+
+    VERL v0.17+ expands ``<image>``/``<video>`` placeholders using the separate
+    ``images``/``videos`` payload columns. Keep that upstream behavior intact for
+    string prompts, and only bypass it when a dataset row is already carrying
+    structured multimodal ``content`` objects.
+    """
 
     external_dataset = importlib.import_module("verl.utils.dataset.rl_dataset")
     dataset_cls = external_dataset.RLHFDataset
@@ -372,27 +434,11 @@ def _patch_rlhf_dataset_message_builder() -> None:
         return
 
     def compat_build_messages(self, example: dict):
-        messages: list = example.pop(self.prompt_key)
+        messages = example[self.prompt_key]
+        if any(not isinstance(message.get("content"), str) for message in messages):
+            return messages
 
-        if self.image_key in example or self.video_key in example:
-            for message in messages:
-                content = message["content"]
-                if not isinstance(content, str):
-                    continue
-                content_list = []
-                segments = re.split("(<image>|<video>)", content)
-                segments = [item for item in segments if item != ""]
-                for segment in segments:
-                    if segment == "<image>":
-                        content_list.append({"type": "image"})
-                    elif segment == "<video>":
-                        content_list.append({"type": "video"})
-                    else:
-                        content_list.append({"type": "text", "text": segment})
-
-                message["content"] = content_list
-
-        return messages
+        return original_build_messages(self, copy.deepcopy(example))
 
     compat_build_messages = functools.wraps(original_build_messages)(compat_build_messages)
     compat_build_messages.__dict__.update(original_build_messages.__dict__)
@@ -406,9 +452,11 @@ def apply_runtime_compat_patches() -> None:
     if _PATCHED:
         return
 
+    apply_flash_attn_varlen_compat_patch()
     _patch_verl_vllm_module()
     _patch_imported_runtime_aliases()
     _patch_ray_actor_runtime_env()
+    _patch_ray_visible_devices_flag_parser()
     _patch_fsdp_checkpoint_manager()
     _patch_fsdp_update_actor_metadata()
     _patch_rollout_correction_helper()

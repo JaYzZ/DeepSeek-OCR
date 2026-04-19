@@ -20,8 +20,8 @@ fi
 
 PROJECT_BASE_CONFIG="${PROJECT_BASE_CONFIG:-$REPO_ROOT/Qwen/configs/rl/deepvision_gspo.yaml}"
 PROJECT_CONFIG="${PROJECT_CONFIG:-}"
-MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/sources/DeepSeek-OCR/Qwen/checkpoints/Qwen3-VL-Linear-2B-Thinking}"
-DATA_DIR="${DATA_DIR:-$REPO_ROOT/Qwen/data/deepvision_103k_verl}"
+MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/huggingface/Qwen/Qwen3-VL-2B-Thinking}"
+DATA_DIR="${DATA_DIR:-$REPO_ROOT/Qwen/data/deepvision_verl}"
 TRAIN_FILE="${TRAIN_FILE:-$DATA_DIR/train.parquet}"
 VAL_FILE="${VAL_FILE:-$DATA_DIR/val.parquet}"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/Qwen/checkpoints/qwen3vl-2b/verl/deepvision_gspo/run_${TIMESTAMP}}"
@@ -183,12 +183,12 @@ export VLLM_PLUGINS="${VLLM_PLUGINS:-vllm_thinking}"
 export VLLM_THINKING="${VLLM_THINKING:-1}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
-export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES="${RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES:-1}"
+qwen3vl_configure_ray_noset_cuda_visible_devices
 if [[ -n "$INIT_LORA_PATH" ]]; then
   export VLLM_LORA_CHECKPOINT_PATH="${VLLM_LORA_CHECKPOINT_PATH:-$INIT_LORA_PATH}"
 fi
 
-EFFECTIVE_CONFIG_LINES="$("$PYTHON_BIN" - "$PROJECT_BASE_CONFIG" "${PROJECT_CONFIG:-}" "$RESOLVED_CONFIG_FILE" <<'PY'
+EFFECTIVE_CONFIG_LINES="$(env PYTHONPATH= PYTHONSAFEPATH=1 "$PYTHON_BIN" - "$PROJECT_BASE_CONFIG" "${PROJECT_CONFIG:-}" "$RESOLVED_CONFIG_FILE" <<'PY'
 import sys
 from omegaconf import OmegaConf
 
@@ -311,12 +311,12 @@ CMD+=("$@")
 printf 'Launching GSPO with output_dir=%s\n' "$OUTPUT_DIR"
 printf 'Training log=%s\n' "$LOG_FILE"
 printf 'Visible GPUs=%s cuda_visible_devices=%s nnodes=%s tp=%s train=%s val=%s\n' "$VISIBLE_GPUS" "${CUDA_VISIBLE_DEVICES:-<unset>}" "$EFFECTIVE_NNODES" "$EFFECTIVE_ROLLOUT_TP_SIZE" "$TRAIN_FILE" "$VAL_FILE"
-printf 'Gen batch=%s train batch=%s rollout_n=%s loss_mode=%s reward_manager=%s\n' "$EFFECTIVE_GEN_BATCH_SIZE" "$EFFECTIVE_TRAIN_BATCH_SIZE" "$EFFECTIVE_ROLLOUT_N" 'gspo' 'dapo_batch'
+printf 'Gen batch=%s train batch=%s rollout_n=%s loss_mode=%s reward_manager=%s\n' "$EFFECTIVE_GEN_BATCH_SIZE" "$EFFECTIVE_TRAIN_BATCH_SIZE" "$EFFECTIVE_ROLLOUT_N" 'gspo' 'dapo'
 printf 'Rollout eager=%s gpu_mem_util=%s mm_preproc_cache_disabled=%s\n' "$EFFECTIVE_ROLLOUT_ENFORCE_EAGER" "$EFFECTIVE_GPU_MEMORY_UTILIZATION" "$EFFECTIVE_ROLLOUT_DISABLE_MM_PREPROCESSOR_CACHE"
 printf 'Filter workers=%s rollout_max_model_len=%s rollout_max_batched_tokens=%s\n' "$EFFECTIVE_FILTER_WORKERS" "$EFFECTIVE_ROLLOUT_MAX_MODEL_LEN" "$EFFECTIVE_ROLLOUT_MAX_BATCHED_TOKENS"
 printf 'Overlong buffer enabled=%s len=%s penalty_factor=%s log=%s\n' "$ENABLE_OVERLONG_BUFFER" "$OVERLONG_BUFFER_LEN" "$OVERLONG_PENALTY_FACTOR" "$OVERLONG_LOG"
 printf 'Runtime env stamp=%s\n' "$RUNTIME_ENV_STAMP"
-printf 'Ray no-set cuda visible devices=%s\n' "$RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"
+printf 'Ray no-set cuda visible devices=%s\n' "${RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES:-<unset>}"
 printf 'Init LoRA=%s resume_mode=%s resume_from=%s\n' "${INIT_LORA_PATH:-<none>}" "$RESUME_MODE" "${RESUME_FROM_PATH:-<none>}"
 printf 'VAE source path=%s\n' "${VLLM_LORA_CHECKPOINT_PATH:-<none>}"
 printf 'VLLM model path=%s\n' "${VLLM_MODEL_PATH:-<none>}"

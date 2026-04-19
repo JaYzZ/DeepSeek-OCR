@@ -323,6 +323,57 @@ def test_save_vae_checkpoint_falls_back_to_runtime_handoff(tmp_path, monkeypatch
     assert torch.equal(saved["good_weight"], valid_state["good_weight"])
 
 
+def test_save_peft_checkpoint_uses_unwrapped_model(tmp_path, monkeypatch):
+    class DummyPeftBase:
+        pass
+
+    class DummyPeftModel(DummyPeftBase):
+        def __init__(self):
+            self.calls = []
+
+        def save_pretrained(self, output_dir, safe_serialization=True, is_main_process=True):
+            self.calls.append((output_dir, safe_serialization, is_main_process))
+            os.makedirs(output_dir, exist_ok=True)
+            with open(os.path.join(output_dir, "adapter_model.safetensors"), "w", encoding="utf-8") as f:
+                f.write("ok")
+
+    class DummyAccelerator:
+        def __init__(self, model):
+            self._model = model
+
+        def unwrap_model(self, model):
+            assert model is self._model
+            return SimpleNamespace(_orig_mod=dummy_model)
+
+    dummy_model = DummyPeftModel()
+    trainer = SimpleNamespace(
+        model=object(),
+        args=SimpleNamespace(should_save=True, save_safetensors=True),
+        accelerator=None,
+        is_world_process_zero=lambda: True,
+    )
+    trainer.accelerator = DummyAccelerator(trainer.model)
+
+    monkeypatch.setattr(lfi, "PeftModel", DummyPeftBase)
+    monkeypatch.setattr(lfi.dist, "is_initialized", lambda: False)
+
+    assert lfi._save_peft_checkpoint(trainer, str(tmp_path)) is True
+    assert dummy_model.calls == [(str(tmp_path), True, True)]
+    assert (tmp_path / "adapter_model.safetensors").exists()
+    assert (tmp_path / "training_args.bin").exists()
+
+
+def test_save_peft_checkpoint_returns_false_for_non_peft(tmp_path):
+    trainer = SimpleNamespace(
+        model=object(),
+        args=SimpleNamespace(should_save=True, save_safetensors=True),
+        accelerator=None,
+        is_world_process_zero=lambda: True,
+    )
+
+    assert lfi._save_peft_checkpoint(trainer, str(tmp_path)) is False
+
+
 def test_unbalanced_sinkhorn_prefers_selective_matches_over_full_average():
     cost_matrix = torch.tensor(
         [

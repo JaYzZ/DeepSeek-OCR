@@ -60,7 +60,7 @@ _build_curriculum_stage_plan() {
     local aux_source_str="$5"
     local latent_ce_str="$6"
     local total_epochs="$7"
-    "$PYTHON_BIN" - "$epochs_str" "$loss_types_str" "$vae_trainable_str" "$lora_trainable_str" "$aux_source_str" "$latent_ce_str" "$total_epochs" <<'PY'
+    env PYTHONPATH= PYTHONSAFEPATH=1 "$PYTHON_BIN" - "$epochs_str" "$loss_types_str" "$vae_trainable_str" "$lora_trainable_str" "$aux_source_str" "$latent_ce_str" "$total_epochs" <<'PY'
 import sys
 
 epochs_str, loss_types_str, vae_trainable_str, lora_trainable_str, aux_source_str, latent_ce_str, total_epochs_str = sys.argv[1:]
@@ -125,7 +125,7 @@ PY
 _resolve_total_num_train_epochs() {
     local main_total_epochs="$1"
     local curriculum_epochs="$2"
-    "$PYTHON_BIN" - "$main_total_epochs" "$curriculum_epochs" <<'PY'
+    env PYTHONPATH= PYTHONSAFEPATH=1 "$PYTHON_BIN" - "$main_total_epochs" "$curriculum_epochs" <<'PY'
 import sys
 
 main_total_epochs_str, curriculum_epochs = sys.argv[1:]
@@ -161,7 +161,7 @@ PY
 _compute_epoch_span() {
     local start_epoch="$1"
     local end_epoch="$2"
-    "$PYTHON_BIN" - "$start_epoch" "$end_epoch" <<'PY'
+    env PYTHONPATH= PYTHONSAFEPATH=1 "$PYTHON_BIN" - "$start_epoch" "$end_epoch" <<'PY'
 import sys
 
 start_epoch = float(sys.argv[1])
@@ -177,7 +177,7 @@ _build_curriculum_stage_dataset_plan() {
     local stage_datasets_str="$1"
     local default_dataset_spec="$2"
     local num_stages="$3"
-    "$PYTHON_BIN" - "$stage_datasets_str" "$default_dataset_spec" "$num_stages" <<'PY'
+    env PYTHONPATH= PYTHONSAFEPATH=1 "$PYTHON_BIN" - "$stage_datasets_str" "$default_dataset_spec" "$num_stages" <<'PY'
 import sys
 
 raw_stage_datasets, default_dataset_spec, num_stages_str = sys.argv[1:]
@@ -673,21 +673,22 @@ _run_llamafactory_stage() {
     echo "  Stage output dir: $stage_output_dir"
     echo "========================================================================"
 
+    local stage_config_path="$CONFIG_PATH"
     local exit_code
-    if [ "$USE_DEEPSPEED" = true ]; then
-        set +e
-        torchrun \
-          --standalone \
-          --nproc_per_node="$NPROC_PER_NODE" \
-          -m llamafactory.cli train "$CONFIG_PATH" "${stage_args[@]}" 2>&1 | tee -a "$LOG_FILE"
-        exit_code=${PIPESTATUS[0]}
-        set -e
-    else
-        set +e
-        "$PYTHON_BIN" -m llamafactory.cli train "$CONFIG_PATH" "${stage_args[@]}" 2>&1 | tee -a "$LOG_FILE"
-        exit_code=${PIPESTATUS[0]}
-        set -e
+
+    if [ "${NPROC_PER_NODE:-1}" = "1" ]; then
+        if [ "$USE_FSDP" = true ]; then
+            stage_config_path="$stage_output_dir/runtime_single_gpu_no_fsdp.yaml"
+            qwen3vl_materialize_single_gpu_runtime_config "$PYTHON_BIN" "$CONFIG_PATH" "$stage_config_path"
+            echo "⚠️  Single visible GPU detected. Using a runtime config without FSDP because the current torch FSDP NO_SHARD path is broken for Qwen3VL tied weights."
+            _log_wrapper_status "single_gpu_fsdp_fallback stage=$stage_num source_config=$CONFIG_PATH runtime_config=$stage_config_path"
+        fi
     fi
+
+    set +e
+    "$PYTHON_BIN" -m llamafactory.cli train "$stage_config_path" "${stage_args[@]}" 2>&1 | tee -a "$LOG_FILE"
+    exit_code=${PIPESTATUS[0]}
+    set -e
 
     _log_wrapper_status "stage_finished stage=$stage_num exit_code=$exit_code"
 

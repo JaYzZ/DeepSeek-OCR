@@ -133,6 +133,13 @@ def apply_runtime_env_for_thinking(
             os.environ["VLLM_ENFORCE_EAGER"] = "1" if str(val).strip().lower() in {"1", "true", "yes", "on"} else "0"
             loaded.append(f"VLLM_ENFORCE_EAGER={os.environ['VLLM_ENFORCE_EAGER']}")
 
+        if not os.environ.get("DISABLE_VERSION_CHECK"):
+            val = cfg.get("disable_version_check", 1)
+            os.environ["DISABLE_VERSION_CHECK"] = (
+                "1" if str(val).strip().lower() in {"1", "true", "yes", "on"} else "0"
+            )
+            loaded.append(f"DISABLE_VERSION_CHECK={os.environ['DISABLE_VERSION_CHECK']}")
+
         if loaded:
             _emit_info(f"{', '.join(loaded)} (from {cfg_path})")
     except Exception as e:
@@ -140,12 +147,14 @@ def apply_runtime_env_for_thinking(
         os.environ.setdefault("VLLM_THINKING", "1")
         os.environ.setdefault("VLLM_FORCE_THINK", "0")
         os.environ.setdefault("VLLM_ENFORCE_EAGER", "0")
+        os.environ.setdefault("DISABLE_VERSION_CHECK", "1")
         _emit_warn(
             f"failed to load vLLM thinking runtime env from {cfg_path} ({e}); "
             f"fallback MIN_CONTINUOUS_STEPS={os.environ['MIN_CONTINUOUS_STEPS']}, "
             f"VLLM_THINKING={os.environ['VLLM_THINKING']}, "
             f"VLLM_FORCE_THINK={os.environ['VLLM_FORCE_THINK']}, "
-            f"VLLM_ENFORCE_EAGER={os.environ['VLLM_ENFORCE_EAGER']}"
+            f"VLLM_ENFORCE_EAGER={os.environ['VLLM_ENFORCE_EAGER']}, "
+            f"DISABLE_VERSION_CHECK={os.environ['DISABLE_VERSION_CHECK']}"
         )
 
 

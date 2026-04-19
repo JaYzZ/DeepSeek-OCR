@@ -2027,7 +2027,7 @@ def start_vllm_server(
     print(f"{'='*80}\n")
 
     # Build command
-    script_path = Path(__file__).parent.parent / "scripts" / "vllm_server.py"
+    script_path = Path(__file__).parent.parent / "inference" / "vllm_server.py"
 
     # Resolve paths to absolute to avoid working directory issues
     if model_path and not os.path.isabs(model_path):
@@ -2338,14 +2338,14 @@ Examples:
     parser.add_argument(
         "--server-temperature",
         type=float,
-        default=1.0,
-        help="Sampling temperature for server-mode inference (default: 1.0)"
+        default=0.0,
+        help="Sampling temperature for server-mode inference (default: 0.0)"
     )
     parser.add_argument(
         "--server-top-p",
         type=float,
-        default=0.95,
-        help="Top-p for server-mode inference (default: 0.95)"
+        default=1.0,
+        help="Top-p for server-mode inference (default: 1.0)"
     )
     parser.add_argument(
         "--server-n",

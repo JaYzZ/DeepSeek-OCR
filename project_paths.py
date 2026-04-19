@@ -38,6 +38,31 @@ def deepseek_ocr_path(*parts: str) -> Path:
     return get_deepseek_ocr_dir().joinpath(*parts)
 
 
+def resolve_project_path(path: str | Path, repo_root: str | Path | None = None) -> Path:
+    """Resolve a path against the repo root or the global project root.
+
+    Absolute paths are returned unchanged.
+
+    Relative paths are first resolved against ``repo_root`` (or the
+    DeepSeek-OCR repo root by default). If that candidate does not exist, the
+    global ``ROOT_DIR`` project root is tried next. This supports mixed asset
+    references such as repo-local ``Qwen/...`` paths and project-level
+    ``huggingface/...`` or ``sources/...`` paths.
+    """
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    bases = [Path(repo_root).expanduser() if repo_root is not None else get_deepseek_ocr_dir()]
+    project_root = get_project_root()
+    if project_root not in bases:
+        bases.append(project_root)
+    for base in bases:
+        resolved = base / candidate
+        if resolved.exists():
+            return resolved
+    return bases[0] / candidate
+
+
 def sources_path(*parts: str) -> Path:
     return get_sources_dir().joinpath(*parts)
 

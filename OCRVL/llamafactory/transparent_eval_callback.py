@@ -23,7 +23,7 @@ from PIL import Image
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 from transformers.integrations import is_fsdp_managed_module
-from project_paths import get_deepseek_ocr_dir
+from project_paths import get_deepseek_ocr_dir, resolve_project_path
 
 logger = logging.getLogger(__name__)
 
@@ -273,7 +273,7 @@ class TransparentEvalCallback(TrainerCallback):
             try:
                 images = []
                 for img_path in sample['images']:
-                    full_path = Path(self.project_dir) / img_path
+                    full_path = resolve_project_path(img_path, repo_root=self.project_dir)
                     if full_path.exists():
                         images.append(Image.open(full_path).convert('RGB'))
 
@@ -511,7 +511,7 @@ class TransparentEvalCallback(TrainerCallback):
             images = result.get('images', [])
 
             for img_idx, img_path in enumerate(images):
-                src = Path(self.project_dir) / img_path
+                src = resolve_project_path(img_path, repo_root=self.project_dir)
                 if src.exists():
                     # Name: {sample_id}_img{idx}{ext}
                     ext = src.suffix

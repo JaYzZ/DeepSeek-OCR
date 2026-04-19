@@ -18,7 +18,7 @@ qwen3vl_get_yaml_value() {
     local file_path="$2"
     local key="$3"
     local default_value="${4:-}"
-    "$python_bin" - "$file_path" "$key" "$default_value" <<'PY'
+    env PYTHONPATH= PYTHONSAFEPATH=1 "$python_bin" - "$file_path" "$key" "$default_value" <<'PY'
 import sys
 from pathlib import Path
 import yaml
@@ -65,7 +65,7 @@ qwen3vl_export_env_from_yaml() {
 
 qwen3vl_resolve_master_port() {
     local python_bin="$1"
-    "$python_bin" - "${MASTER_PORT:-}" <<'PY'
+    env PYTHONPATH= PYTHONSAFEPATH=1 "$python_bin" - "${MASTER_PORT:-}" <<'PY'
 import socket
 import sys
 
@@ -112,7 +112,7 @@ qwen3vl_snapshot_run_configs() {
 qwen3vl_list_checkpoint_dirs() {
     local python_bin="$1"
     local ckpt_dir="$2"
-    "$python_bin" - "$ckpt_dir" <<'PY'
+    env PYTHONPATH= PYTHONSAFEPATH=1 "$python_bin" - "$ckpt_dir" <<'PY'
 import sys
 from pathlib import Path
 
@@ -140,10 +140,15 @@ qwen3vl_count_visible_gpus() {
         awk -F',' '{print NF}' <<<"${CUDA_VISIBLE_DEVICES}"
         return
     fi
-    "$python_bin" - <<'PY'
+    env PYTHONPATH= PYTHONSAFEPATH=1 "$python_bin" - <<'PY'
 import torch
 print(torch.cuda.device_count())
 PY
+}
+
+
+qwen3vl_configure_ray_noset_cuda_visible_devices() {
+    unset RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES || true
 }
 
 
@@ -158,4 +163,30 @@ qwen3vl_copy_if_present() {
     if [[ -n "$src" && -f "$src" ]]; then
         cp "$src" "$dest_dir/$(basename "$src")"
     fi
+}
+
+
+qwen3vl_materialize_single_gpu_runtime_config() {
+    local python_bin="$1"
+    local src_config="$2"
+    local dest_config="$3"
+    env PYTHONPATH= PYTHONSAFEPATH=1 "$python_bin" - "$src_config" "$dest_config" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+src_config = Path(sys.argv[1])
+dest_config = Path(sys.argv[2])
+data = yaml.safe_load(src_config.read_text()) or {}
+
+# Current PyTorch FSDP clamps single-process world size to NO_SHARD. For
+# Qwen3VL's tied embed/lm_head weights, that upstream path crashes under
+# use_orig_params.
+data.pop("fsdp", None)
+data.pop("fsdp_config", None)
+
+dest_config.parent.mkdir(parents=True, exist_ok=True)
+dest_config.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+PY
 }

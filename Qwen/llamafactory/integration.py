@@ -30,7 +30,7 @@ import safetensors.torch
 
 from transformers import AutoTokenizer, TrainerCallback, Trainer
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
-from peft import PeftModelForCausalLM
+from peft import PeftModel, PeftModelForCausalLM
 from llamafactory.data import SFTDataCollatorWith4DAttentionMask, loader as loader_module
 from llamafactory.data.converter import SharegptDatasetConverter
 from llamafactory.data.mm_plugin import Qwen3VLPlugin
@@ -47,12 +47,14 @@ from llamafactory.data.template import (
 from llamafactory.train.callbacks import SaveProcessorCallback
 from llamafactory.train.sft.trainer import CustomSeq2SeqTrainer
 
+from Qwen.compat.flash_attn import apply_flash_attn_varlen_compat_patch
 from Qwen.llamafactory.transparent_eval_callback import QwenTransparentEvalCallback
 from Qwen.llamafactory.curriculum_callback import QwenCurriculumCallback
 from Qwen.llamafactory.runtime_env import get_flag
 
 logger = logging.getLogger(__name__)
 debug_enabled = os.environ.get("LLAMAFACTORY_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+TRAINING_ARGS_BIN = "training_args.bin"
 
 
 def _is_rank0() -> bool:
@@ -522,6 +524,12 @@ def _patch_once() -> None:
     except Exception as e:
         logger.warning(f"[Qwen3VL Latent] Failed to patch tokenizer for special tokens: {e}")
 
+    # Patch 0b: Repair flash-attn varlen wrapper/native signature skew.
+    try:
+        apply_flash_attn_varlen_compat_patch()
+    except Exception as e:
+        logger.warning(f"[Qwen3VL Latent] Failed to patch flash-attn varlen compat: {e}")
+
     # Grid_thw handling: vision model manages pre-merge values correctly
     _patch_qwen2vl_image_processor(logger)
 
@@ -913,6 +921,46 @@ def _maybe_load_runtime_vae_checkpoint(model) -> None:
 def _should_save_vae_checkpoint() -> bool:
     """Save VAE checkpoints only when the active stage actually uses VAE."""
     return "vae" in _get_loss_spec()
+
+
+def _unwrap_trainer_model_for_save(trainer) -> Any:
+    """Return the underlying model used for adapter checkpoint saves."""
+    model = trainer.model
+    accelerator = getattr(trainer, "accelerator", None)
+    if accelerator is not None:
+        model = accelerator.unwrap_model(model)
+    return getattr(model, "_orig_mod", model)
+
+
+def _save_peft_checkpoint(trainer, output_dir: str) -> bool:
+    """Save PEFT checkpoints directly from the unwrapped adapter model."""
+    model = _unwrap_trainer_model_for_save(trainer)
+    if not isinstance(model, PeftModel):
+        return False
+
+    should_save = bool(getattr(trainer.args, "should_save", False))
+    is_main_process = bool(getattr(trainer, "is_world_process_zero", lambda: should_save)())
+
+    if should_save:
+        os.makedirs(output_dir, exist_ok=True)
+
+    model.save_pretrained(
+        output_dir,
+        safe_serialization=bool(getattr(trainer.args, "save_safetensors", True)),
+        is_main_process=is_main_process,
+    )
+
+    if should_save and is_main_process:
+        torch.save(trainer.args, os.path.join(output_dir, TRAINING_ARGS_BIN))
+        logger.info("[Qwen3VL Latent] Saved PEFT checkpoint to %s", output_dir)
+
+    try:
+        if dist.is_initialized():
+            dist.barrier()
+    except Exception:
+        pass
+
+    return True
 
 
 def _patch_dataset_converter(logger) -> None:
@@ -2673,7 +2721,10 @@ def _patch_trainer_callback(logger) -> None:
                     output_dir = os.path.join(self.args.output_dir, "checkpoint_latest")
             except Exception:
                 pass
-        result = original_save_model(self, output_dir=output_dir, *args, **kwargs)
+        if _save_peft_checkpoint(self, output_dir):
+            result = None
+        else:
+            result = original_save_model(self, output_dir=output_dir, *args, **kwargs)
 
         # Save VAE alongside every trainer-managed checkpoint save, including the final
         # `save_model(output_dir=self.args.output_dir)` path that is remapped to

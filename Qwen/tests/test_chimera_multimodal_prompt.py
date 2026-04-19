@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 from PIL import Image
 import torch
 from verl.utils.dataset.rl_dataset import RLHFDataset
@@ -17,7 +18,7 @@ from verl_compat.continuous_replay import (
 )
 
 
-def test_build_chimera_verl_dataset_emits_structured_image_content(tmp_path):
+def test_build_chimera_verl_dataset_emits_string_prompt_with_image_side_channel(tmp_path):
     image_dir = tmp_path / "images"
     image_dir.mkdir()
     sample_id = "chimera_0000000"
@@ -31,6 +32,8 @@ def test_build_chimera_verl_dataset_emits_structured_image_content(tmp_path):
     )
 
     assert len(images) == 1
+    assert images[0]["path"] is None
+    assert images[0]["bytes"]
     assert prompt == [
         {
             "role": "system",
@@ -38,13 +41,7 @@ def test_build_chimera_verl_dataset_emits_structured_image_content(tmp_path):
         },
         {
             "role": "user",
-            "content": [
-                {"type": "image"},
-                {
-                    "type": "text",
-                    "text": "The image contains the full problem statement. Solve it carefully. This is a Mathematics problem.",
-                },
-            ],
+            "content": "<image>\nThe image contains the full problem statement. Solve it carefully. This is a Mathematics problem.",
         }
     ]
 
@@ -82,6 +79,37 @@ def test_build_chimera_record_keeps_incorrect_trace_rows(tmp_path):
     assert record["extra_info"]["correctness"] is False
 
 
+def test_build_chimera_parquet_roundtrip_preserves_prompt_and_images(tmp_path):
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    sample_id = "chimera_0000000"
+    image_path = image_dir / f"{sample_id}_question.png"
+    Image.new("RGB", (8, 8), color="white").save(image_path)
+
+    record = chimera_build._build_record(
+        {
+            "question": "Q",
+            "answer": "A",
+            "solution": "S",
+            "original_solution": "OS",
+            "subject": "Math",
+            "topic": "Geometry",
+            "index": 0,
+        },
+        source_name="train",
+        row_idx=0,
+        chimera_images_dir=image_dir,
+    )
+
+    output_path = tmp_path / "chimera.parquet"
+    chimera_build._write_parquet([record], output_path)
+
+    df = pd.read_parquet(output_path)
+    row = df.iloc[0]
+    assert len(row["prompt"]) == 2
+    assert len(row["images"]) == 1
+
+
 def test_rlhf_dataset_patch_preserves_structured_multimodal_content():
     _patch_rlhf_dataset_message_builder()
 
@@ -89,6 +117,7 @@ def test_rlhf_dataset_patch_preserves_structured_multimodal_content():
     dummy_dataset.prompt_key = "prompt"
     dummy_dataset.image_key = "images"
     dummy_dataset.video_key = "videos"
+    dummy_dataset.processor = object()
 
     structured_example = {
         "prompt": [
@@ -113,13 +142,15 @@ def test_rlhf_dataset_patch_preserves_structured_multimodal_content():
 
     legacy_example = {
         "prompt": [{"role": "user", "content": "<image>\nSolve this question shown in the image."}],
-        "images": ["placeholder.png"],
+        "images": [Image.new("RGB", (4, 4), color="white")],
     }
     legacy_messages = dummy_dataset._build_messages(legacy_example)
-    assert legacy_messages[0]["content"] == [
-        {"type": "image"},
-        {"type": "text", "text": "\nSolve this question shown in the image."},
-    ]
+    assert legacy_messages[0]["content"][0]["type"] == "image"
+    assert isinstance(legacy_messages[0]["content"][0]["image"], Image.Image)
+    assert legacy_messages[0]["content"][1] == {
+        "type": "text",
+        "text": "\nSolve this question shown in the image.",
+    }
 
 
 def test_multimodal_validation_ignores_generated_image_token_when_prompt_mask_is_provided():

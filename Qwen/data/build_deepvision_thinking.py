@@ -5,7 +5,7 @@ Build DeepVision-103K Thinking Dataset in Qwen3VL latent-training format.
 Input:
 - DeepVision parquet files (math-77k.parquet, visual_logic-26k.parquet)
 
-Output JSONL schema (aligned with r1_onevision_thinking.jsonl):
+Output JSONL schema (aligned with r1ov_thinking.jsonl):
 - messages
 - images
 - latent_ground_truth
@@ -34,6 +34,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
@@ -225,6 +226,7 @@ def main_render_only(args):
 
     output_dir.mkdir(parents=True, exist_ok=True)
     images_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Keep DeepVision thinking renders on the same adaptive Skia path as
     # r1_onevision so line wrapping and newline preservation match.
@@ -250,6 +252,7 @@ def main_render_only(args):
 
     kept = 0
     skipped = 0
+
     with open(metadata_path, "w", encoding="utf-8") as f_meta:
         for idx, row in enumerate(all_rows):
             split_name = _safe_name(row.get("_split", "unknown"))
@@ -278,7 +281,8 @@ def main_render_only(args):
             if not _is_valid_image_file(query_path):
                 try:
                     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                    _atomic_save_png(img, query_path)
+                    img_array = np.array(img)
+                    _atomic_save_png(img_array, query_path)
                 except Exception:
                     skipped += 1
                     continue
@@ -293,7 +297,7 @@ def main_render_only(args):
             for cidx, chunk in enumerate(thinking_chunks):
                 chunk_name = f"{sample_id}_thinking_{cidx}"
                 chunk_path = images_dir / f"{chunk_name}.png"
-                if not chunk_path.exists():
+                if not _is_valid_image_file(chunk_path):
                     render_buffer.append((chunk, chunk_path))
                 thinking_image_paths.append(str(chunk_path))
 
@@ -323,7 +327,7 @@ def main_render_only(args):
             kept += 1
 
             if kept % 500 == 0:
-                logger.info(f"Render progress: kept={kept} skipped={skipped}")
+                logger.info(f"Render progress: {kept}/{len(all_rows)} ({kept/len(all_rows)*100:.1f}%) skipped={skipped}")
 
     # Flush remaining render tasks.
     flush_render_buffer(force=True)
@@ -416,6 +420,7 @@ def main_encode_only(args):
 
     kept = 0
     seq_len_cache: Dict[str, int] = {}
+    out_jsonl.parent.mkdir(parents=True, exist_ok=True)
     with open(out_jsonl, "w", encoding="utf-8") as f_out:
         for s in samples:
             thinking_cache_paths = []
@@ -483,7 +488,7 @@ def main():
     parser.add_argument("--output-dir", default="Qwen/data")
     parser.add_argument("--images-dir", default="Qwen/data/deepvision_images")
     parser.add_argument("--metadata-file", default="metadata/deepvision_103k_metadata.jsonl")
-    parser.add_argument("--output-jsonl", default="sft/deepvision_103k_thinking.jsonl")
+    parser.add_argument("--output-jsonl", default="sft/deepvision_thinking.jsonl")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-chars-per-chunk", type=int, default=4800)
     parser.add_argument("--batch-size", type=int, default=64)

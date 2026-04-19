@@ -60,7 +60,7 @@ freeze_vision_tower: true
 #   `latent_ce_token=0`
 # - `num_latent_steps`: number of thinking chunks (`<think_sep>` count + 1)
 # Unified latent SFT: always train on both R1-OneVision and encoded DeepVision-103K.
-dataset: r1_onevision_thinking,deepvision_thinking
+dataset: r1ov_thinking,deepvision_thinking
 dataset_dir: Qwen/data
 template: qwen3vl_latent
 cutoff_len: 8192

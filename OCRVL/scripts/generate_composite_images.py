@@ -9,6 +9,7 @@ import argparse
 import json
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
+from project_paths import resolve_project_path
 
 
 def extract_display_output(full_output: str) -> str:
@@ -93,7 +94,7 @@ def create_composite_image(
     # Load images
     images = []
     for img_path in result.get('images', []):
-        full_path = repo_root / img_path
+        full_path = resolve_project_path(img_path, repo_root=repo_root)
         if full_path.exists():
             img = Image.open(full_path).convert('RGB')
             images.append(img)

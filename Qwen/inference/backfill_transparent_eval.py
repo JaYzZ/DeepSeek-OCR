@@ -40,7 +40,7 @@ from transformers import AutoProcessor, AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.v1.engine import LoRARequest
 from vllm_thinking.runner_patch import apply_thinking_mode_patch
-from project_paths import hf_path
+from project_paths import hf_path, resolve_project_path
 
 
 if os.environ.get("VLLM_THINKING", "0").strip().lower() in {"1", "true", "yes", "on"}:
@@ -370,7 +370,7 @@ def run_evaluation(
             # Load images
             images = []
             for img_path in sample['images']:
-                full_path = repo_root / img_path
+                full_path = resolve_project_path(img_path, repo_root=repo_root)
                 if full_path.exists():
                     images.append(Image.open(full_path).convert('RGB'))
                 else:
@@ -805,11 +805,7 @@ def save_results(
         # Load images
         images = []
         for img_path in result.get('images', []):
-            # Handle both absolute and relative paths
-            if os.path.isabs(img_path):
-                full_path = Path(img_path)
-            else:
-                full_path = repo_root / img_path
+            full_path = resolve_project_path(img_path, repo_root=repo_root)
             if full_path.exists():
                 img = Image.open(full_path).convert('RGB')
                 images.append(img)

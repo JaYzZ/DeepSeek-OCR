@@ -49,8 +49,6 @@ def vllm_thinking_plugin():
 
     # Canonical enable flag.
     enabled = _env_flag("VLLM_THINKING", default=False)
-    if "VLLM_THINKING_MODE_ENABLED" in os.environ and "VLLM_THINKING" not in os.environ:
-        logger.warning("[PLUGIN] Ignoring legacy VLLM_THINKING_MODE_ENABLED; set VLLM_THINKING=1")
     if "VLLM_THINKING" in os.environ:
         logger.info(f"[PLUGIN] VLLM_THINKING={enabled}")
     if not enabled:

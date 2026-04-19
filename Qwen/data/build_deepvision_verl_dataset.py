@@ -15,7 +15,7 @@ from project_paths import deepseek_ocr_path, hf_path
 
 
 DEFAULT_DATA_DIR = hf_path("skylenage", "DeepVision-103K")
-DEFAULT_OUTPUT_DIR = deepseek_ocr_path("Qwen", "data", "deepvision_103k_verl")
+DEFAULT_OUTPUT_DIR = deepseek_ocr_path("Qwen", "data", "deepvision_verl")
 
 
 def _to_python(value: Any) -> Any:

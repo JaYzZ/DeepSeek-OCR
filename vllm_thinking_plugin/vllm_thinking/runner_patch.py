@@ -210,6 +210,54 @@ def _get_min_continuous_steps() -> int:
     except Exception:
         return DEFAULT_MIN_CONTINUOUS_STEPS
 
+
+def _get_req_num_sched_for_forward(model_runner, req_idx: int) -> int:
+    """Scheduled-token count for the current v0.17+ GPU input batch."""
+    input_batch = model_runner.input_batch
+    computed = int(input_batch.num_computed_tokens_cpu[req_idx])
+    return max(0, int(input_batch.num_tokens_no_spec[req_idx]) - computed)
+
+
+def _get_req_token_pos_after_sample(model_runner, req_idx: int, req_id: str) -> int:
+    """Last generated token position after sample_tokens() on v0.17+."""
+    req_state = model_runner.requests.get(req_id)
+    if req_state is None:
+        return -1
+    return int(req_state.num_tokens) - 1
+
+
+def _get_result_req_ids(result) -> list[str]:
+    if result is None:
+        return []
+    req_ids = getattr(result, "req_ids", None)
+    if req_ids is not None:
+        return list(req_ids)
+    output = getattr(result, "_model_runner_output", None)
+    if output is None:
+        return []
+    return list(output.req_ids)
+
+
+def _get_result_sampled_token_ids(result) -> list[list[int]]:
+    if result is None:
+        return []
+    sampled_token_ids = getattr(result, "sampled_token_ids", None)
+    if sampled_token_ids:
+        return sampled_token_ids
+
+    ready_event = getattr(result, "async_copy_ready_event", None)
+    sampled_token_ids_cpu = getattr(result, "sampled_token_ids_cpu", None)
+    if ready_event is None or sampled_token_ids_cpu is None:
+        return []
+
+    ready_event.synchronize()
+    sampled_list = result.sampled_token_ids_cpu.tolist()
+    invalid_req_indices = set(result._invalid_req_indices)
+    for req_idx in invalid_req_indices:
+        if 0 <= req_idx < len(sampled_list):
+            sampled_list[req_idx] = []
+    return sampled_list
+
 _patch_applied = False
 
 
@@ -308,6 +356,7 @@ def apply_thinking_mode_patch():
         self._thinking_state = {}
         self._vae_loaded = False
         self.latent_vae = None
+        self.hidden_size = self.model_config.get_hidden_size()
         # Use vLLM's native mixed token/embed input path so the model call
         # signature stays static across decode iterations.
         self.enable_prompt_embeds = True
@@ -413,17 +462,14 @@ def apply_thinking_mode_patch():
 
     @functools.wraps(_orig_prepare_input_ids)
     def patched_prepare_input_ids(self, scheduler_output, total_num_scheduled_tokens, cu_num_tokens):
-        # vLLM's async scheduling fast path can overwrite GPU-side `is_token_ids`
-        # and force decode inputs back to token IDs. If any scheduled position is
-        # marked as a prompt/embed input, bypass that optimization so the mixed
-        # token/embed batch reaches `_preprocess` unchanged.
+        embed_rows: list[int] = []
         if self.enable_prompt_embeds:
             req_ids = getattr(self.input_batch, "req_ids", ())
             num_computed_tokens = self.input_batch.num_computed_tokens_cpu
             is_token_ids = self.input_batch.is_token_ids
             num_scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", {})
 
-            needs_embed_upload = False
+            flat_idx = 0
             for req_idx, req_id in enumerate(req_ids):
                 num_sched = int(num_scheduled_tokens.get(req_id, 0))
                 if num_sched <= 0:
@@ -431,15 +477,12 @@ def apply_thinking_mode_patch():
 
                 start = int(num_computed_tokens[req_idx])
                 end = start + num_sched
-                if end > start and not bool(is_token_ids[req_idx, start:end].all()):
-                    needs_embed_upload = True
-                    break
-
-            if needs_embed_upload:
-                self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
-                self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
-                self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
-                return
+                if end > start:
+                    row_mask = is_token_ids[req_idx, start:end]
+                    for local_idx, is_token in enumerate(row_mask):
+                        if not bool(is_token):
+                            embed_rows.append(flat_idx + local_idx)
+                flat_idx += num_sched
 
         _orig_prepare_input_ids(
             self,
@@ -447,6 +490,24 @@ def apply_thinking_mode_patch():
             total_num_scheduled_tokens,
             cu_num_tokens,
         )
+
+        if not embed_rows or not self.enable_prompt_embeds:
+            return
+
+        # Keep vLLM's async token backfill for normal decode rows, then patch
+        # only the embed-driven rows so multimodal embed_input_ids never sees
+        # async placeholder token IDs such as -1.
+        for flat_idx in embed_rows:
+            self.input_ids.gpu[flat_idx] = 0
+            if flat_idx < total_num_scheduled_tokens:
+                self.inputs_embeds.gpu[flat_idx].copy_(
+                    self.inputs_embeds.cpu[flat_idx].to(
+                        device=self.inputs_embeds.gpu.device,
+                        dtype=self.inputs_embeds.gpu.dtype,
+                        non_blocking=False,
+                    )
+                )
+                self.is_token_ids.gpu[flat_idx] = False
         return
 
     @functools.wraps(_orig_preprocess)
@@ -528,11 +589,10 @@ def apply_thinking_mode_patch():
             num_reqs = len(req_ids)
             if num_reqs > 0:
                 num_computed = self.input_batch.num_computed_tokens_cpu
-                num_tokens = self.input_batch.num_tokens
                 flat_idx = 0
                 for req_idx, req_id in enumerate(req_ids):
                     state = self._thinking_state.get(req_id)
-                    num_sched = int(num_tokens[req_idx] - num_computed[req_idx])
+                    num_sched = _get_req_num_sched_for_forward(self, req_idx)
                     if num_sched <= 0:
                         continue
 
@@ -595,16 +655,15 @@ def apply_thinking_mode_patch():
 
         # Call original sample_tokens
         result = _orig_sample_tokens(self, grammar_output)
+        if result is None:
+            return None
 
         # Get batch_req_ids to match with thinking state
-        batch_req_ids = []
-        if hasattr(self, 'input_batch') and hasattr(self.input_batch, 'req_ids'):
-            batch_req_ids = self.input_batch.req_ids
+        batch_req_ids = _get_result_req_ids(result)
+        if not batch_req_ids and hasattr(self, 'input_batch') and hasattr(self.input_batch, 'req_ids'):
+            batch_req_ids = list(self.input_batch.req_ids)
 
-        # Get sampled tokens from result - use sampled_token_ids instead of outputs
-        sampled_tokens_list = []
-        if batch_req_ids and hasattr(result, 'sampled_token_ids'):
-            sampled_tokens_list = result.sampled_token_ids
+        sampled_tokens_list = _get_result_sampled_token_ids(result) if batch_req_ids else []
 
         if batch_req_ids and sampled_tokens_list:
             for i, req_id in enumerate(batch_req_ids):
@@ -718,7 +777,7 @@ def apply_thinking_mode_patch():
                             logits_row=_get_logprob_row(logits_for_trace, i),
                             req_id=str(req_id),
                         )
-                        req_pos = self.input_batch.num_tokens[ i ] - 1
+                        req_pos = _get_req_token_pos_after_sample(self, i, req_id)
                         if req_pos >= 0:
                             self.input_batch.token_ids_cpu[i, req_pos] = sampled
                             req_state = self.requests.get(req_id)
@@ -744,7 +803,7 @@ def apply_thinking_mode_patch():
                 use_continuous_embedding = bool(state.get('mode') == 'continuous' and last_hidden is not None)
                 global _CONTINUOUS_AR_CERT_LOGGED
                 if use_continuous_embedding and not _CONTINUOUS_AR_CERT_LOGGED:
-                    logger.debug(
+                    logger.warning(
                         "[Thinking] vLLM continuous AR active: req_id=%s source=%s saved_hidden_states=true saved_latent_embeddings=%s saved_latent_log_probs=%s",
                         req_id,
                         "latent_vae_rsample" if self.latent_vae is not None else "last_hidden",
@@ -821,7 +880,7 @@ def apply_thinking_mode_patch():
                 # after sampling corresponds to the just-added output token slot:
                 # `num_tokens - 1`. Override that slot so the next forward consumes
                 # the hidden-state-derived embedding instead of the sampled token ID.
-                token_pos = self.input_batch.num_tokens[i] - 1
+                token_pos = _get_req_token_pos_after_sample(self, i, req_id)
                 if state.get('mode') == 'continuous':
                     _set_next_decode_embedding(
                         self,

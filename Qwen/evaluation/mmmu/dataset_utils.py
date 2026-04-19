@@ -11,7 +11,7 @@ from Qwen.evaluation.mmmu.common_utils import (
 )
 
 MMMU_DATASET_URL = 'https://opencompass.openxlab.space/utils/VLMEval/MMMU_DEV_VAL.tsv'
-MMMU_DATASET_MD5 = '521afc0f3bf341e6654327792781644d'
+MMMU_DATASET_MD5 = '585e8ad75e73f75dcad265dfd0417d64'
 
 def load_dataset(dataset_name='MMMU_DEV_VAL'):
     """Load the MMMU dataset."""

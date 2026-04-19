@@ -7,6 +7,7 @@ import logging
 import os
 import functools
 import itertools
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -676,6 +677,16 @@ def _has_continuous_replay_inputs(micro_batch) -> bool:
     )
 
 
+def _build_prompt_positions_mask(input_ids: torch.Tensor, response_length: int) -> torch.Tensor:
+    response_start = input_ids.size(1) - int(response_length)
+    return (
+        torch.arange(input_ids.size(1), device=input_ids.device)
+        .unsqueeze(0)
+        .expand(input_ids.size(0), -1)
+        < response_start
+    )
+
+
 def _iter_object_array_rows(value) -> Iterable:
     if value is None:
         return []
@@ -1012,11 +1023,9 @@ def _prepare_inputs_embeds(
         "continuous_replay_row_ids": replay_row_ids.clone(),
         "continuous_replay_hidden_states": hidden_buffer[:next_row_id].clone(),
         "continuous_replay_latent_embeddings": latent_buffer[:next_row_id].clone(),
-        "continuous_replay_prompt_positions_mask": (
-            torch.arange(input_ids.size(1), device=input_ids.device)
-            .unsqueeze(0)
-            .expand(input_ids.size(0), -1)
-            < response_start
+        "continuous_replay_prompt_positions_mask": _build_prompt_positions_mask(
+            input_ids=input_ids,
+            response_length=response_length,
         ).clone(),
         "continuous_replay_latent_vae": vae,
     }
@@ -1248,7 +1257,12 @@ def apply_continuous_replay_patches() -> None:
         return
 
     from verl.workers.actor import dp_actor as dp_actor_mod
-    from verl.workers.rollout.vllm_rollout import vllm_rollout_spmd as rollout_mod
+    import ray
+    from tensordict import TensorDict
+    from verl import DataProto
+    from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
+    from verl.workers.rollout.vllm_rollout import vllm_rollout as rollout_mod
+    from verl.workers.rollout.vllm_rollout import vllm_async_server as async_server_mod
 
     _patch_verl_qwen3vl_inputs_embeds_support()
 
@@ -1260,18 +1274,24 @@ def apply_continuous_replay_patches() -> None:
         _load_policy_latent_vae(self)
 
     def compat_forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False):
-        if not _has_continuous_replay_inputs(micro_batch):
+        calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False)
+        sum_pi_squared_checkpointing = self.config.get("sum_pi_squared_checkpointing", False)
+
+        multi_modal_inputs = {}
+        if "multi_modal_inputs" in micro_batch.keys():
+            from verl.utils.model import extract_multi_modal_inputs
+
+            multi_modal_inputs = extract_multi_modal_inputs(micro_batch["multi_modal_inputs"])
+
+        has_continuous_replay_inputs = _has_continuous_replay_inputs(micro_batch)
+        has_qwen3vl_multimodal_inputs = bool(multi_modal_inputs) and _resolve_qwen3vl_model(self.actor_module) is not None
+        if not has_continuous_replay_inputs and not has_qwen3vl_multimodal_inputs:
             return original_forward_micro_batch(self, micro_batch, temperature, calculate_entropy)
 
         if self.use_ulysses_sp:
             raise NotImplementedError("Continuous replay does not support ulysses sequence parallelism yet")
 
         response_length = micro_batch["responses"].size(-1)
-        multi_modal_inputs = {}
-        if "multi_modal_inputs" in micro_batch.keys():
-            from verl.utils.model import extract_multi_modal_inputs
-
-            multi_modal_inputs = extract_multi_modal_inputs(micro_batch["multi_modal_inputs"])
 
         with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
             input_ids = micro_batch["input_ids"]
@@ -1279,16 +1299,26 @@ def apply_continuous_replay_patches() -> None:
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
             entropy = None
+            sum_pi_squared = None
             if position_ids.dim() == 3:
                 position_ids = position_ids.transpose(0, 1)
 
-            replay_model_kwargs, replay_state = _prepare_inputs_embeds(
-                self,
-                micro_batch,
-                input_ids,
-                attention_mask=attention_mask,
-                multi_modal_inputs=multi_modal_inputs,
-            )
+            replay_model_kwargs = {}
+            replay_state = {}
+            if has_continuous_replay_inputs:
+                replay_model_kwargs, replay_state = _prepare_inputs_embeds(
+                    self,
+                    micro_batch,
+                    input_ids,
+                    attention_mask=attention_mask,
+                    multi_modal_inputs=multi_modal_inputs,
+                )
+
+            if has_qwen3vl_multimodal_inputs:
+                replay_model_kwargs.setdefault(
+                    "continuous_replay_prompt_positions_mask",
+                    _build_prompt_positions_mask(input_ids=input_ids, response_length=response_length),
+                )
 
             extra_args = {}
             if self.use_fused_kernels:
@@ -1357,6 +1387,14 @@ def apply_continuous_replay_patches() -> None:
                                 self.compute_entropy_from_logits,
                                 logits_rmpad,
                             )
+                    if calculate_sum_pi_squared:
+                        if not sum_pi_squared_checkpointing:
+                            sum_pi_squared_rmpad = self.calculate_sum_pi_squared_from_logits(logits_rmpad)
+                        else:
+                            sum_pi_squared_rmpad = _checkpoint_if_needed(
+                                self.calculate_sum_pi_squared_from_logits,
+                                logits_rmpad,
+                            )
 
                 if calculate_entropy:
                     full_entropy = dp_actor_mod.pad_input(
@@ -1372,7 +1410,16 @@ def apply_continuous_replay_patches() -> None:
                     batch=batch_size,
                     seqlen=seqlen,
                 )
+                if calculate_sum_pi_squared:
+                    full_sum_pi_squared = dp_actor_mod.pad_input(
+                        hidden_states=sum_pi_squared_rmpad.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]
+                if calculate_sum_pi_squared:
+                    sum_pi_squared = full_sum_pi_squared.squeeze(-1)[:, -response_length - 1 : -1]
             else:
                 output = self.actor_module(
                     input_ids=input_ids,
@@ -1396,8 +1443,23 @@ def apply_continuous_replay_patches() -> None:
                             entropy = dp_actor_mod.verl_F.entropy_from_logits(logits)
                         else:
                             entropy = _checkpoint_if_needed(dp_actor_mod.verl_F.entropy_from_logits, logits)
-            log_probs, entropy = _merge_continuous_policy_stats(log_probs, entropy, replay_state)
-            return entropy, log_probs
+                    if calculate_sum_pi_squared:
+                        if not sum_pi_squared_checkpointing:
+                            sum_pi_squared = self.calculate_sum_pi_squared_from_logits(logits)
+                        else:
+                            sum_pi_squared = _checkpoint_if_needed(
+                                self.calculate_sum_pi_squared_from_logits,
+                                logits,
+                            )
+            if has_continuous_replay_inputs:
+                log_probs, entropy = _merge_continuous_policy_stats(log_probs, entropy, replay_state)
+
+            outputs = {"log_probs": log_probs}
+            if calculate_entropy:
+                outputs["entropys"] = entropy
+            if calculate_sum_pi_squared:
+                outputs["sum_pi_squared"] = sum_pi_squared
+            return outputs
 
     def _continuous_non_tensor_keys(data) -> list[str]:
         keys = []
@@ -1410,6 +1472,8 @@ def apply_continuous_replay_patches() -> None:
         return keys
 
     def compat_compute_log_prob(self, data, calculate_entropy=False):
+        calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False)
+
         self.actor_module.eval()
         if getattr(self, "latent_vae", None) is not None:
             self.latent_vae.eval()
@@ -1417,6 +1481,7 @@ def apply_continuous_replay_patches() -> None:
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+        pad_token_id = data.meta_info.get("pad_token_id", 0)
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=_continuous_non_tensor_keys(data))
 
@@ -1428,26 +1493,38 @@ def apply_continuous_replay_patches() -> None:
 
         log_probs_lst = []
         entropy_lst = []
+        sum_pi_squared_lst = []
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(dp_actor_mod.get_device_id())
-            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
+                outputs = self._forward_micro_batch(
                     model_inputs,
                     temperature=temperature,
                     calculate_entropy=calculate_entropy,
                 )
-            log_probs_lst.append(log_probs)
+            log_probs_lst.append(outputs["log_probs"])
             if calculate_entropy:
-                entropy_lst.append(entropy)
+                entropy_lst.append(outputs["entropys"])
+            if calculate_sum_pi_squared:
+                sum_pi_squared_lst.append(outputs["sum_pi_squared"])
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = torch.concat(entropy_lst, dim=0) if calculate_entropy else None
+        sum_pi_squared = torch.concat(sum_pi_squared_lst, dim=0) if calculate_sum_pi_squared else None
         if use_dynamic_bsz:
             log_probs = dp_actor_mod.restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = dp_actor_mod.restore_dynamic_batch(entropys, batch_idx_list)
-        return log_probs, entropys
+            if calculate_sum_pi_squared:
+                sum_pi_squared = dp_actor_mod.restore_dynamic_batch(sum_pi_squared, batch_idx_list)
+
+        outputs = {"log_probs": log_probs}
+        if calculate_entropy:
+            outputs["entropys"] = entropys
+        if calculate_sum_pi_squared:
+            outputs["sum_pi_squared"] = sum_pi_squared
+        return outputs
 
     def compat_update_policy(self, data):
         self.actor_module.train()
@@ -1502,11 +1579,13 @@ def apply_continuous_replay_patches() -> None:
                         loss_scale_factor = 1 / self.gradient_accumulation
 
                     calculate_entropy = entropy_coeff != 0
-                    entropy, log_prob = self._forward_micro_batch(
+                    outputs = self._forward_micro_batch(
                         model_inputs,
                         temperature=temperature,
                         calculate_entropy=calculate_entropy,
                     )
+                    log_prob = outputs["log_probs"]
+                    entropy = outputs["entropys"] if calculate_entropy else None
 
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                         old_log_prob = model_inputs["old_log_probs"]
@@ -1580,153 +1659,151 @@ def apply_continuous_replay_patches() -> None:
         self.actor_optimizer.zero_grad()
         return metrics
 
-    def compat_rollout_generate_sequences(self, prompts, **kwargs):
-        global _ROLLOUT_CERT_LOGGED
-        from verl import DataProto
-        from tensordict import TensorDict
-        from vllm.lora.request import LoRARequest
+    original_server_generate = async_server_mod.vLLMHttpServer.generate
+
+    async def compat_server_generate(self, *args, **kwargs):
+        output = await original_server_generate(self, *args, **kwargs)
 
         from vllm_thinking.trace_store import pop_request_trace
+
+        request_id = kwargs.get("request_id")
+        if request_id is None and len(args) >= 3:
+            request_id = args[2]
+
+        if request_id is not None:
+            trace = pop_request_trace(request_id)
+            if trace is not None:
+                output.extra_fields = dict(output.extra_fields)
+                output.extra_fields["continuous_trace"] = trace
+
+        return output
+
+    def compat_rollout_generate_sequences(self, prompts, **kwargs):
+        global _ROLLOUT_CERT_LOGGED
 
         idx = prompts.batch["input_ids"]
         attention_mask = prompts.batch["attention_mask"]
         position_ids = prompts.batch["position_ids"]
         eos_token_id = prompts.meta_info["eos_token_id"]
+        pad_token_id = prompts.meta_info["pad_token_id"]
         batch_size = idx.size(0)
 
         non_tensor_batch = prompts.non_tensor_batch
-        if "raw_prompt_ids" not in non_tensor_batch:
-            non_tensor_batch["raw_prompt_ids"] = np.array(
-                [rollout_mod._pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)],
-                dtype=object,
-            )
-        if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
-            raise RuntimeError("vllm sharding manager is not work properly.")
+        input_ids_cpu = idx.detach().to(device="cpu")
+        attention_mask_cpu = attention_mask.detach().to(device="cpu", dtype=torch.bool)
+        raw_prompt_ids = [input_ids_cpu[i][attention_mask_cpu[i]].tolist() for i in range(batch_size)]
 
-        if "multi_modal_data" in non_tensor_batch:
-            vllm_inputs = []
-            for raw_prompt_ids, multi_modal_data in zip(
-                non_tensor_batch.pop("raw_prompt_ids"),
-                non_tensor_batch.pop("multi_modal_data"),
-                strict=True,
-            ):
-                vllm_inputs.append({"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data})
-        else:
-            vllm_inputs = [{"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")]
+        multi_modal_rows = non_tensor_batch.get("multi_modal_data")
+        if isinstance(multi_modal_rows, np.ndarray):
+            multi_modal_rows = multi_modal_rows.tolist()
+        elif multi_modal_rows is None:
+            multi_modal_rows = [None] * batch_size
 
-        for input_data in vllm_inputs:
-            input_data["prompt_token_ids"] = list(input_data["prompt_token_ids"])
+        if batch_size != len(raw_prompt_ids):
+            raise RuntimeError("vLLM rollout prompt batch assembly is inconsistent.")
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
+        temperature = prompts.meta_info.get("temperature", self.config.temperature)
+        top_p = prompts.meta_info.get("top_p", self.config.get("top_p", 1.0))
         if not do_sample:
             sampling_kwargs = {"best_of": 1, "top_p": 1.0, "top_k": -1, "min_p": 0.0, "temperature": 0, "n": 1}
         elif is_validate:
             sampling_kwargs = {
-                "top_k": self.config.val_kwargs.top_k,
+                "top_k": max(0, self.config.val_kwargs.top_k),
                 "top_p": self.config.val_kwargs.top_p,
                 "temperature": self.config.val_kwargs.temperature,
                 "n": 1,
             }
         else:
-            sampling_kwargs = kwargs
+            sampling_kwargs = {
+                "top_k": max(0, getattr(self.config, "top_k", -1)),
+                "top_p": top_p,
+                "temperature": temperature,
+                "n": 1,
+            }
+            sampling_kwargs.update(kwargs)
 
         # Override logprobs parameter when calculate_log_probs is enabled
         if self.config.calculate_log_probs:
             sampling_kwargs["logprobs"] = 1  # Return logprobs for generated tokens
 
-        lora_requests = None
-        if self.lora_kwargs:
-            lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
-            if len(lora_int_ids) > 0:
-                lora_int_id = lora_int_ids[0]
-                lora_requests = [
-                    LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")
-                ] * batch_size
-
         continuous_hidden_states = []
         continuous_latent_embeddings = []
         continuous_token_masks = []
-        with self.update_sampling_params(**sampling_kwargs):
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,
-                sampling_params=self.sampling_params,
-                lora_request=lora_requests,
-                use_tqdm=False,
+        if self.server_handle is None:
+            self.server_handle = ray.get_actor(f"vllm_server_{self.replica_rank}_{self.node_rank}")
+
+        request_prefix = f"continuous-replay-{os.getpid()}-{time.time_ns()}"
+        outputs = ray.get(
+            [
+                self.server_handle.generate.remote(
+                    prompt_ids=prompt_token_ids,
+                    sampling_params=dict(sampling_kwargs),
+                    request_id=f"{request_prefix}-{row_idx}",
+                    image_data=(multi_modal_rows[row_idx] or {}).get("image") if multi_modal_rows[row_idx] else None,
+                    video_data=(multi_modal_rows[row_idx] or {}).get("video") if multi_modal_rows[row_idx] else None,
+                )
+                for row_idx, prompt_token_ids in enumerate(raw_prompt_ids)
+            ]
+        )
+
+        response = []
+        rollout_log_probs = []
+        for output in outputs:
+            trace = output.extra_fields.get("continuous_trace")
+            if trace is None:
+                raise RuntimeError(
+                    "Continuous replay trace missing for vLLM request_id="
+                    f"{getattr(output, 'request_id', '<unknown>')}. "
+                    "This indicates trace capture did not survive async rollout."
+                )
+
+            hidden_row, latent_row, mask_row = _validate_request_trace(
+                trace,
+                request_id=str(getattr(output, "request_id", "<unknown>")),
+                response_length=self.config.response_length,
+            )
+            response_ids = output.token_ids
+            response.append(response_ids)
+            actual_response_length = len(response_ids)
+            latent_log_probs = None
+            if self.config.calculate_log_probs:
+                latent_log_probs = np.asarray(
+                    trace.get(CONTINUOUS_LATENT_LOGPROB_KEY, np.empty((0,), dtype=np.float32)),
+                    dtype=np.float32,
+                ).reshape(-1)
+
+            hidden_row_trimmed, latent_row_trimmed, mask_row_trimmed, latent_log_probs = (
+                _trim_request_trace_to_actual_response_length(
+                    hidden_row=hidden_row,
+                    latent_row=latent_row,
+                    mask_row=mask_row,
+                    latent_log_probs=latent_log_probs,
+                    actual_response_length=actual_response_length,
+                    request_id=str(getattr(output, "request_id", "<unknown>")),
+                )
             )
 
-            response = []
-            rollout_log_probs = []
-            for output in outputs:
-                trace = pop_request_trace(output.request_id)
-                if len(output.outputs) != 1:
-                    raise RuntimeError(
-                        "Continuous replay currently requires exactly one sampled output per vLLM request; "
-                        f"got {len(output.outputs)} outputs for request_id={output.request_id}"
-                    )
-                if trace is None:
-                    raise RuntimeError(
-                        "Continuous replay trace missing for vLLM request_id="
-                        f"{output.request_id}. This indicates trace capture did not survive rollout."
-                    )
-                hidden_row, latent_row, mask_row = _validate_request_trace(
-                    trace,
-                    request_id=str(output.request_id),
-                    response_length=self.config.response_length,
-                )
-                for sample_id in range(len(output.outputs)):
-                    response_ids = output.outputs[sample_id].token_ids
-                    response.append(response_ids)
-                    actual_response_length = len(response_ids)
-                    latent_log_probs = None
-                    if sample_id == 0 and self.config.calculate_log_probs:
-                        latent_log_probs = np.asarray(
-                            trace.get(CONTINUOUS_LATENT_LOGPROB_KEY, np.empty((0,), dtype=np.float32)),
-                            dtype=np.float32,
-                        ).reshape(-1)
-                    if sample_id == 0:
-                        hidden_row_trimmed, latent_row_trimmed, mask_row_trimmed, latent_log_probs = (
-                            _trim_request_trace_to_actual_response_length(
-                                hidden_row=hidden_row,
-                                latent_row=latent_row,
-                                mask_row=mask_row,
-                                latent_log_probs=latent_log_probs,
-                                actual_response_length=actual_response_length,
-                                request_id=str(output.request_id),
-                            )
-                        )
-                    if self.config.calculate_log_probs:
-                        curr_log_prob = []
-                        for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                            curr_log_prob.append(logprob[response_ids[i]].logprob)
+            continuous_hidden_states.append(hidden_row_trimmed)
+            continuous_latent_embeddings.append(latent_row_trimmed)
+            continuous_token_masks.append(mask_row_trimmed)
 
-                    if sample_id == 0:
-                        continuous_hidden_states.append(hidden_row_trimmed)
-                        continuous_latent_embeddings.append(latent_row_trimmed)
-                        continuous_token_masks.append(mask_row_trimmed)
-                        if self.config.calculate_log_probs:
-                            _inject_latent_log_probs_into_rollout(
-                                curr_log_prob=curr_log_prob,
-                                mask_row=mask_row_trimmed,
-                                latent_log_probs=latent_log_probs,
-                                request_id=str(output.request_id),
-                            )
-                    else:
-                        continuous_hidden_states.append(np.empty((0, 0), dtype=np.float16))
-                        continuous_latent_embeddings.append(np.empty((0, 0), dtype=np.float16))
-                        continuous_token_masks.append(np.zeros(len(response_ids), dtype=np.bool_))
-                    if self.config.calculate_log_probs:
-                        rollout_log_probs.append(curr_log_prob)
-
-            response = rollout_mod.pad_2d_list_to_length(
-                response, self.pad_token_id, max_length=self.config.response_length
-            ).to(idx.device)
             if self.config.calculate_log_probs:
-                rollout_log_probs = rollout_mod.pad_2d_list_to_length(
-                    rollout_log_probs, -1, max_length=self.config.response_length
-                ).to(idx.device)
-                rollout_log_probs = rollout_log_probs.to(torch.float32)
-            seq = torch.cat([idx, response], dim=-1)
+                curr_log_prob = list(output.log_probs or [])
+                _inject_latent_log_probs_into_rollout(
+                    curr_log_prob=curr_log_prob,
+                    mask_row=mask_row_trimmed,
+                    latent_log_probs=latent_log_probs,
+                    request_id=str(getattr(output, "request_id", "<unknown>")),
+                )
+                rollout_log_probs.append(curr_log_prob)
+
+        response = pad_2d_list_to_length(response, pad_token_id, max_length=self.config.response_length).to(idx.device)
+        if self.config.calculate_log_probs:
+            rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length)
+            rollout_log_probs = rollout_log_probs.to(idx.device, dtype=torch.float32)
+        seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
@@ -1735,11 +1812,7 @@ def apply_continuous_replay_patches() -> None:
             delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, position_ids.size(1), -1)
         response_position_ids = position_ids[..., -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = rollout_mod.get_response_mask(
-            response_id=response,
-            eos_token=eos_token_id,
-            dtype=attention_mask.dtype,
-        )
+        response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         batch = TensorDict(
@@ -1777,7 +1850,8 @@ def apply_continuous_replay_patches() -> None:
     dp_actor_mod.DataParallelPPOActor._forward_micro_batch = compat_forward_micro_batch
     dp_actor_mod.DataParallelPPOActor.compute_log_prob = compat_compute_log_prob
     dp_actor_mod.DataParallelPPOActor.update_policy = compat_update_policy
-    rollout_mod.vLLMRollout.generate_sequences = compat_rollout_generate_sequences
+    async_server_mod.vLLMHttpServer.generate = compat_server_generate
+    rollout_mod.ServerAdapter.generate_sequences = compat_rollout_generate_sequences
     _PATCHED = True
 
 __all__ = [

@@ -781,6 +781,7 @@ def _prepare_runtime_env(config: dict[str, Any]) -> None:
     runtime_env = config.get("runtime_env_config")
     if runtime_env:
         os.environ["QWEN3VL_RUNTIME_ENV_CONFIG"] = str(runtime_env)
+    os.environ.setdefault("DISABLE_VERSION_CHECK", "1")
     os.environ.setdefault("QWEN3VL_LATENT_SUPERVISION", "1")
     os.environ.setdefault("QWEN3VL_HIDDEN_STATES_HOOK", "0")
     os.environ.setdefault("VLLM_THINKING", "1")

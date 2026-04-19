@@ -398,22 +398,24 @@ done
 TRAIN_ARGS+=("output_dir=$CKPT_DIR")
 
 # Run training
-# FSDP: Direct Python call (LlamaFactory handles torchrun internally)
-# DeepSpeed: Use torchrun explicitly
-if [ "$USE_DEEPSPEED" = true ]; then
-    set +e
-    torchrun \
-      --standalone \
-      --nproc_per_node="$NPROC_PER_NODE" \
-      -m llamafactory.cli train "$CONFIG_PATH" "${TRAIN_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
-    exit_code=${PIPESTATUS[0]}
-    set -e
-else
-    set +e
-    "$PYTHON_BIN" -m llamafactory.cli train "$CONFIG_PATH" "${TRAIN_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
-    exit_code=${PIPESTATUS[0]}
-    set -e
+# Delegate distributed launch to LlamaFactory. Single-visible-GPU FSDP runs need
+# a runtime config without FSDP because the current torch FSDP NO_SHARD path
+# crashes on Qwen3VL's tied weights.
+ACTIVE_CONFIG_PATH="$CONFIG_PATH"
+
+if [ "${NPROC_PER_NODE:-1}" = "1" ]; then
+    if [ "$USE_FSDP" = true ]; then
+        ACTIVE_CONFIG_PATH="$CKPT_DIR/runtime_single_gpu_no_fsdp.yaml"
+        qwen3vl_materialize_single_gpu_runtime_config "$PYTHON_BIN" "$CONFIG_PATH" "$ACTIVE_CONFIG_PATH"
+        echo "⚠️  Single visible GPU detected. Using a runtime config without FSDP because the current torch FSDP NO_SHARD path is broken for Qwen3VL tied weights."
+        _log_wrapper_status "single_gpu_fsdp_fallback source_config=$CONFIG_PATH runtime_config=$ACTIVE_CONFIG_PATH"
+    fi
 fi
+
+set +e
+"$PYTHON_BIN" -m llamafactory.cli train "$ACTIVE_CONFIG_PATH" "${TRAIN_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
+exit_code=${PIPESTATUS[0]}
+set -e
 _log_wrapper_status "training_finished exit_code=$exit_code"
 train_exit_code=$exit_code
 

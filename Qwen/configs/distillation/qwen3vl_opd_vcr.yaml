@@ -20,7 +20,7 @@ lora:
   target_modules: q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj
 
 data:
-  dataset_names: r1_onevision_thinking,deepvision_thinking
+  dataset_names: r1ov_thinking,deepvision_thinking
   manifest_builder: opd_text
   opsd_manifest: null
   overwrite_manifest: false

@@ -326,6 +326,7 @@ def main_render_only(args):
 
     output_dir.mkdir(parents=True, exist_ok=True)
     images_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
 
     df = _load_chimera_rows(data_dir)
     total_rows = len(df)
@@ -529,6 +530,8 @@ def main_encode_only(args):
     kept = 0
     dropped_image = 0
     dropped_text = 0
+    out_jsonl_image.parent.mkdir(parents=True, exist_ok=True)
+    out_jsonl_text.parent.mkdir(parents=True, exist_ok=True)
     with open(out_jsonl_image, "w", encoding="utf-8") as f_img, open(out_jsonl_text, "w", encoding="utf-8") as f_txt:
         for s in items:
             solution_cache_paths = [str(cache_dir / f"{Path(p).stem}.pt") for p in s["solution_chunk_image_paths"]]
@@ -651,6 +654,9 @@ def main_all(args):
     output_dir.mkdir(parents=True, exist_ok=True)
     images_dir.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    out_jsonl_image.parent.mkdir(parents=True, exist_ok=True)
+    out_jsonl_text.parent.mkdir(parents=True, exist_ok=True)
 
     df = _load_chimera_rows(data_dir)
     if args.max_samples:

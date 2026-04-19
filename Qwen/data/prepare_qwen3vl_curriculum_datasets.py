@@ -25,10 +25,10 @@ SFT_DIR = DATA_DIR / "sft"
 
 OCR_SUPPLEMENT = SFT_DIR / "ocrvl_ocr_supplement.jsonl"
 OCR_STRICT = SFT_DIR / "ocrvl_ocr_strict.jsonl"
-DEEPVISION_THINKING_SRC = SFT_DIR / "deepvision_103k_thinking.jsonl"
+DEEPVISION_THINKING_SRC = SFT_DIR / "deepvision_thinking.jsonl"
 DEEPVISION_THINKING_CONCISE = SFT_DIR / "deepvision_thinking_concise.jsonl"
 R1OV_SRC = SFT_DIR / "r1ov_thinking.jsonl"
-R1OV_THINKING_CONCISE = SFT_DIR / "r1_onevision_thinking_concise.jsonl"
+R1OV_THINKING_CONCISE = SFT_DIR / "r1ov_thinking_concise.jsonl"
 
 STRICT_OCR_TASKS = {"bbox_ocr", "full_document_ocr", "markdown_conversion"}
 MCQ_PATTERNS = (
@@ -201,7 +201,7 @@ def build_r1onevision_thinking_concise() -> tuple[int, Counter]:
                 new_messages[-1]["content"] = f"{think_prefix}{concise_answer}"
                 new_row["answer_style"] = "concise_option_only"
             new_row["messages"] = new_messages
-            new_row["task"] = "r1_onevision_thinking_concise"
+            new_row["task"] = "r1ov_thinking_concise"
             stats["kept"] += 1
             yield new_row
 
@@ -219,7 +219,7 @@ def main() -> int:
             build_deepvision_thinking_concise,
         ),
         (
-            "r1_onevision_thinking_concise",
+            "r1ov_thinking_concise",
             R1OV_THINKING_CONCISE,
             [R1OV_SRC, SCRIPT_PATH],
             build_r1onevision_thinking_concise,

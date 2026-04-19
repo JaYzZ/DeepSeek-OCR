@@ -4,13 +4,29 @@
 from __future__ import annotations
 
 import os
+import inspect
 from typing import Iterable, Tuple
 
 import torch
 from transformers import AutoConfig, AutoModel
-from vllm.attention.backends.registry import AttentionBackendEnum
+
+try:
+    from vllm.config.attention import AttentionBackendEnum
+except ImportError:  # Older vLLM layout.
+    from vllm.attention.backends.registry import AttentionBackendEnum
+
 from vllm.distributed import initialize_model_parallel, init_distributed_environment
-from vllm.distributed.parallel_state import get_tensor_model_parallel_group
+
+try:
+    from vllm.distributed.parallel_state import model_parallel_is_initialized
+except ImportError:  # Older vLLM layout.
+    model_parallel_is_initialized = None
+
+try:
+    from vllm.distributed.parallel_state import get_tensor_model_parallel_group
+except ImportError:  # Newer vLLM layout removed this helper.
+    get_tensor_model_parallel_group = None
+
 from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VisionTransformer
 from vllm.model_executor.models.qwen3_vl import Qwen3_VisionTransformer
 
@@ -24,6 +40,40 @@ def _iter_visual_weights(
         if not name.startswith(prefix):
             continue
         yield name[len(prefix) :], tensor
+
+
+def _resolve_attn_backend(attn_backend_override: str | None):
+    if not attn_backend_override:
+        return None
+    if attn_backend_override in AttentionBackendEnum.__members__:
+        return AttentionBackendEnum[attn_backend_override]
+    return AttentionBackendEnum(attn_backend_override)
+
+
+def _instantiate_vit(vit_cls, *, vision_config, backend):
+    """Instantiate vLLM ViT across constructor variants."""
+    signature = inspect.signature(vit_cls)
+    kwargs = {"vision_config": vision_config}
+
+    # Older vLLM versions exposed these knobs directly on the constructor.
+    if "use_data_parallel" in signature.parameters:
+        kwargs["use_data_parallel"] = True
+    if "attn_backend_override" in signature.parameters and backend is not None:
+        kwargs["attn_backend_override"] = backend
+
+    return vit_cls(**kwargs)
+
+
+def _vllm_model_parallel_is_initialized() -> bool:
+    if model_parallel_is_initialized is not None:
+        return bool(model_parallel_is_initialized())
+    if get_tensor_model_parallel_group is not None:
+        try:
+            get_tensor_model_parallel_group()
+            return True
+        except (AssertionError, AttributeError):
+            return False
+    return False
 
 
 def build_qwen3_vit(
@@ -44,10 +94,7 @@ def build_qwen3_vit(
         local_rank = int(os.environ.get('LOCAL_RANK', rank))
 
         # First, check if vLLM model parallel is already initialized
-        try:
-            # If this succeeds, vLLM is already initialized, skip
-            get_tensor_model_parallel_group()
-        except (AssertionError, AttributeError):
+        if not _vllm_model_parallel_is_initialized():
             # vLLM not initialized yet - need to initialize it
             # Initialize vLLM's distributed environment using existing PyTorch setup
             init_distributed_environment(
@@ -82,18 +129,11 @@ def build_qwen3_vit(
     prev_default = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
     try:
-        backend = None
-        if attn_backend_override:
-            # Accept either enum name ("FLASH_ATTN") or value.
-            backend = (
-                AttentionBackendEnum[attn_backend_override]
-                if attn_backend_override in AttentionBackendEnum.__members__
-                else AttentionBackendEnum(attn_backend_override)
-            )
-        vit = Qwen3_VisionTransformer(
+        backend = _resolve_attn_backend(attn_backend_override)
+        vit = _instantiate_vit(
+            Qwen3_VisionTransformer,
             vision_config=vision_config,
-            use_data_parallel=True,  # avoid TP init; matches single-GPU fast path
-            attn_backend_override=backend,
+            backend=backend,
         )
     finally:
         torch.set_default_dtype(prev_default)
@@ -143,17 +183,11 @@ def build_qwen25_vit(
     prev_default = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
     try:
-        backend = None
-        if attn_backend_override:
-            backend = (
-                AttentionBackendEnum[attn_backend_override]
-                if attn_backend_override in AttentionBackendEnum.__members__
-                else AttentionBackendEnum(attn_backend_override)
-            )
-        vit = Qwen2_5_VisionTransformer(
+        backend = _resolve_attn_backend(attn_backend_override)
+        vit = _instantiate_vit(
+            Qwen2_5_VisionTransformer,
             vision_config=vision_config,
-            use_data_parallel=True,
-            attn_backend_override=backend,
+            backend=backend,
         )
     finally:
         torch.set_default_dtype(prev_default)

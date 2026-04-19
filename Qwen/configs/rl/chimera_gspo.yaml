@@ -1,7 +1,3 @@
-custom_reward_function:
-  path: ${oc.env:ROOT_DIR,/share/project/xiyan}/sources/DeepSeek-OCR/Qwen/verl/chimera_gspo_reward.py
-  name: compute_score_batch
-
 data:
   train_files: ${oc.env:TRAIN_FILE,Qwen/data/chimera_verl/train.parquet}
   val_files: ${oc.env:VAL_FILE,Qwen/data/chimera_verl/val.parquet}
@@ -58,7 +54,7 @@ actor_rollout_ref:
 
   rollout:
     name: vllm
-    mode: sync
+    mode: async
     tensor_model_parallel_size: ${oc.decode:${oc.env:ROLLOUT_TP_SIZE,1}}
     n: ${oc.decode:${oc.env:ROLLOUT_N,8}}
     temperature: ${oc.decode:${oc.env:TEMPERATURE,1.0}}
@@ -78,10 +74,15 @@ actor_rollout_ref:
       vllm:
         disable_mm_preprocessor_cache: ${oc.decode:${oc.env:ROLLOUT_DISABLE_MM_PREPROCESSOR_CACHE,false}}
     agent:
-      num_workers: ${oc.decode:${oc.env:AGENT_NUM_WORKERS,4}}
+      num_workers: ${oc.decode:${oc.env:AGENT_NUM_WORKERS,${gpu_adapt:${trainer.n_gpus_per_node},1,2,4,8,8}}}
 
-reward_model:
-  reward_manager: dapo_batch
+reward:
+  custom_reward_function:
+    path: ${oc.env:ROOT_DIR,/share/project/xiyan}/sources/DeepSeek-OCR/Qwen/verl/chimera_gspo_reward.py
+    name: compute_score
+  reward_manager:
+    source: register
+    name: dapo
   reward_kwargs:
     overlong_buffer_cfg:
       enable: ${oc.decode:${oc.env:ENABLE_OVERLONG_BUFFER,false}}

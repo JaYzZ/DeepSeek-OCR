@@ -6,13 +6,14 @@ import os
 import sys
 
 from .bootstrap import apply_runtime_compat_patches
-from vllm.lora.models import LoRAModel
+
+from vllm.lora.lora_model import LoRAModel
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager, WorkerLoRAManager
 from verl.utils.vllm.utils import VLLMHijack
 
 
 def collect_patch_diagnostics() -> dict:
-    rollout_module = sys.modules.get("verl.workers.rollout.vllm_rollout.vllm_rollout_spmd")
+    rollout_module = sys.modules.get("verl.workers.rollout.vllm_rollout.vllm_rollout")
     sharding_module = sys.modules.get("verl.workers.sharding_manager.fsdp_vllm")
 
     return {

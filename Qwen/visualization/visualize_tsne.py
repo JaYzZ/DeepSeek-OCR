@@ -40,8 +40,9 @@ class FeatureVisualizer:
         self.use_cls = use_cls  # Whether to visualize CLS tokens (default: True)
 
         # Always use cuda:0
+        self.device = "cuda:0"
         torch.cuda.set_device(0)
-        print(f"Using GPU: cuda:0 (forced)")
+        print(f"Using GPU: {self.device} (forced)")
 
         # Load features
         print(f"\nLoading features from {features_path}...")
@@ -118,7 +119,7 @@ class FeatureVisualizer:
             ax.scatter(
                 embedding[mask, 0],
                 embedding[mask, 1],
-                c=[self.category_colors[caption for caption in [self.category_colors] if caption == category]],
+                color=self.category_colors[category],
                 label=category,
                 alpha=0.7,
                 s=50,
@@ -165,7 +166,7 @@ class FeatureVisualizer:
             axes[0].scatter(
                 dpsk_embedding[mask, 0],
                 dpsk_embedding[mask, 1],
-                c=[self.category_colors[caption] for caption in [self.category_colors if caption == category]],
+                color=self.category_colors[category],
                 label=category,
                 alpha=0.7,
                 s=50,
@@ -184,7 +185,7 @@ class FeatureVisualizer:
             axes[1].scatter(
                 qwen_embedding[mask, 0],
                 qwen_embedding[mask, 1],
-                c=[self.category_colors[caption] for caption in [self.category_colors if caption == category]],
+                color=self.category_colors[category],
                 label=category,
                 alpha=0.7,
                 s=50,
@@ -372,7 +373,7 @@ class FeatureVisualizer:
                 axes[0, col].scatter(
                     dpsk_embedding[mask, 0],
                     dpsk_embedding[mask, 1],
-                    c=[self.category_colors[caption] for caption in [self.category_colors if caption == category]],
+                    color=self.category_colors[category],
                     label=category,
                     alpha=0.7,
                     s=30,
@@ -399,7 +400,7 @@ class FeatureVisualizer:
                     axes[1, col].scatter(
                         qwen_embedding[mask, 0],
                         qwen_embedding[mask, 1],
-                        c=[self.category_colors[caption] for caption in [self.category_colors if caption == category]],
+                        color=self.category_colors[category],
                         label=category,
                         alpha=0.7,
                         s=30,

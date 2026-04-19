@@ -6,7 +6,7 @@ qwen3vl_materialize_dataset_mix() {
   local dataset_spec="$3"
   local output_dir="$4"
 
-  "$python_bin" - "$dataset_dir" "$dataset_spec" "$output_dir" <<'PY'
+  env PYTHONPATH= PYTHONSAFEPATH=1 "$python_bin" - "$dataset_dir" "$dataset_spec" "$output_dir" <<'PY'
 import json
 import math
 import os

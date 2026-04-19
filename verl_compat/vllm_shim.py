@@ -8,7 +8,8 @@ import logging
 
 from msgspec import field
 from packaging import version as vs
-from vllm.lora.models import LoRAModel
+
+from vllm.lora.lora_model import LoRAModel
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
 from vllm.lora.utils import get_adapter_absolute_path
@@ -35,7 +36,7 @@ class _SuppressMultimodalLoRAWarnings(logging.Filter):
 def _install_multimodal_lora_warning_filters() -> None:
     filter_obj = _SuppressMultimodalLoRAWarnings()
     for module_name in (
-        "vllm.lora.models",
+        "vllm.lora.lora_model",
         "vllm.v1.worker.lora_model_runner_mixin",
     ):
         module = importlib.import_module(module_name)
@@ -71,6 +72,7 @@ def _build_load_adapter():
         model = self._adapter_manager.model
         hf_to_vllm_mapper = getattr(model, "hf_to_vllm_mapper", None)
         extra_vocab_size = getattr(self.lora_config, "lora_extra_vocab_size", 0)
+        model_vocab_size = getattr(self, "vocab_size", 0) + extra_vocab_size
 
         if isinstance(lora_request, TensorLoRARequest):
             peft_helper = PEFTHelper.from_dict(lora_request.peft_config)
@@ -81,10 +83,9 @@ def _build_load_adapter():
                 peft_helper=peft_helper,
                 device="cpu",
                 dtype=self.lora_config.lora_dtype,
-                target_embedding_padding=self.vocab_size + extra_vocab_size,
-                embedding_modules=self.embedding_modules,
-                embedding_padding_modules=self.embedding_padding_modules,
+                model_vocab_size=model_vocab_size,
                 weights_mapper=hf_to_vllm_mapper,
+                skip_prefixes=getattr(self, "skip_prefixes", None),
             )
         else:
             lora_path = get_adapter_absolute_path(lora_request.lora_path)
@@ -96,16 +97,15 @@ def _build_load_adapter():
             peft_helper.validate_legal(self.lora_config)
             lora = self._lora_model_cls.from_local_checkpoint(
                 lora_path,
-                expected_lora_modules,
+                set(expected_lora_modules),
                 peft_helper=peft_helper,
                 lora_model_id=lora_request.lora_int_id,
                 device="cpu",
                 dtype=self.lora_config.lora_dtype,
-                target_embedding_padding=self.vocab_size + extra_vocab_size,
-                embedding_modules=self.embedding_modules,
-                embedding_padding_modules=self.embedding_padding_modules,
+                model_vocab_size=model_vocab_size,
                 tensorizer_config_dict=lora_request.tensorizer_config_dict,
                 weights_mapper=hf_to_vllm_mapper,
+                skip_prefixes=getattr(self, "skip_prefixes", None),
             )
 
         if not hasattr(lora, "extra_vocab_size"):

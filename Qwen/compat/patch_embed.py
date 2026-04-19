@@ -8,6 +8,8 @@ import os
 
 import torch
 import torch.nn as nn
+from llamafactory.extras import packages as lf_packages
+from llamafactory.model import loader as lf_loader
 
 logger = logging.getLogger(__name__)
 
@@ -38,12 +40,6 @@ def apply_llamafactory_qwen3vl_conv3d_guard_patch() -> None:
     if not qwen3vl_patch_embed_monkey_enabled():
         return
 
-    try:
-        from llamafactory.extras import packages as lf_packages
-    except Exception as exc:
-        logger.debug("Skipped LlamaFactory Conv3d guard patch: %s", exc)
-        return
-
     if getattr(lf_packages, "_deepseek_qwen3vl_conv3d_guard_patch", False):
         return
 
@@ -59,12 +55,7 @@ def apply_llamafactory_qwen3vl_conv3d_guard_patch() -> None:
     lf_packages.is_torch_version_greater_than = patched_version_check
     lf_packages._deepseek_qwen3vl_conv3d_guard_patch = True
 
-    try:
-        from llamafactory.model import loader as lf_loader
-
-        lf_loader.is_torch_version_greater_than = patched_version_check
-    except Exception as exc:
-        logger.debug("Deferred loader guard patch until import: %s", exc)
+    lf_loader.is_torch_version_greater_than = patched_version_check
 
     logger.info("Patched LlamaFactory torch-2.9 Conv3d guard for monkey-patched Qwen3-VL")
 
@@ -104,4 +95,3 @@ __all__ = [
     "apply_transformers_qwen3vl_patch_embed_patch",
     "qwen3vl_patch_embed_monkey_enabled",
 ]
-

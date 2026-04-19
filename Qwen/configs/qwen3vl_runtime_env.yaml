@@ -41,7 +41,7 @@ curriculum_lora_trainable: 1,1,1
 curriculum_aux_source: vae_sample,vae_sample,vae_sample
 curriculum_latent_ce: 1,1,1
 prepare_curriculum_datasets: 1
-curriculum_stage_datasets: "r1_onevision_thinking,deepvision_thinking|r1_onevision_thinking,deepvision_thinking|r1_onevision_thinking,deepvision_thinking|r1_onevision_thinking,deepvision_thinking"
+curriculum_stage_datasets: "r1ov_thinking,deepvision_thinking|r1ov_thinking,deepvision_thinking|r1ov_thinking,deepvision_thinking|r1ov_thinking,deepvision_thinking"
 
 ### backfill / transparent eval
 # Used by post-training backfill and transparent eval callbacks.
@@ -67,6 +67,11 @@ compile_vision_only: 1
 
 ### diagnostics
 hidden_states_hook: 1
+
+### compatibility
+# Keep LlamaFactory's hard transformers pin check disabled by default for the
+# regular Qwen pipeline on this repo. Shell/exported env vars still take precedence.
+disable_version_check: 1
 
 ### torch / allocator
 cuda_alloc_conf: expandable_segments:True

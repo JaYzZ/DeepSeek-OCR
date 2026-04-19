@@ -53,13 +53,12 @@ def _to_python(value: Any) -> Any:
     return value
 
 
-def _build_user_content(prompt_text: str, *, has_image: bool) -> str | list[dict[str, str]]:
+def _build_user_content(prompt_text: str, *, has_image: bool) -> str:
     if not has_image:
         return prompt_text
-    return [
-        {"type": "image"},
-        {"type": "text", "text": prompt_text},
-    ]
+    if "<image>" in prompt_text:
+        return prompt_text
+    return f"<image>\n{prompt_text}".strip()
 
 
 def _build_problem_context(subject: str, topic: str) -> str:
@@ -91,7 +90,7 @@ def _normalize_prompt(
     row: dict[str, Any],
     sample_id: str,
     chimera_images_dir: Path,
-) -> tuple[list[dict[str, Any]], list[dict[str, bytes]]]:
+) -> tuple[list[dict[str, str]], list[dict[str, bytes | None]]]:
     """Build prompt messages from the question, using pre-rendered images."""
     question = str(row.get("question") or "").strip()
     subject = str(row.get("subject") or "").strip()
@@ -102,10 +101,11 @@ def _normalize_prompt(
 
     images = []
     if question_image_path.exists():
-        # Load image as bytes (format expected by VERL/qwen_vl_utils)
+        # Match the stable DeepVision VERL parquet schema: image bytes live in the
+        # separate `images` column, while prompt text uses a plain `<image>` token.
         with open(question_image_path, "rb") as f:
             image_bytes = f.read()
-        images = [{"bytes": image_bytes}]
+        images = [{"bytes": image_bytes, "path": None}]
         user_content = _build_user_content(
             _build_user_prompt_text(question, subject=subject, topic=topic, has_image=True),
             has_image=True,

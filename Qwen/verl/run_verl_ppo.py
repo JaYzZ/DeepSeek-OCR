@@ -302,9 +302,8 @@ def _check_runtime_env(config) -> int:
 def main() -> int:
     args, overrides = parse_args()
 
+    from verl.experimental.reward_loop import migrate_legacy_reward_impl
     from verl_compat import apply_runtime_compat_patches
-    import verl_compat.reward_manager  # noqa: F401
-
     apply_runtime_compat_patches()
 
     from verl.trainer.main_ppo import run_ppo
@@ -321,6 +320,7 @@ def main() -> int:
     _normalize_ray_kwargs(config)
     _normalize_rollout_correction_config(config)
     _inject_runtime_env(config)
+    config = migrate_legacy_reward_impl(config)
     OmegaConf.resolve(config)
 
     if args.check_runtime_only:

@@ -113,7 +113,7 @@ Important wrapper behavior:
 
 ### Dataset Contract
 
-The config references dataset `r1_onevision_thinking`, which is defined in [dataset_info.json](data/dataset_info.json) and currently points to:
+The config references dataset `r1ov_thinking`, which is defined in [dataset_info.json](data/dataset_info.json) and currently points to:
 
 - `Qwen/data/sft/r1ov_thinking.jsonl`
 

@@ -26,6 +26,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.distributed as dist
@@ -249,16 +250,24 @@ def main_render_only(args, renderer):
                     paths = [p for _, p in current]
                     try:
                         images = renderer.render_batch(texts, thinking_mode=thinking_mode)
+                        if not images:
+                            raise ValueError("render_batch returned None")
                         for image, out_path in zip(images, paths):
+                            if image is None:
+                                raise ValueError("render_batch returned None element")
                             out_path.parent.mkdir(parents=True, exist_ok=True)
-                            Image.fromarray(image).save(out_path)
+                            _atomic_save_png(image, Path(out_path))
                             stats[stats_key] += 1
-                    except Exception:
+                    except Exception as e:
+                        # Log the error for debugging
+                        logger.warning(f"Batch render failed (thinking_mode={thinking_mode}): {e}")
                         # Fallback to per-item rendering to avoid losing whole batch.
                         for text, out_path in current:
                             try:
                                 if renderer.render(text, str(out_path), thinking_mode=thinking_mode):
                                     stats[stats_key] += 1
+                                else:
+                                    stats['errors'] += 1
                             except Exception:
                                 stats['errors'] += 1
 
@@ -446,6 +455,7 @@ def main_encode_only(args, encoder):
             logger.info(f"Processing {dataset_name} ({len(parquet_files)} shards)...")
 
         output_jsonl = output_dir / f"r1ov_{dataset_name}_thinking.jsonl"
+        output_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
         # Use rank-specific output file for multi-GPU
         if world_size > 1:
@@ -696,7 +706,7 @@ def main_encode_only(args, encoder):
                             # Precomputed one-time metadata for worker-side latent expansion.
                             'latent_seq_lens': latent_seq_lens,
                             'cot_chunk_token_ids': cot_chunk_token_ids,
-                            'task': 'r1_onevision_thinking',
+                            'task': 'r1ov_thinking',
                         }
                         expanded_len = _get_exact_expanded_length(
                             tokenizer,
@@ -742,6 +752,7 @@ def main_encode_only(args, encoder):
 
                 if rank_files:
                     # Concatenate all rank files
+                    base_jsonl.parent.mkdir(parents=True, exist_ok=True)
                     with open(base_jsonl, 'w') as f_out:
                         for rank_file in sorted(rank_files, key=lambda x: int(x.stem.split('rank')[1])):
                             with open(rank_file, 'r') as f_in:
@@ -768,6 +779,7 @@ def main_encode_only(args, encoder):
         logger.info("Merging all datasets into single JSONL...")
 
         merged_jsonl = output_dir / "r1ov_thinking.jsonl"
+        merged_jsonl.parent.mkdir(parents=True, exist_ok=True)
         total_samples = 0
 
         with open(merged_jsonl, 'w') as f_out:

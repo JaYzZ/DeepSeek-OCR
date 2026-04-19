@@ -119,14 +119,7 @@ _ALPHA_PREFIX_RE = re.compile(r"^(\s*)([A-Za-z])\s*[\.\)]\s+")
 
 def _atomic_save_png(image: Any, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="wb",
-        suffix=output_path.suffix,
-        prefix=f"{output_path.stem}.",
-        dir=output_path.parent,
-        delete=False,
-    ) as tmp_file:
-        tmp_path = Path(tmp_file.name)
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
     try:
         Image.fromarray(image).save(tmp_path, format="PNG")
         if not tmp_path.exists():

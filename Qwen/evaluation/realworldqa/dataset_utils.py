@@ -19,7 +19,7 @@ from Qwen.evaluation.realworldqa.common_utils import (
 
 # RealWorldQA dataset URL and MD5
 REALWORLDQA_DATASET_URL = 'https://opencompass.openxlab.space/utils/VLMEval/RealWorldQA.tsv'
-REALWORLDQA_DATASET_MD5 = '92321028d2bc29040284b6674721e48f'
+REALWORLDQA_DATASET_MD5 = '4de008f55dc4fd008ca9e15321dc44b7'
 
 def load_dataset(dataset_name='RealWorldQA'):
     """
