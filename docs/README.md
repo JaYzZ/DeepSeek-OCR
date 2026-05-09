@@ -14,6 +14,7 @@ This directory contains repo-local documentation for the engineering workspace i
 
 - [CLAUDE.md](CLAUDE.md): repo-specific working notes and operational conventions.
 - [LLAMAFACTORY.md](LLAMAFACTORY.md): how the repo overlays LlamaFactory for latent-token training.
+- [PRIVILEGED_OPSD.md](PRIVILEGED_OPSD.md): proposal notes for privileged-answer OPSD with OT alignment.
 
 ## Upstream vs Local Code
 

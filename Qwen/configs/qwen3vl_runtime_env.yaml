@@ -31,6 +31,7 @@ latent_ce_token: 0
 match_strategy: truncate
 max_new_tokens: 40960
 vae_intermediate_size: 512
+vae_trainable: 1
 
 ### curriculum
 curriculum_enable: 1
@@ -59,8 +60,10 @@ benchmark_server_concurrency: 32
 # These control whether continuous hidden-state AR is enabled at inference time.
 vllm_thinking: 1
 vllm_enforce_eager: 0
-vllm_force_think: 0
 min_continuous_steps: 0
+# Maximum continuous thinking steps within a single thinking span.
+# If unset/null, runtime derives it as max_new_tokens // 2.
+max_continuous_steps: null
 
 ### model/runtime behavior
 compile_vision_only: 1

@@ -5,8 +5,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-PROJECT_ROOT="${ROOT_DIR:-/share/project/xiyan}"
 source "$SCRIPT_DIR/qwen3vl_common.sh"
+PROJECT_ROOT="$ROOT_DIR"
 PYTHON_BIN="$(qwen3vl_require_python_bin "$REPO_ROOT")"
 
 TIMESTAMP="${QWEN3VL_TIMESTAMP:-$(date '+%Y%m%d_%H%M%S')}"
@@ -125,7 +125,6 @@ qwen3vl_copy_if_present "$PROJECT_CONFIG" "$OUTPUT_DIR"
 
 exec > >(qwen3vl_sanitize_log_stream | tee -a "$LOG_FILE") 2>&1
 
-export ROOT_DIR="$PROJECT_ROOT"
 export MODEL_PATH
 export VLLM_MODEL_PATH="${VLLM_MODEL_PATH:-$MODEL_PATH}"
 export TRAIN_FILE

@@ -16,6 +16,8 @@ from typing import Any, Iterable
 from Qwen.data.build_qwen3vl_opsd_dataset import (
     REPO_ROOT,
     _assistant_text,
+    _format_teacher_assistant_target,
+    _format_teacher_solution_text,
     _load_dataset_info,
     _resolve_dataset_path,
     _split_answer,
@@ -63,6 +65,8 @@ def _build_row(source_dataset: str, row_idx: int, row: dict[str, Any]) -> dict[s
         "student_user_text": _strip_leading_image_placeholder(_user_text(row)),
         "assistant_target": _assistant_text(row),
         "answer_text": _split_answer(_assistant_text(row)),
+        "teacher_solution_text": _format_teacher_solution_text(row),
+        "teacher_assistant_target": _format_teacher_assistant_target(row),
         "latent_ground_truth": list(row.get("latent_ground_truth") or []),
         "latent_supervision": list(row.get("latent_supervision") or []),
         "latent_seq_lens": list(row.get("latent_seq_lens") or []),

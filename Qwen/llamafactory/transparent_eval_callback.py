@@ -101,7 +101,7 @@ class QwenTransparentEvalCallback(TrainerCallback):
             print(msg, flush=True)
 
         # Load samples from metadata
-        metadata_path = Path(self.repo_root) / "Qwen/evaluation/data/qwen3vl_transparent_eval.metadata.json"
+        metadata_path = Path(self.repo_root) / "Qwen/evaluation/data/transparent_eval.metadata.json"
         if not metadata_path.exists():
             if is_main:
                 logger.warning(f"[QwenTransparentEval] No metadata found at {metadata_path}")

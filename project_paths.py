@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 ROOT_DIR_ENV = "ROOT_DIR"
-DEFAULT_PROJECT_ROOT = Path("/share/project/xiyan")
+DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def get_project_root() -> Path:

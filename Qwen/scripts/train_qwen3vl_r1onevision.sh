@@ -219,7 +219,7 @@ _set_env_from_runtime "QWEN3VL_THINKING_SEP_ID" "thinking_sep_id" "151670"
 _set_env_from_runtime "QWEN3VL_LOSS_TYPE" "loss_type" "ce+vae"
 _set_env_from_runtime "QWEN3VL_LATENT_AUX_LOSS_SOURCE" "latent_aux_loss_source" "hidden"
 _set_env_from_runtime "QWEN3VL_MATCH_STRATEGY" "match_strategy" "truncate"
-_set_env_from_runtime "QWEN3VL_MAX_NEW_TOKENS" "max_new_tokens" "40960"
+qwen3vl_export_env_from_main_then_runtime "$PYTHON_BIN" "$CONFIG_PATH" "generation.max_new_tokens" "$QWEN3VL_RUNTIME_ENV_CONFIG" "max_new_tokens" "QWEN3VL_MAX_NEW_TOKENS" "40960"
 _set_env_from_runtime "QWEN3VL_VAE_INTERMEDIATE_SIZE" "vae_intermediate_size" "512"
 _set_env_from_runtime "QWEN3VL_CURRICULUM_ENABLE" "curriculum_enable" "1"
 _set_env_from_runtime "QWEN3VL_CURRICULUM_EPOCHS" "curriculum_epochs" "0,1,2"
@@ -242,8 +242,8 @@ _set_env_from_runtime "PYTORCH_CUDA_ALLOC_CONF" "cuda_alloc_conf" "expandable_se
 # vLLM plugin runtime flags (used by backfill / benchmark subprocesses)
 _set_env_from_runtime "VLLM_THINKING" "vllm_thinking" "1"
 _set_env_from_runtime "VLLM_ENFORCE_EAGER" "vllm_enforce_eager" "0"
-_set_env_from_runtime "VLLM_FORCE_THINK" "vllm_force_think" "0"
-_set_env_from_runtime "MIN_CONTINUOUS_STEPS" "min_continuous_steps" "0"
+qwen3vl_export_env_from_main_then_runtime "$PYTHON_BIN" "$CONFIG_PATH" "generation.min_continuous_steps" "$QWEN3VL_RUNTIME_ENV_CONFIG" "min_continuous_steps" "MIN_CONTINUOUS_STEPS" "0"
+qwen3vl_export_max_continuous_steps_from_yaml "$PYTHON_BIN" "$CONFIG_PATH" "$QWEN3VL_RUNTIME_ENV_CONFIG"
 
 RUN_BACKFILL="$(_get_runtime_config "backfill_enable" "1")"
 RUN_BENCHMARK="$(_get_runtime_config "benchmark_enable" "0")"
@@ -378,7 +378,7 @@ BENCH_GPUS="\${BENCH_GPUS:-\${BENCH_CUDA_VISIBLE_DEVICES:-\${CUDA_VISIBLE_DEVICE
 QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" CUDA_VISIBLE_DEVICES="\$BACKFILL_GPUS" $PYTHON_BIN Qwen/inference/backfill_transparent_eval.py --checkpoint_dir "$CKPT_DIR" --checkpoint checkpoint_latest --gpu_memory_utilization \${GPU_MEMORY_UTILIZATION:-0.9} 2>&1 | tee \${BACKFILL_LOG:-/tmp/backfill_thinking_debug.log}
 BENCH_DIR="$RUN_DIR/bench"
 mkdir -p "\$BENCH_DIR"
-QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" VLLM_FORCE_THINK=$VLLM_FORCE_THINK CUDA_VISIBLE_DEVICES="\$BENCH_GPUS" $PYTHON_BIN Qwen/evaluation/run_all_benchmarks.py --start-server --gpus "\$BENCH_GPUS" --benchmarks \${BENCHMARKS:-MathVision,MMMU,RealWorldQA} --num-samples \${BENCHMARK_NUM_SAMPLES:-$BENCHMARK_NUM_SAMPLES} --lora-path "$CKPT_DIR/checkpoint_latest" --run-dir "\$BENCH_DIR"
+QWEN3VL_RUNTIME_ENV_CONFIG="$QWEN3VL_RUNTIME_ENV_CONFIG" CUDA_VISIBLE_DEVICES="\$BENCH_GPUS" $PYTHON_BIN Qwen/evaluation/run_all_benchmarks.py --start-server --gpus "\$BENCH_GPUS" --benchmarks \${BENCHMARKS:-MathVision,MMMU,RealWorldQA} --num-samples \${BENCHMARK_NUM_SAMPLES:-$BENCHMARK_NUM_SAMPLES} --lora-path "$CKPT_DIR/checkpoint_latest" --run-dir "\$BENCH_DIR"
 EOF
 chmod +x "$RERUN_EVALS_SH"
 LOG_FILE="$RUN_DIR/training.log"

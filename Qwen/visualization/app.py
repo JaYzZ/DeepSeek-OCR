@@ -36,7 +36,12 @@ import safetensors.torch
 from tokenizers import AddedToken
 from transformers import AutoModelForVision2Seq, AutoProcessor, AutoTokenizer
 
-from Qwen.inference.vllm_utils import apply_runtime_env_for_thinking
+from Qwen.inference.vllm_utils import (
+    append_forced_think_prompt,
+    apply_runtime_env_for_thinking,
+    should_force_think_prompt,
+    vllm_thinking_enabled,
+)
 from Qwen.llamafactory.integration import LatentVAE
 from Qwen.visualization.utils.visualization_utils import compute_tsne
 
@@ -53,11 +58,6 @@ TSNE_MAX_FEATURE_POINTS = int(os.environ.get("QWEN_VIS_TSNE_MAX_FEATURE_POINTS",
 ATTENTION_CACHE_DIR = Path(os.environ.get("QWEN_VIS_ATTENTION_CACHE_DIR", "/tmp/qwen_vis_attention"))
 ATTENTION_CACHE_TTL_SECONDS = int(os.environ.get("QWEN_VIS_ATTENTION_CACHE_TTL_SECONDS", str(60 * 60)))
 ATTENTION_OVERVIEW_MAX_SIZE = int(os.environ.get("QWEN_VIS_ATTENTION_OVERVIEW_MAX_SIZE", "256"))
-
-
-def _env_flag_enabled(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
-
 
 def _strip_trailing_think_prompt(prompt_text: str) -> str:
     stripped = prompt_text.rstrip()
@@ -240,8 +240,8 @@ def _prepare_batch(
         tokenize=False,
         add_generation_prompt=True,
     )
-    if _env_flag_enabled("VLLM_FORCE_THINK"):
-        prompt_text += "<think>"
+    if should_force_think_prompt(default="1"):
+        prompt_text = append_forced_think_prompt(prompt_text, default="1")
     else:
         prompt_text = _strip_trailing_think_prompt(prompt_text)
 
@@ -593,7 +593,7 @@ def _sample_token_id(
 
 
 def _format_response_text_for_display(text: str) -> str:
-    if _env_flag_enabled("VLLM_FORCE_THINK"):
+    if should_force_think_prompt(default="1"):
         return text
     if text.startswith("<think>") and "</think>" in text:
         return text.split("</think>", 1)[1].lstrip()
@@ -712,7 +712,7 @@ def _generate_with_adaptive_thinking_trace(
 
     think_start_id = int(os.environ.get("QWEN3VL_THINKING_START_ID", "151667"))
     think_end_id = int(os.environ.get("QWEN3VL_THINKING_END_ID", "151668"))
-    max_thinking_steps = int(os.environ.get("QWEN3VL_MAX_THINKING_STEPS", str(max_new_tokens // 2 if max_new_tokens > 1 else 1)))
+    max_thinking_steps = int(os.environ.get("MAX_CONTINUOUS_STEPS", str(max_new_tokens // 2 if max_new_tokens > 1 else 1)))
     min_continuous_steps = max(0, int(os.environ.get("MIN_CONTINUOUS_STEPS", "0")))
 
     input_ids = batch["input_ids"]
@@ -1066,7 +1066,7 @@ static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 apply_runtime_env_for_thinking(repo_root=_REPO_ROOT)
-THINKING_MODE_ENABLED = _env_flag_enabled("VLLM_THINKING", default="1") or _env_flag_enabled("VLLM_FORCE_THINK")
+THINKING_MODE_ENABLED = vllm_thinking_enabled(default="1")
 
 model = None
 processor = None

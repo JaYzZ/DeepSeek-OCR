@@ -59,6 +59,8 @@ loss:
 
 generation:
   max_new_tokens: 8192
+  min_continuous_steps: 0
+  max_continuous_steps: null
   do_sample: true
   temperature: 1.0
   top_p: 1.0
@@ -71,7 +73,6 @@ rollout:
   # Student rollout uses continuous-thinking vLLM by default.
   # Set false if you want a discrete student rollout baseline.
   vllm_thinking: true
-  vllm_force_think: false
   tensor_parallel_size: 1
   sync_steps: 1
   gpu_memory_utilization: 0.35

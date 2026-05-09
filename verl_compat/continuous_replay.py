@@ -16,7 +16,12 @@ from typing import Iterable
 import numpy as np
 import torch
 import torch.nn as nn
+from peft import PeftModel
 from safetensors.torch import load_file
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoModelForImageTextToText, AutoModelForVision2Seq
+from verl.models.transformers.monkey_patch import apply_monkey_patch
+from verl.utils.fs import copy_to_local
+from vllm_thinking.trace_store import get_request_trace, pop_request_trace
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +29,7 @@ CONTINUOUS_HIDDEN_KEY = "continuous_hidden_states"
 CONTINUOUS_LATENT_KEY = "continuous_latent_embeddings"
 CONTINUOUS_LATENT_LOGPROB_KEY = "continuous_latent_log_probs"
 CONTINUOUS_MASK_KEY = "continuous_token_mask"
+OPSD_TEACHER_PROMPT_IDS_KEY = "opsd_teacher_prompt_ids"
 _PATCHED = False
 _REPLAY_DTYPE_CAST_LOGGED = False
 _GRAD_FLOW_LOGGED = False
@@ -32,6 +38,10 @@ _POLICY_VAE_LOGGED = False
 _ROLLOUT_CERT_LOGGED = False
 _REPLAY_CERT_LOGGED = False
 _REPLAY_DEBUG_LOGGED = False
+_OPSD_LOSS_LOGGED = False
+_VLLM_LOGPROB_FALLBACK_LOGGED = False
+_OPSD_TEACHER_LOAD_LOGGED = False
+_TRACE_ATTACH_LOGGED = False
 
 
 def _replay_debug(message: str, *args) -> None:
@@ -594,6 +604,35 @@ def _log_grad_flow_probe(policy, micro_batch) -> None:
     _GRAD_FLOW_LOGGED = True
 
 
+def _collect_grad_flow_probe_metrics(policy, micro_batch) -> dict[str, float]:
+    latent_vae = getattr(policy, "latent_vae", None)
+    vae_stats = _collect_param_grad_stats(latent_vae.parameters()) if latent_vae is not None else None
+
+    response_mask = micro_batch["response_mask"]
+    response_supervised_tokens = int(response_mask.to(torch.int64).sum().item())
+    traced_samples = 0
+    continuous_positions = 0
+    for mask_row in _iter_object_array_rows(micro_batch.get(CONTINUOUS_MASK_KEY)):
+        if mask_row is None:
+            continue
+        mask_np = np.asarray(mask_row, dtype=np.bool_).reshape(-1)
+        if mask_np.size == 0:
+            continue
+        traced_samples += 1
+        continuous_positions += int(mask_np.sum())
+
+    return {
+        "actor/replay_response_tokens": float(response_supervised_tokens),
+        "actor/replay_traced_samples": float(traced_samples),
+        "actor/replay_continuous_positions": float(continuous_positions),
+        "actor/vae_enabled": 1.0 if latent_vae is not None else 0.0,
+        "actor/vae_trainable_params": 0.0 if vae_stats is None else float(vae_stats["trainable_params"]),
+        "actor/vae_grad_params": 0.0 if vae_stats is None else float(vae_stats["grad_params"]),
+        "actor/vae_nonzero_grad_params": 0.0 if vae_stats is None else float(vae_stats["nonzero_grad_params"]),
+        "actor/vae_grad_abs_max": 0.0 if vae_stats is None else float(vae_stats["grad_abs_max"]),
+    }
+
+
 def _resolve_vae_path(preferred_dir: str | None = None) -> Path | None:
     candidate_dirs = []
     if preferred_dir:
@@ -616,6 +655,8 @@ def _load_policy_latent_vae(policy) -> None:
     if vae_path is None:
         policy.latent_vae = None
         return
+    vae_trainable = os.environ.get("QWEN3VL_VAE_TRAINABLE", "1") == "1"
+    has_optimizer = policy.actor_optimizer is not None
 
     hidden_size = _resolve_hidden_size(policy.actor_module)
     vae = LatentVAE(
@@ -624,13 +665,13 @@ def _load_policy_latent_vae(policy) -> None:
         deterministic=False,
     )
     vae.load_state_dict(load_file(str(vae_path)), strict=True)
-    vae.train(policy.actor_optimizer is not None)
+    vae.train(has_optimizer and vae_trainable)
     for param in vae.parameters():
-        param.requires_grad = policy.actor_optimizer is not None
+        param.requires_grad = has_optimizer and vae_trainable
     policy.latent_vae = vae
     policy._qwen3vl_latent_vae_path = str(vae_path)
 
-    if policy.actor_optimizer is not None:
+    if has_optimizer and vae_trainable:
         existing_param_ids = {id(param) for group in policy.actor_optimizer.param_groups for param in group["params"]}
         new_params = [param for param in policy.latent_vae.parameters() if id(param) not in existing_param_ids]
         if new_params:
@@ -639,7 +680,7 @@ def _load_policy_latent_vae(policy) -> None:
         logger.warning(
             "[ContinuousReplay] Actor latent VAE loaded: path=%s trainable=%s params=%s",
             vae_path,
-            bool(policy.actor_optimizer is not None),
+            bool(has_optimizer and vae_trainable),
             sum(param.numel() for param in policy.latent_vae.parameters()),
         )
         _POLICY_VAE_LOGGED = True
@@ -667,6 +708,130 @@ def _restore_policy_latent_vae(policy, checkpoint_dir: str | None) -> None:
 
     policy.latent_vae.load_state_dict(load_file(str(vae_path)), strict=True)
     policy._qwen3vl_latent_vae_path = str(vae_path)
+
+
+def _opsd_off_policy_enabled() -> bool:
+    return str(os.environ.get("OPSD_OFF_POLICY_MODE", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _opsd_offload_teacher_enabled() -> bool:
+    return str(os.environ.get("OPSD_OFFLOAD_TEACHER_MODEL", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _config_get(config, key: str, default=None):
+    if config is None:
+        return default
+    if hasattr(config, "get"):
+        value = config.get(key, default)
+        return default if value is None else value
+    return getattr(config, key, default)
+
+
+def _module_compute_device(module: torch.nn.Module) -> torch.device:
+    first_tensor = next(module.parameters(), None)
+    if first_tensor is None:
+        first_tensor = next(module.buffers(), None)
+    if first_tensor is None:
+        raise RuntimeError("Could not determine module device for OPSD external teacher.")
+    return first_tensor.device
+
+
+def _load_opsd_external_teacher(policy) -> None:
+    global _OPSD_TEACHER_LOAD_LOGGED
+
+    if getattr(policy, "_opsd_external_teacher_ready", False):
+        return
+    if not _opsd_off_policy_enabled():
+        policy._opsd_external_teacher_ready = True
+        policy.opsd_external_teacher = None
+        return
+
+    teacher_model_path = str(os.environ.get("OPSD_TEACHER_MODEL_PATH", "") or "").strip()
+    if not teacher_model_path:
+        raise RuntimeError("OPSD_OFF_POLICY_MODE requires OPSD_TEACHER_MODEL_PATH to be set.")
+
+    actor_config = getattr(policy, "config", None)
+    actor_model_cfg = _config_get(actor_config, "model", {})
+    actor_module = getattr(policy, "actor_module", None)
+    local_path = copy_to_local(teacher_model_path, use_shm=_config_get(actor_model_cfg, "use_shm", False))
+    trust_remote_code = bool(_config_get(actor_model_cfg, "trust_remote_code", False))
+
+    attn_implementation = "flash_attention_2"
+    if not torch.cuda.is_available():
+        attn_implementation = "eager"
+    teacher_model_config = AutoConfig.from_pretrained(
+        local_path,
+        attn_implementation=attn_implementation,
+        trust_remote_code=trust_remote_code,
+    )
+
+    has_remote_code = hasattr(teacher_model_config, "auto_map") and any(
+        teacher_model_config.architectures[0] in val for val in teacher_model_config.auto_map.values()
+    )
+    if has_remote_code:
+        auto_class = next(
+            key for key, value in teacher_model_config.auto_map.items() if teacher_model_config.architectures[0] in value
+        )
+        match auto_class:
+            case "AutoModelForVision2Seq":
+                teacher_module_class = AutoModelForVision2Seq
+            case "AutoModelForCausalLM":
+                teacher_module_class = AutoModelForCausalLM
+            case "AutoModelForImageTextToText":
+                teacher_module_class = AutoModelForImageTextToText
+            case _:
+                teacher_module_class = AutoModel
+    else:
+        if type(teacher_model_config) in AutoModelForVision2Seq._model_mapping.keys():
+            teacher_module_class = AutoModelForVision2Seq
+        elif type(teacher_model_config) in AutoModelForCausalLM._model_mapping.keys():
+            teacher_module_class = AutoModelForCausalLM
+        elif type(teacher_model_config) in AutoModelForImageTextToText._model_mapping.keys():
+            teacher_module_class = AutoModelForImageTextToText
+        else:
+            teacher_module_class = AutoModel
+
+    teacher_module = teacher_module_class.from_pretrained(
+        pretrained_model_name_or_path=local_path,
+        torch_dtype=torch.bfloat16,
+        config=teacher_model_config,
+        trust_remote_code=trust_remote_code,
+        attn_implementation=attn_implementation,
+    )
+    apply_monkey_patch(
+        model=teacher_module,
+        use_remove_padding=bool(_config_get(actor_config, "use_remove_padding", False)),
+        ulysses_sp_size=_config_get(actor_config, "ulysses_sequence_parallel_size", 1),
+        use_fused_kernels=bool(_config_get(actor_model_cfg, "use_fused_kernels", False)),
+        fused_kernels_backend=(_config_get(actor_model_cfg, "fused_kernel_options", {}) or {}).get(
+            "impl_backend"
+        ),
+    )
+
+    teacher_adapter_path = str(os.environ.get("OPSD_TEACHER_ADAPTER_PATH", "") or "").strip()
+    if teacher_adapter_path:
+        local_adapter_path = copy_to_local(teacher_adapter_path, use_shm=_config_get(actor_model_cfg, "use_shm", False))
+        teacher_module = PeftModel.from_pretrained(teacher_module, local_adapter_path, is_trainable=False)
+
+    for param in teacher_module.parameters():
+        param.requires_grad_(False)
+    teacher_module.eval()
+    actor_device = next(actor_module.parameters()).device
+    if actor_device.type != "cpu":
+        teacher_module.to(actor_device)
+    if _opsd_offload_teacher_enabled():
+        teacher_module.to("cpu")
+
+    policy.opsd_external_teacher = teacher_module
+    policy._opsd_external_teacher_ready = True
+    if not _OPSD_TEACHER_LOAD_LOGGED:
+        logger.warning(
+            "[ContinuousReplay][OPSD] Loaded external teacher model=%s adapter=%s offload=%s",
+            teacher_model_path,
+            teacher_adapter_path or "<none>",
+            _opsd_offload_teacher_enabled(),
+        )
+        _OPSD_TEACHER_LOAD_LOGGED = True
 
 
 def _has_continuous_replay_inputs(micro_batch) -> bool:
@@ -700,6 +865,61 @@ def _pack_object_rows(rows: list[object]) -> np.ndarray:
     for idx, row in enumerate(rows):
         packed[idx] = row
     return packed
+
+
+def _agent_loop_response_length(output: object) -> int:
+    response_mask = getattr(output, "response_mask", None)
+    if isinstance(response_mask, torch.Tensor):
+        return int(response_mask.detach().to(device="cpu", dtype=torch.int64).sum().item())
+
+    response_ids = getattr(output, "response_ids", None)
+    if response_ids is None:
+        return 0
+    if isinstance(response_ids, torch.Tensor):
+        response_ids = response_ids.detach().to(device="cpu")
+        if response_ids.ndim == 0:
+            return int(response_ids.numel())
+        if response_ids.ndim == 1:
+            return int(response_ids.numel())
+        return int(response_ids.shape[-1])
+    return len(response_ids)
+
+
+def _unpack_agent_loop_continuous_traces(
+    outputs: list[object],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    continuous_hidden_states = []
+    continuous_latent_embeddings = []
+    continuous_token_masks = []
+
+    for output in outputs:
+        trace = getattr(output, "extra_fields", {}).get("continuous_trace")
+        if trace is None:
+            return None
+
+        response_length = _agent_loop_response_length(output)
+        hidden_row, latent_row, mask_row = _validate_request_trace(
+            trace,
+            request_id=str(getattr(output, "request_id", "<unknown>")),
+            response_length=response_length,
+        )
+        hidden_row_trimmed, latent_row_trimmed, mask_row_trimmed, _ = _trim_request_trace_to_actual_response_length(
+            hidden_row=hidden_row,
+            latent_row=latent_row,
+            mask_row=mask_row,
+            latent_log_probs=None,
+            actual_response_length=response_length,
+            request_id=str(getattr(output, "request_id", "<unknown>")),
+        )
+        continuous_hidden_states.append(hidden_row_trimmed)
+        continuous_latent_embeddings.append(latent_row_trimmed)
+        continuous_token_masks.append(mask_row_trimmed)
+
+    return (
+        _pack_object_rows(continuous_hidden_states),
+        _pack_object_rows(continuous_latent_embeddings),
+        _pack_object_rows(continuous_token_masks),
+    )
 
 
 def _validate_request_trace(trace: dict, request_id: str, response_length: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1260,6 +1480,8 @@ def apply_continuous_replay_patches() -> None:
     import ray
     from tensordict import TensorDict
     from verl import DataProto
+    from verl.experimental.agent_loop import agent_loop as agent_loop_mod
+    from verl.trainer.ppo import ray_trainer as ray_trainer_mod
     from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
     from verl.workers.rollout.vllm_rollout import vllm_rollout as rollout_mod
     from verl.workers.rollout.vllm_rollout import vllm_async_server as async_server_mod
@@ -1268,10 +1490,12 @@ def apply_continuous_replay_patches() -> None:
 
     original_policy_init = dp_actor_mod.DataParallelPPOActor.__init__
     original_forward_micro_batch = dp_actor_mod.DataParallelPPOActor._forward_micro_batch
+    original_agent_loop_postprocess = agent_loop_mod.AgentLoopWorker._postprocess
 
     def compat_policy_init(self, config, actor_module, actor_optimizer=None):
         original_policy_init(self, config=config, actor_module=actor_module, actor_optimizer=actor_optimizer)
         _load_policy_latent_vae(self)
+        _load_opsd_external_teacher(self)
 
     def compat_forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False):
         calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False)
@@ -1465,11 +1689,210 @@ def apply_continuous_replay_patches() -> None:
         keys = []
         if "multi_modal_inputs" in data.non_tensor_batch:
             keys.append("multi_modal_inputs")
+        if OPSD_TEACHER_PROMPT_IDS_KEY in data.non_tensor_batch:
+            keys.append(OPSD_TEACHER_PROMPT_IDS_KEY)
         if CONTINUOUS_HIDDEN_KEY in data.non_tensor_batch and CONTINUOUS_MASK_KEY in data.non_tensor_batch:
             keys.extend([CONTINUOUS_HIDDEN_KEY, CONTINUOUS_MASK_KEY])
         if CONTINUOUS_LATENT_KEY in data.non_tensor_batch:
             keys.append(CONTINUOUS_LATENT_KEY)
         return keys
+
+    def _opsd_cfg_value(config, key: str, default):
+        env_names = {
+            "enabled": "OPSD_ENABLED",
+            "weight": "OPSD_WEIGHT",
+            "temperature": "OPSD_TEMPERATURE",
+            "sampled_logprob_chunk_size": "OPSD_LOGPROB_CHUNK_SIZE",
+        }
+        env_name = env_names.get(key)
+        if env_name:
+            raw_value = os.environ.get(env_name)
+            if raw_value is not None:
+                if isinstance(default, bool):
+                    return str(raw_value).strip().lower() in {"1", "true", "yes", "on"}
+                if isinstance(default, int):
+                    return int(raw_value)
+                if isinstance(default, float):
+                    return float(raw_value)
+                return raw_value
+
+        cfg = getattr(config, "opsd", None)
+        if cfg is not None:
+            return cfg.get(key, default)
+        engine_cfg = getattr(config, "engine", None)
+        if engine_cfg is not None:
+            opsd_cfg = engine_cfg.get("opsd", None) if hasattr(engine_cfg, "get") else None
+            if opsd_cfg is not None:
+                return opsd_cfg.get(key, default)
+        return default
+
+    def _opsd_enabled(config) -> bool:
+        return bool(_opsd_cfg_value(config, "enabled", os.environ.get("OPSD_ENABLED", "0") == "1"))
+
+    def _pad_prompt_response_inputs(
+        *,
+        prompt_rows,
+        responses: torch.Tensor,
+        response_mask: torch.Tensor,
+        pad_token_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        device = responses.device
+        batch_size, response_len = responses.shape
+        prompt_lists: list[list[int]] = []
+        for row in _iter_object_array_rows(prompt_rows):
+            if hasattr(row, "tolist"):
+                row = row.tolist()
+            prompt_lists.append([int(token_id) for token_id in (row or [])])
+        if len(prompt_lists) != batch_size:
+            raise RuntimeError(
+                f"OPSD teacher prompt batch mismatch: prompts={len(prompt_lists)} responses={batch_size}"
+            )
+        max_prompt_len = max((len(row) for row in prompt_lists), default=0)
+        if max_prompt_len <= 0:
+            raise RuntimeError("OPSD teacher replay requires non-empty teacher prompt token IDs.")
+
+        total_len = max_prompt_len + response_len
+        input_ids = torch.full((batch_size, total_len), int(pad_token_id), dtype=torch.long, device=device)
+        attention_mask = torch.zeros((batch_size, total_len), dtype=response_mask.dtype, device=device)
+        target_mask = torch.zeros((batch_size, response_len), dtype=response_mask.dtype, device=device)
+
+        for row_idx, prompt_ids in enumerate(prompt_lists):
+            prompt_len = len(prompt_ids)
+            prompt_start = max_prompt_len - prompt_len
+            input_ids[row_idx, prompt_start:max_prompt_len] = torch.tensor(
+                prompt_ids,
+                dtype=torch.long,
+                device=device,
+            )
+            attention_mask[row_idx, prompt_start:max_prompt_len] = 1
+            input_ids[row_idx, max_prompt_len:] = responses[row_idx]
+            target_mask[row_idx] = response_mask[row_idx]
+            attention_mask[row_idx, max_prompt_len:] = response_mask[row_idx]
+
+        position_ids = torch.clip(torch.cumsum(attention_mask, dim=-1) - 1, min=0)
+        return input_ids, attention_mask, position_ids, target_mask
+
+    def _sampled_log_probs_from_logits(
+        *,
+        logits: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+        temperature: float,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        if chunk_size and int(chunk_size) > 0 and logits.shape[1] > int(chunk_size):
+            chunks: list[torch.Tensor] = []
+            step = int(chunk_size)
+            for start in range(0, int(logits.shape[1]), step):
+                end = min(start + step, int(logits.shape[1]))
+                chunks.append(
+                    _sampled_log_probs_from_logits(
+                        logits=logits[:, start:end, :],
+                        sampled_token_ids=sampled_token_ids[:, start:end],
+                        temperature=temperature,
+                        chunk_size=0,
+                    )
+                )
+            return torch.cat(chunks, dim=1)
+
+        gather_index = sampled_token_ids.unsqueeze(-1)
+        if abs(float(temperature) - 1.0) < 1e-6:
+            sampled_logits = torch.gather(logits, dim=-1, index=gather_index).squeeze(-1)
+            log_norm = torch.logsumexp(logits, dim=-1)
+            return sampled_logits - log_norm
+
+        scaled_logits = logits / float(temperature)
+        sampled_logits = torch.gather(scaled_logits, dim=-1, index=gather_index).squeeze(-1)
+        log_norm = torch.logsumexp(scaled_logits, dim=-1)
+        return sampled_logits - log_norm
+
+    def _compute_opsd_teacher_student_loss(
+        self,
+        *,
+        model_inputs: dict,
+        student_log_prob: torch.Tensor,
+        temperature: float,
+        pad_token_id: int,
+    ) -> tuple[torch.Tensor | None, dict[str, float]]:
+        global _OPSD_LOSS_LOGGED
+
+        prompt_rows = model_inputs.get(OPSD_TEACHER_PROMPT_IDS_KEY)
+        if prompt_rows is None:
+            return None, {}
+
+        responses = model_inputs["responses"]
+        response_mask = model_inputs["response_mask"]
+        teacher_input_ids, teacher_attention_mask, teacher_position_ids, teacher_target_mask = _pad_prompt_response_inputs(
+            prompt_rows=prompt_rows,
+            responses=responses,
+            response_mask=response_mask,
+            pad_token_id=pad_token_id,
+        )
+
+        teacher_module = getattr(self, "opsd_external_teacher", None) if _opsd_off_policy_enabled() else None
+        if teacher_module is None:
+            teacher_module = self.actor_module
+
+        teacher_device = responses.device
+        restore_device = None
+        if teacher_module is not self.actor_module:
+            original_device = _module_compute_device(teacher_module)
+            if original_device != teacher_device:
+                teacher_module = teacher_module.to(teacher_device)
+                if _opsd_offload_teacher_enabled() or original_device.type == "cpu":
+                    restore_device = original_device
+
+        teacher_input_ids = teacher_input_ids.to(device=teacher_device)
+        teacher_attention_mask = teacher_attention_mask.to(device=teacher_device)
+        teacher_position_ids = teacher_position_ids.to(device=teacher_device)
+
+        with torch.no_grad(), torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
+            was_training = bool(getattr(teacher_module, "training", False))
+            teacher_module.eval()
+            try:
+                output = teacher_module(
+                    input_ids=teacher_input_ids,
+                    attention_mask=teacher_attention_mask,
+                    position_ids=teacher_position_ids,
+                    use_cache=False,
+                )
+            finally:
+                if was_training:
+                    teacher_module.train()
+                if restore_device is not None:
+                    teacher_module.to(restore_device)
+
+        teacher_logits = output.logits[:, -responses.size(1) - 1 : -1, :]
+        teacher_log_prob = _sampled_log_probs_from_logits(
+            logits=teacher_logits,
+            sampled_token_ids=responses,
+            temperature=float(_opsd_cfg_value(self.config, "temperature", temperature)),
+            chunk_size=int(_opsd_cfg_value(self.config, "sampled_logprob_chunk_size", 1024)),
+        )
+
+        mask = teacher_target_mask.to(dtype=torch.bool)
+        if not mask.any():
+            return None, {}
+
+        advantage = (teacher_log_prob - student_log_prob).detach()
+        loss = -(advantage[mask] * student_log_prob[mask]).mean()
+
+        metrics = {
+            "actor/opsd_loss": float(loss.detach().item()),
+            "actor/opsd_advantage": float(advantage[mask].mean().detach().item()),
+            "actor/opsd_student_logprob": float(student_log_prob[mask].mean().detach().item()),
+            "actor/opsd_teacher_logprob": float(teacher_log_prob[mask].mean().detach().item()),
+            "actor/opsd_tokens": float(mask.sum().detach().item()),
+        }
+        if not _OPSD_LOSS_LOGGED:
+            logger.warning(
+                "[ContinuousReplay][OPSD] teacher replay active: batch=%s response_len=%s prompt_max_len=%s weight=%s",
+                int(responses.size(0)),
+                int(responses.size(1)),
+                int(teacher_input_ids.size(1) - responses.size(1)),
+                float(_opsd_cfg_value(self.config, "weight", 1.0)),
+            )
+            _OPSD_LOSS_LOGGED = True
+        return loss, metrics
 
     def compat_compute_log_prob(self, data, calculate_entropy=False):
         calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False)
@@ -1572,6 +1995,7 @@ def apply_continuous_replay_patches() -> None:
                     advantages = model_inputs["advantages"]
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
+                    pad_token_id = data.meta_info.get("pad_token_id", 0)
 
                     if self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
@@ -1627,6 +2051,20 @@ def apply_continuous_replay_patches() -> None:
                     else:
                         policy_loss = pg_loss
 
+                    if _opsd_enabled(self.config):
+                        opsd_loss, opsd_metrics = _compute_opsd_teacher_student_loss(
+                            self,
+                            model_inputs=model_inputs,
+                            student_log_prob=log_prob,
+                            temperature=temperature,
+                            pad_token_id=pad_token_id,
+                        )
+                        if opsd_loss is not None:
+                            opsd_weight = float(_opsd_cfg_value(self.config, "weight", 1.0))
+                            policy_loss = policy_loss + opsd_loss * opsd_weight
+                            for metric_key, metric_value in opsd_metrics.items():
+                                micro_batch_metrics[metric_key] = metric_value * loss_scale_factor
+
                     if self.config.use_kl_loss:
                         ref_log_prob = model_inputs["ref_log_prob"]
                         kld = dp_actor_mod.kl_penalty(
@@ -1648,6 +2086,7 @@ def apply_continuous_replay_patches() -> None:
                         self.scaler.scale(loss).backward()
                     else:
                         loss.backward()
+                    micro_batch_metrics.update(_collect_grad_flow_probe_metrics(self, model_inputs))
                     if _GRAD_FLOW_DEBUG:
                         _log_grad_flow_probe(self, model_inputs)
 
@@ -1659,22 +2098,169 @@ def apply_continuous_replay_patches() -> None:
         self.actor_optimizer.zero_grad()
         return metrics
 
-    original_server_generate = async_server_mod.vLLMHttpServer.generate
-
     async def compat_server_generate(self, *args, **kwargs):
-        output = await original_server_generate(self, *args, **kwargs)
+        global _TRACE_ATTACH_LOGGED, _VLLM_LOGPROB_FALLBACK_LOGGED
 
-        from vllm_thinking.trace_store import pop_request_trace
+        prompt_ids = kwargs.pop("prompt_ids", args[0] if len(args) >= 1 else None)
+        sampling_params = kwargs.pop("sampling_params", args[1] if len(args) >= 2 else None)
+        request_id = kwargs.pop("request_id", args[2] if len(args) >= 3 else None)
+        image_data = kwargs.pop("image_data", args[3] if len(args) >= 4 else None)
+        video_data = kwargs.pop("video_data", args[4] if len(args) >= 5 else None)
+        priority = kwargs.pop("priority", args[5] if len(args) >= 6 else 0)
+        if kwargs:
+            unexpected = ", ".join(sorted(kwargs.keys()))
+            raise TypeError(f"Unexpected vLLM generate kwargs: {unexpected}")
+        if prompt_ids is None or sampling_params is None or request_id is None:
+            raise TypeError("prompt_ids, sampling_params, and request_id are required for vLLM generate.")
 
-        request_id = kwargs.get("request_id")
-        if request_id is None and len(args) >= 3:
-            request_id = args[2]
+        prompt_ids = async_server_mod.normalize_token_ids(prompt_ids)
+        max_possible_tokens = self.config.max_model_len - len(prompt_ids)
+        if max_possible_tokens < 0:
+            raise ValueError(
+                f"Prompt length ({len(prompt_ids)}) exceeds the model's maximum context length "
+                f"({self.config.max_model_len})."
+            )
 
+        sampling_params = dict(sampling_params)
+        if "max_tokens" in sampling_params:
+            max_tokens = sampling_params.pop("max_tokens")
+        elif "max_new_tokens" in sampling_params:
+            max_tokens = sampling_params.pop("max_new_tokens")
+        else:
+            max_tokens = min(
+                self.config.response_length,
+                self.config.prompt_length + self.config.response_length - len(prompt_ids),
+            )
+        max_tokens = max(0, min(max_tokens, max_possible_tokens))
+
+        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        sampling_params = async_server_mod.SamplingParams(max_tokens=max_tokens, **sampling_params)
+        prompt_ids = async_server_mod.qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+
+        multi_modal_data = {}
+        if image_data is not None:
+            multi_modal_data["image"] = image_data
+        if video_data is not None:
+            multi_modal_data["video"] = video_data
+        prompt = async_server_mod.TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
+
+        lora_request = None
+        if self.lora_as_adapter:
+            lora_loaded = async_server_mod.VLLM_LORA_INT_ID in await self.engine.list_loras()
+            if lora_loaded:
+                lora_request = async_server_mod.LoRARequest(
+                    lora_name=async_server_mod.VLLM_LORA_NAME,
+                    lora_int_id=async_server_mod.VLLM_LORA_INT_ID,
+                    lora_path=async_server_mod.VLLM_LORA_PATH,
+                )
+
+        generator = self.engine.generate(
+            prompt=prompt,
+            sampling_params=sampling_params,
+            request_id=request_id,
+            lora_request=lora_request,
+            priority=priority,
+        )
+
+        final_res = None
+        async for engine_output in generator:
+            final_res = engine_output
+        assert final_res is not None
+
+        vllm_output = final_res.outputs[0]
+        token_ids = vllm_output.token_ids
+        log_probs = None
+        if sampling_params.logprobs is not None:
+            log_probs = []
+            for token_id, logprob_map in zip(token_ids, vllm_output.logprobs or []):
+                selected = logprob_map.get(token_id) if logprob_map is not None else None
+                if selected is None and logprob_map:
+                    selected = next(iter(logprob_map.values()))
+                    if not _VLLM_LOGPROB_FALLBACK_LOGGED:
+                        logger.warning(
+                            "[ContinuousReplay] vLLM omitted selected token %s from logprob map; using first returned logprob.",
+                            int(token_id),
+                        )
+                        _VLLM_LOGPROB_FALLBACK_LOGGED = True
+                log_probs.append(float(getattr(selected, "logprob", 0.0)))
+
+        routed_experts = None
+        if self.config.enable_rollout_routing_replay:
+            routed_experts = vllm_output.routed_experts
+
+        finish_reason = vllm_output.finish_reason
+        if finish_reason == "abort":
+            stop_reason = "aborted"
+        elif finish_reason in ("stop", "length"):
+            stop_reason = "completed"
+        else:
+            stop_reason = finish_reason
+
+        num_preempted = getattr(vllm_output, "num_preempted", None)
+        output = async_server_mod.TokenOutput(
+            token_ids=token_ids,
+            log_probs=log_probs,
+            routed_experts=routed_experts,
+            stop_reason=stop_reason,
+            num_preempted=num_preempted,
+            extra_fields={"global_steps": self.global_steps},
+        )
         if request_id is not None:
             trace = pop_request_trace(request_id)
+            if trace is None:
+                trace = get_request_trace(request_id)
             if trace is not None:
+                if output.log_probs is not None:
+                    latent_log_probs = np.asarray(
+                        trace.get(CONTINUOUS_LATENT_LOGPROB_KEY, np.empty((0,), dtype=np.float32)),
+                        dtype=np.float32,
+                    ).reshape(-1)
+                    if latent_log_probs.size > 0:
+                        hidden_row, latent_row, mask_row = _validate_request_trace(
+                            trace,
+                            request_id=str(request_id),
+                            response_length=len(token_ids),
+                        )
+                        _, _, mask_row_trimmed, latent_log_probs_trimmed = _trim_request_trace_to_actual_response_length(
+                            hidden_row=hidden_row,
+                            latent_row=latent_row,
+                            mask_row=mask_row,
+                            latent_log_probs=latent_log_probs,
+                            actual_response_length=len(token_ids),
+                            request_id=str(request_id),
+                        )
+                        _inject_latent_log_probs_into_rollout(
+                            curr_log_prob=output.log_probs,
+                            mask_row=mask_row_trimmed,
+                            latent_log_probs=latent_log_probs_trimmed,
+                            request_id=str(request_id),
+                        )
                 output.extra_fields = dict(output.extra_fields)
                 output.extra_fields["continuous_trace"] = trace
+                if not _TRACE_ATTACH_LOGGED:
+                    mask = np.asarray(
+                        trace.get(CONTINUOUS_MASK_KEY, np.empty((0,), dtype=np.bool_)),
+                        dtype=np.bool_,
+                    ).reshape(-1)
+                    hidden = np.asarray(
+                        trace.get(CONTINUOUS_HIDDEN_KEY, np.empty((0, 0), dtype=np.float16)),
+                        dtype=np.float16,
+                    )
+                    latent = np.asarray(
+                        trace.get(CONTINUOUS_LATENT_KEY, np.empty((0, 0), dtype=np.float16)),
+                        dtype=np.float16,
+                    )
+                    logger.warning(
+                        "[ContinuousReplay] Trace attached: request_id=%s response_tokens=%s mask_len=%s active_positions=%s hidden_shape=%s latent_shape=%s",
+                        request_id,
+                        len(token_ids),
+                        int(mask.size),
+                        int(mask.sum()),
+                        tuple(hidden.shape),
+                        tuple(latent.shape),
+                    )
+                    _TRACE_ATTACH_LOGGED = True
 
         return output
 
@@ -1846,12 +2432,58 @@ def apply_continuous_replay_patches() -> None:
             _ROLLOUT_CERT_LOGGED = True
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
+    def compat_agent_loop_postprocess(self, outputs, input_non_tensor_batch=None):
+        global _ROLLOUT_CERT_LOGGED
+
+        batch_output = original_agent_loop_postprocess(self, outputs, input_non_tensor_batch=input_non_tensor_batch)
+        packed_traces = _unpack_agent_loop_continuous_traces(outputs)
+        if packed_traces is None:
+            return batch_output
+
+        batch_output.non_tensor_batch.pop("continuous_trace", None)
+        hidden_rows, latent_rows, mask_rows = packed_traces
+        batch_output.non_tensor_batch[CONTINUOUS_HIDDEN_KEY] = hidden_rows
+        batch_output.non_tensor_batch[CONTINUOUS_LATENT_KEY] = latent_rows
+        batch_output.non_tensor_batch[CONTINUOUS_MASK_KEY] = mask_rows
+
+        if not _ROLLOUT_CERT_LOGGED:
+            traced_samples = sum(int(getattr(item, "shape", (0,))[0] > 0) for item in hidden_rows.tolist())
+            active_positions = sum(int(np.asarray(mask, dtype=np.bool_).sum()) for mask in mask_rows.tolist())
+            saved_latents = sum(int(getattr(item, "shape", (0,))[0] > 0) for item in latent_rows.tolist())
+            logger.warning(
+                "[ContinuousReplay] Rollout trace active: samples=%s traced=%s response_len=%s active_positions=%s saved_latents=%s",
+                len(hidden_rows),
+                traced_samples,
+                int(batch_output.batch["responses"].size(1)),
+                active_positions,
+                saved_latents,
+            )
+            _ROLLOUT_CERT_LOGGED = True
+
+        return batch_output
+
+    original_get_gen_batch = ray_trainer_mod.RayPPOTrainer._get_gen_batch
+
+    def compat_get_gen_batch(self, batch):
+        if OPSD_TEACHER_PROMPT_IDS_KEY not in batch.non_tensor_batch:
+            return original_get_gen_batch(self, batch)
+
+        reward_keys = set({"data_source", "reward_model", "extra_info", "uid", OPSD_TEACHER_PROMPT_IDS_KEY}) & set(
+            batch.non_tensor_batch.keys()
+        )
+        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_keys
+        gen_batch = batch.pop(batch_keys=[], non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop))
+        gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
+        return gen_batch
+
     dp_actor_mod.DataParallelPPOActor.__init__ = compat_policy_init
     dp_actor_mod.DataParallelPPOActor._forward_micro_batch = compat_forward_micro_batch
     dp_actor_mod.DataParallelPPOActor.compute_log_prob = compat_compute_log_prob
     dp_actor_mod.DataParallelPPOActor.update_policy = compat_update_policy
     async_server_mod.vLLMHttpServer.generate = compat_server_generate
     rollout_mod.ServerAdapter.generate_sequences = compat_rollout_generate_sequences
+    agent_loop_mod.AgentLoopWorker._postprocess = compat_agent_loop_postprocess
+    ray_trainer_mod.RayPPOTrainer._get_gen_batch = compat_get_gen_batch
     _PATCHED = True
 
 __all__ = [
@@ -1859,6 +2491,7 @@ __all__ = [
     "CONTINUOUS_LATENT_KEY",
     "CONTINUOUS_LATENT_LOGPROB_KEY",
     "CONTINUOUS_MASK_KEY",
+    "OPSD_TEACHER_PROMPT_IDS_KEY",
     "LatentVAE",
     "_restore_policy_latent_vae",
     "apply_continuous_replay_patches",

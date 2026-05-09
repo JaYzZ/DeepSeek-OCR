@@ -4,7 +4,6 @@ system_prompt: ""
 
 model:
   model_name_or_path: ../../huggingface/Qwen/Qwen3-VL-2B-Thinking
-  adapter_name_or_path: null
   freeze_vision_tower: true
   gradient_checkpointing: true
 
@@ -18,14 +17,19 @@ data:
   dataset_names: r1ov_thinking,deepvision_thinking
   opsd_manifest: Qwen/data/opsd_manifest/r1ov_deepvision_opsd.jsonl
   overwrite_manifest: false
+  load_from_cache_file: true
+  image_min_pixels: 1024
+  image_max_pixels: 262144
   max_prompt_length: 8192
   max_response_length: 8192
-  gen_batch_size: 4
-  train_batch_size: 4
-  val_batch_size: 4
-  dataloader_num_workers: 0
+  dataset_num_proc: 8
+  dataloader_num_workers: 8
   filter_overlong_prompts: false
   filter_overlong_prompts_workers: 1
+
+performance:
+  dataloader_persistent_workers: true
+  dataloader_prefetch_factor: 2
 
 prompts:
   student_user: |
@@ -47,58 +51,51 @@ prompts:
 
 teacher:
   model_name_or_path: ../../huggingface/Qwen/Qwen3-VL-2B-Thinking
-  adapter_name_or_path: null
   offload_model: false
 
 mode:
   off_policy: false
 
 loss:
-  opsd_enabled: true
-  opsd_weight: 1.0
+  token_type: jsd
   temperature: 1.0
+  beta: 0.0
+  token_clip: 0.05
   sampled_logprob_chunk_size: 1024
-  ot_replay_enabled: false
-  ot_replay_weight: 0.0
-
-vae:
-  enabled: false
-  trainable: false
-  intermediate_size: 512
 
 generation:
   max_new_tokens: 8192
-  min_continuous_steps: 0
-  max_continuous_steps: null
   temperature: 1.0
   top_p: 1.0
   top_k: 20
 
 rollout:
-  tensor_parallel_size: 1
   gpu_memory_utilization: 0.55
-  n: 1
-  max_num_batched_tokens: 20480
   max_model_len: 20480
-  enable_chunked_prefill: true
-  enforce_eager: false
-  agent_num_workers: 1
-
-reward:
-  num_workers: 1
-
-resources:
-  ray_num_cpus: 8
 
 training:
-  output_dir: Qwen/checkpoints/qwen3vl-2b/verl/opsd
+  output_dir: Qwen/checkpoints/qwen3vl-2b/swift/opsd
   learning_rate: 1.0e-6
   num_train_epochs: 1
   save_steps: 10
   save_total_limit: 2
-  use_kl_loss: true
-  kl_coef: 0.001
-  ppo_mini_batch_size: 4
-  actor_micro_batch_size: 1
-  actor_max_token_len: 20480
-  infer_max_token_len: 20480
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 4
+  logging_steps: 1
+  warmup_ratio: 0.0
+
+swift:
+  model_type: qwen3_vl
+  template: qwen3_vl
+  rlhf_type: gkd
+  use_vllm: true
+  vllm_mode: colocate
+  num_generations: 1
+  lmbda: 1.0
+  sft_alpha: 0.0
+  beta: 0.0
+  max_pixels: 262144
+  torch_dtype: bfloat16
+  use_liger_kernel: false
+  max_length: 8192
+  vit_gradient_checkpointing: false

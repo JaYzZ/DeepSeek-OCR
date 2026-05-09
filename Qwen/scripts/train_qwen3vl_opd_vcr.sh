@@ -52,8 +52,9 @@ _set_env_from_runtime "QWEN3VL_LATENT_TOKEN_ID" "latent_token_id" "151669"
 _set_env_from_runtime "QWEN3VL_THINKING_START_ID" "thinking_start_id" "151667"
 _set_env_from_runtime "QWEN3VL_THINKING_END_ID" "thinking_end_id" "151668"
 _set_env_from_runtime "QWEN3VL_THINKING_SEP_ID" "thinking_sep_id" "151670"
-_set_env_from_runtime "QWEN3VL_MAX_NEW_TOKENS" "max_new_tokens" "40960"
-_set_env_from_runtime "MIN_CONTINUOUS_STEPS" "min_continuous_steps" "0"
+qwen3vl_export_env_from_main_then_runtime "$PYTHON_BIN" "$CONFIG_PATH" "generation.max_new_tokens" "$QWEN3VL_RUNTIME_ENV_CONFIG" "max_new_tokens" "QWEN3VL_MAX_NEW_TOKENS" "40960"
+qwen3vl_export_env_from_main_then_runtime "$PYTHON_BIN" "$CONFIG_PATH" "generation.min_continuous_steps" "$QWEN3VL_RUNTIME_ENV_CONFIG" "min_continuous_steps" "MIN_CONTINUOUS_STEPS" "0"
+qwen3vl_export_max_continuous_steps_from_yaml "$PYTHON_BIN" "$CONFIG_PATH" "$QWEN3VL_RUNTIME_ENV_CONFIG"
 
 unset PYTORCH_CUDA_ALLOC_CONF
 unset PYTORCH_ALLOC_CONF

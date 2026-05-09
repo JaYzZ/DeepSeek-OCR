@@ -133,13 +133,17 @@ Shared runtime yaml:
 Important env values for vLLM:
 
 - `VLLM_THINKING`
-- `VLLM_FORCE_THINK`
 - `VLLM_ENFORCE_EAGER`
 - `MIN_CONTINUOUS_STEPS`
 - `QWEN3VL_THINKING_START_ID`
 - `QWEN3VL_THINKING_END_ID`
 - `QWEN3VL_LATENT_TOKEN_ID`
 - `QWEN3VL_THINKING_SEP_ID`
+
+Prompt behavior is now unified under `VLLM_THINKING`:
+
+- `VLLM_THINKING=1`: continuous hidden-state AR, no forced `<think>` prompt prefix
+- `VLLM_THINKING=0`: discrete AR, prompt helper appends `<think>`
 
 This is the alignment layer between training semantics and inference semantics.
 

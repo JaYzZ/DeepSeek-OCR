@@ -14,12 +14,23 @@ from __future__ import annotations
 
 import logging
 import os
-import torch.multiprocessing as mp
 
-# FD limit: Use file_system sharing strategy to avoid FD-per-tensor
-mp.set_sharing_strategy("file_system")
-if os.environ.get("LOCAL_RANK", "0") == "0":
-    logging.warning("[sitecustomize] Set torch multiprocessing sharing strategy to 'file_system' to avoid FD limits")
+
+def _defer_cuda_touching_patches() -> bool:
+    return os.environ.get("QWEN3VL_DEFER_VERL_PATCHES") == "1"
+
+
+def _configure_torch_sharing_strategy() -> None:
+    import torch.multiprocessing as mp
+
+    # FD limit: Use file_system sharing strategy to avoid FD-per-tensor
+    mp.set_sharing_strategy("file_system")
+    if os.environ.get("LOCAL_RANK", "0") == "0":
+        logging.warning("[sitecustomize] Set torch multiprocessing sharing strategy to 'file_system' to avoid FD limits")
+
+
+if not _defer_cuda_touching_patches():
+    _configure_torch_sharing_strategy()
 
 
 def _qwen_patches_enabled() -> bool:
@@ -39,11 +50,16 @@ def _verl_patches_enabled() -> bool:
     flag = os.environ.get("QWEN3VL_APPLY_VERL_PATCHES")
     if flag is None:
         return False
+    if os.environ.get("QWEN3VL_DEFER_VERL_PATCHES") == "1":
+        return False
     return flag.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _patch_once() -> None:
     """Apply all patches."""
+    if _defer_cuda_touching_patches():
+        return
+
     logger = logging.getLogger(__name__)
 
     try:

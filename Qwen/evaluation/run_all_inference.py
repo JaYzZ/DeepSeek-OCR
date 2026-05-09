@@ -35,14 +35,15 @@ def run_vllm_inference(
     """Run inference using vLLM backend by calling individual benchmark scripts."""
     adapter_meta = resolve_lora_artifacts(model_path, lora_path)
     resolved_model_path = adapter_meta["model_path"] or model_path
+    resolved_lora_path = adapter_meta["lora_path"]
     resolved_lora_rank = adapter_meta["lora_rank"] if adapter_meta["lora_rank"] is not None else 64
 
     print("\n" + "="*80)
     print("🚀 UNIFIED INFERENCE - vLLM Backend")
     print("="*80)
     print(f"Model: {resolved_model_path}")
-    if lora_path:
-        print(f"LoRA: {lora_path}")
+    if resolved_lora_path:
+        print(f"LoRA: {resolved_lora_path}")
         print(f"LoRA rank: {resolved_lora_rank}")
     print(f"Tensor parallel size: {tensor_parallel_size}")
     print(f"Benchmarks: {', '.join(benchmarks)}")
@@ -113,14 +114,14 @@ def run_vllm_inference(
         env = os.environ.copy()
 
         # Set LoRA checkpoint path for VAE loading (if provided)
-        if lora_path:
-            env["VLLM_LORA_CHECKPOINT_PATH"] = lora_path
+        if resolved_lora_path:
+            env["VLLM_LORA_CHECKPOINT_PATH"] = resolved_lora_path
 
         # Add LoRA arguments if provided
-        if lora_path:
+        if resolved_lora_path:
             cmd.extend([
                 "--enable-lora",
-                "--lora-path", lora_path,
+                "--lora-path", resolved_lora_path,
                 "--lora-name", lora_name,
             ])
 

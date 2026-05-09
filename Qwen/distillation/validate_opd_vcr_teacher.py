@@ -17,9 +17,9 @@ from Qwen.scripts.train_qwen3vl_opd_vcr import (
     _prepare_teacher_processor,
     _prepare_teacher_rollout_runtime,
     _resolve_config_paths,
-    _teacher_force_think,
+    _teacher_force_discrete_think_prompt,
 )
-from Qwen.scripts.train_qwen3vl_opsd import (
+from Qwen.scripts.qwen3vl_opsd_common import (
     _configure_quiet_logging,
     _load_processor_for_model,
     _maybe_prepare_manifest,
@@ -112,7 +112,7 @@ def main() -> int:
         cfg, acc, teacher_processor
     )
 
-    force_think = _teacher_force_think(cfg)
+    force_discrete_think_prompt = _teacher_force_discrete_think_prompt(cfg)
     output_path = Path(args.output_jsonl)
     results: list[dict] = []
 
@@ -124,11 +124,14 @@ def main() -> int:
             sampling_params=sampling_params,
             rollout_processor=rollout_processor,
             prepared_rows=prepared_rows,
-            force_think=force_think,
+            force_discrete_think_prompt=force_discrete_think_prompt,
         )
         for row, prepared, rollout in zip(batch_rows, prepared_rows, rollouts):
             decoded = rollout.get("decoded_text") or ""
-            thinking, answer = _extract_thinking_and_answer(decoded, forced_think_prefix=force_think)
+            thinking, answer = _extract_thinking_and_answer(
+                decoded,
+                forced_think_prefix=force_discrete_think_prompt,
+            )
             teacher_prompt_text = rollout_processor.apply_chat_template(
                 prepared.get("teacher_messages") or [],
                 tokenize=False,

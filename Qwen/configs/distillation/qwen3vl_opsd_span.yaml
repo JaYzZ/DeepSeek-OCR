@@ -1,0 +1,135 @@
+system_prompt: ""
+
+model:
+  model_name_or_path: ../../huggingface/Qwen/Qwen3-VL-2B-Thinking
+  freeze_vision_tower: true
+  gradient_checkpointing: true
+
+lora:
+  rank: 8
+  alpha: 16
+  target_modules: all-linear
+  exclude_modules: .*visual.*
+
+data:
+  dataset_name: r1ov_thinking
+  opsd_span_manifest: Qwen/data/opsd_manifest/r1ov_opsd_span.jsonl
+  overwrite_manifest: false
+  load_from_cache_file: true
+  image_min_pixels: 1024
+  image_max_pixels: 262144
+  max_prompt_length: 8192
+  max_response_length: 8192
+  dataset_num_proc: 8
+  dataloader_num_workers: 8
+
+performance:
+  dataloader_persistent_workers: true
+  dataloader_prefetch_factor: 2
+  pytorch_alloc_conf: expandable_segments:True
+
+prompts:
+  student_user: |
+    Answer the question.
+
+    Use <think>...</think> for reasoning. Inside the thinking span, <latent> means a compressed reasoning segment that stands for omitted thinking content. Only use <latent> inside <think>...</think>, and use it when you compress part of the reasoning instead of writing it out fully.
+
+    Question:
+    {question_text}
+  teacher_user: |
+    Problem:
+    {question_text}
+
+    Here is a reference solution to this problem:
+    === Reference Solution Begin ===
+    {reference_solution}
+    === Reference Solution End ===
+
+    After reading the reference solution above, make sure you truly understand the reasoning behind each step. Do not copy or paraphrase it. Now, using your own words and independent reasoning, derive the same final answer to the problem above.
+
+teacher:
+  model_name_or_path: ../../huggingface/Qwen/Qwen3-VL-2B-Thinking
+  offload_model: false
+
+mode:
+  off_policy: false
+  rlsd_enabled: false
+  stage: all
+
+warmup:
+  enabled: true
+  num_train_epochs: 1
+  max_steps: 0
+  learning_rate: 5.0e-6
+  save_steps: 50
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 4
+
+gspo:
+  enabled: true
+  rlhf_type: grpo
+  loss_type: grpo
+  advantage_estimator: grpo
+  importance_sampling_level: sequence_token
+  num_train_epochs: 1
+  max_steps: 0
+  learning_rate: 1.0e-6
+  save_steps: 10
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  num_generations: 8
+  beta: 0.001
+  lmbda: 1.0
+  sft_alpha: 0.0
+
+loss:
+  token_type: jsd
+  temperature: 1.0
+  beta: 0.0
+  token_clip: 0.05
+  sampled_logprob_chunk_size: 1024
+  delta_memory_enabled: true
+  delta_memory_gamma: 0.5
+  delta_memory_target_weight: 0.25
+
+replay:
+  mode: segment_mixed
+  delta_mode: follow_global
+  legit_latent_count_max: 12
+
+generation:
+  max_new_tokens: 8192
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 20
+
+rollout:
+  gpu_memory_utilization: 0.55
+  max_model_len: 12288
+
+training:
+  output_dir: Qwen/checkpoints/qwen3vl-2b/swift/opsd_span
+  learning_rate: 1.0e-6
+  num_train_epochs: 1
+  save_steps: 10
+  save_total_limit: 2
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 4
+  logging_steps: 1
+  warmup_ratio: 0.0
+
+swift:
+  model_type: qwen3_vl
+  template: qwen3_vl
+  rlhf_type: gkd
+  use_vllm: true
+  vllm_mode: colocate
+  num_generations: 1
+  lmbda: 1.0
+  sft_alpha: 0.0
+  beta: 0.0
+  max_pixels: 262144
+  torch_dtype: bfloat16
+  use_liger_kernel: false
+  max_length: 8192
+  vit_gradient_checkpointing: false

@@ -1,22 +1,14 @@
 """
-vLLM Thinking Mode Plugin
+vLLM thinking/latent decode plugin.
 
-This plugin enables Qwen3VL thinking mode with continuous hidden state AR
-in vLLM. It patches GPUModelRunner to support hidden state injection during
-the thinking phase.
-
-Usage:
-    export VLLM_PLUGINS=vllm_thinking
-    # OR
-    export VLLM_PLUGINS=vllm_thinking,other_plugin
-
-The plugin will be automatically loaded in all vLLM processes (main and workers).
+This plugin patches GPUModelRunner to support:
+- continuous hidden-state AR when `VLLM_THINKING=1`
+- discrete latent-token carry, where sampling `<latent>` injects
+  `embed(<latent>) + hidden_state` into the next decode step
 """
 
 import logging
 import os
-
-
 
 logger = logging.getLogger(__name__)
 
@@ -47,20 +39,21 @@ def vllm_thinking_plugin():
         logger.error(f"[vLLM Thinking Plugin] Failed to apply Qwen3-VL patch-embed patch: {e}")
         raise
 
-    # Canonical enable flag.
     enabled = _env_flag("VLLM_THINKING", default=False)
     if "VLLM_THINKING" in os.environ:
         logger.info(f"[PLUGIN] VLLM_THINKING={enabled}")
-    if not enabled:
-        logger.debug("[vLLM Thinking Plugin] Not enabled (set VLLM_THINKING=1)")
-        return
-
-    logger.info("[vLLM Thinking Plugin] Initializing...")
+    if "OPSD_DELTA_MEMORY_ENABLED" in os.environ:
+        logger.info(
+            "[PLUGIN] OPSD_DELTA_MEMORY_ENABLED=%s OPSD_DELTA_MEMORY_GAMMA=%s",
+            os.environ.get("OPSD_DELTA_MEMORY_ENABLED", "0"),
+            os.environ.get("OPSD_DELTA_MEMORY_GAMMA", "0.5"),
+        )
+    logger.info("[vLLM Thinking Plugin] Initializing decode patch...")
 
     try:
         from vllm_thinking.runner_patch import apply_thinking_mode_patch
         apply_thinking_mode_patch()
-        logger.info("[vLLM Thinking Plugin] ✓ Successfully applied thinking mode patch")
+        logger.info("[vLLM Thinking Plugin] ✓ Successfully applied decode patch")
     except Exception as e:
         logger.error(f"[vLLM Thinking Plugin] Failed to apply patch: {e}")
         raise

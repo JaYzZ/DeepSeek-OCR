@@ -1,9 +1,10 @@
 # Qwen3VL Training
 
-This directory currently has two primary training flows:
+This directory currently has three primary training flows:
 
 - `R1-OneVision` supervised fine-tuning with latent injection and latent losses.
 - `Chimera` GSPO reinforcement learning on VERL with vLLM rollout.
+- `OPSD` privileged dual-replay distillation for continuous thinking, with optional OT replay targets.
 
 The commands below match the active wrappers in this repo as of April 4, 2026.
 
@@ -13,6 +14,7 @@ The launcher command forms did not change during the recent refactor. These are 
 
 - SFT: `tmux new-session -d -s r1_sft 'bash Qwen/scripts/train_qwen3vl_r1onevision.sh Qwen/configs/qwen3vl_r1onevision_thinking.yaml'`
 - RL: `tmux new-session -d -s chimera_gspo 'INIT_LORA_PATH=Qwen/checkpoints/qwen3vl-2b/lora/r1_onevision_thinking/run_vae_mse_ot_2ce_subcot/checkpoint-729 bash Qwen/scripts/train_qwen3vl_chimera_gspo.sh'`
+- OPSD: `tmux new-session -d -s opsd 'bash Qwen/scripts/train_qwen3vl_opsd.sh Qwen/configs/distillation/qwen3vl_opsd.yaml'`
 
 Current implementation state:
 
@@ -253,14 +255,45 @@ Current runtime defaults:
 
 - `backfill_enable: 1`
 - `benchmark_enable: 1`
-- `benchmark_list: MathVision,MMMU,RealWorldQA`
+- `benchmark_list: MathVision,MMMU,RealWorldQA,M3CoT`
 - `benchmark_num_samples: 100`
 
 The wrapper also emits:
 
 - `training.log`
 - `dataset_mix_summary.json` when dataset mixing or ratios are used
-- `rerun_evals.sh` for rerunning backfill and benchmark jobs later
+
+### Standard Manual Eval Commands
+
+For a designated checkpoint and designated GPUs, use these canonical commands.
+
+Transparent backfill:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python Qwen/inference/backfill_transparent_eval.py \
+  --checkpoint_dir /abs/path/to/run_or_ckpt_parent \
+  --checkpoint checkpoint-1650 \
+  --gpu_memory_utilization 0.8
+```
+
+Benchmark:
+
+```bash
+CUDA_VISIBLE_DEVICES=1,2 python Qwen/evaluation/run_all_benchmarks.py \
+  --start-server \
+  --lora-path /abs/path/to/checkpoint-1650 \
+  --run-dir /abs/path/to/checkpoint-1650/bench \
+  --gpus 1,2 \
+  --benchmarks MathVision,MMMU,RealWorldQA,M3CoT \
+  --num-samples 100
+```
+
+Conventions:
+
+- backfill uses `--checkpoint_dir` plus optional `--checkpoint`
+- benchmark uses `--lora-path` plus `--run-dir`
+- benchmark dataset selection is controlled only by `--benchmarks`
+- benchmark GPU selection is controlled by `CUDA_VISIBLE_DEVICES` and `--gpus`
 
 ## Chimera GSPO RL
 
@@ -448,9 +481,13 @@ The repo-local plugin is used by benchmark and RL-serving flows.
 Relevant env vars:
 
 - `VLLM_THINKING`
-- `VLLM_FORCE_THINK`
 - `MIN_CONTINUOUS_STEPS`
 - `VLLM_LORA_CHECKPOINT_PATH`
+
+Discrete AR prompting now follows the shared helper behavior:
+
+- `VLLM_THINKING=1`: continuous hidden-state AR, do not force `<think>` in the prompt
+- `VLLM_THINKING=0`: discrete AR, force `<think>` in the prompt
 
 The plugin can load `vae.safetensors` from the LoRA checkpoint directory when present. If that file is missing, it falls back to using the previous hidden state directly instead of VAE sampling.
 

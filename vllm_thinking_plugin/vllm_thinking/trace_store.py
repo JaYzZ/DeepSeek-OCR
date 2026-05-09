@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import os
-import glob
-import pickle
-import tempfile
 from threading import Lock
 from typing import Any
 import queue
@@ -13,12 +10,12 @@ import queue
 import numpy as np
 import torch
 
-# Visualization data collection flag (disabled by default for performance)
-_STORE_VISUALIZATION_DATA = os.environ.get("VLLM_STORE_VISUALIZATION_DATA", "0").strip().lower() in {"1", "true", "yes", "on"}
-
-# Temp directory for cross-process trace sharing
-_TRACE_DIR = tempfile.gettempdir()
-_TRACE_FILE_PREFIX = "vllm_trace_"
+_STORE_VISUALIZATION_DATA = os.environ.get("VLLM_STORE_VISUALIZATION_DATA", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 # Global lock for trace dictionary operations only (not for per-request appends)
 _TRACE_DICT_LOCK = Lock()
@@ -36,6 +33,7 @@ def reset_request_trace(request_id: str) -> None:
             "continuous_latent_log_probs": [],
             "continuous_token_mask": [],
             "all_token_ids": [],
+            "all_token_logprobs": [],
         }
         if _STORE_VISUALIZATION_DATA:
             trace_dict["all_hidden_states"] = []
@@ -44,13 +42,6 @@ def reset_request_trace(request_id: str) -> None:
         _REQUEST_TRACES[request_id] = trace_dict
         # Create per-request queue for lock-free recording
         _REQUEST_QUEUES[request_id] = queue.Queue()
-        
-    trace_file = os.path.join(_TRACE_DIR, f"{_TRACE_FILE_PREFIX}{request_id}.pkl")
-    if os.path.exists(trace_file):
-        try:
-            os.remove(trace_file)
-        except OSError:
-            pass
 
 
 def record_request_step(
@@ -61,6 +52,7 @@ def record_request_step(
     use_continuous_embedding: bool,
     all_hidden_states: torch.Tensor | None = None,
     all_token_ids: list[int] | None = None,
+    all_token_logprobs: list[float | None] | None = None,
     attention_weights: torch.Tensor | None = None,
     token_embeddings: torch.Tensor | None = None,
 ) -> None:
@@ -79,6 +71,10 @@ def record_request_step(
                     "continuous_latent_log_probs": [],
                     "continuous_token_mask": [],
                     "all_token_ids": [],
+                    "all_token_logprobs": [],
+                    "all_hidden_states": [],
+                    "all_token_embeddings": [],
+                    "attention_weights": [],
                 },
             )
         _record_to_trace(
@@ -89,6 +85,7 @@ def record_request_step(
             use_continuous_embedding,
             all_hidden_states,
             all_token_ids,
+            all_token_logprobs,
             attention_weights,
             token_embeddings,
         )
@@ -101,6 +98,7 @@ def record_request_step(
             use_continuous_embedding,
             all_hidden_states,
             all_token_ids,
+            all_token_logprobs,
             attention_weights,
             token_embeddings,
         ))
@@ -114,6 +112,7 @@ def _record_to_trace(
     use_continuous_embedding: bool,
     all_hidden_states: torch.Tensor | None = None,
     all_token_ids: list[int] | None = None,
+    all_token_logprobs: list[float | None] | None = None,
     attention_weights: torch.Tensor | None = None,
     token_embeddings: torch.Tensor | None = None,
 ) -> None:
@@ -141,30 +140,34 @@ def _record_to_trace(
 
     if all_token_ids is not None:
         trace["all_token_ids"].extend(int(token_id) for token_id in all_token_ids)
+    if all_token_logprobs is not None:
+        trace["all_token_logprobs"].extend(
+            float(logprob) if logprob is not None else float("nan")
+            for logprob in all_token_logprobs
+        )
 
-    # Store visualization data if enabled
     if _STORE_VISUALIZATION_DATA:
         if all_hidden_states is not None:
-            hs = all_hidden_states.detach().to(
+            hidden_states = all_hidden_states.detach().to(
                 device="cpu",
                 dtype=torch.float16,
                 non_blocking=True,
             ).contiguous().numpy()
-            trace["all_hidden_states"].append(hs)
+            trace.setdefault("all_hidden_states", []).append(hidden_states)
         if token_embeddings is not None:
-            te = token_embeddings.detach().to(
+            embeddings = token_embeddings.detach().to(
                 device="cpu",
                 dtype=torch.float16,
                 non_blocking=True,
             ).contiguous().numpy()
-            trace["all_token_embeddings"].append(te)
+            trace.setdefault("all_token_embeddings", []).append(embeddings)
         if attention_weights is not None:
-            aw = attention_weights.detach().to(
+            attention = attention_weights.detach().to(
                 device="cpu",
                 dtype=torch.float32,
                 non_blocking=True,
             ).contiguous().numpy()
-            trace["attention_weights"].append(aw)
+            trace.setdefault("attention_weights", []).append(attention)
 
 
 def _drain_request_queue(request_id: str) -> None:
@@ -184,6 +187,7 @@ def _drain_request_queue(request_id: str) -> None:
                 use_continuous_embedding,
                 all_hidden_states,
                 all_token_ids,
+                all_token_logprobs,
                 attention_weights,
                 token_embeddings,
             ) = q.get_nowait()
@@ -195,6 +199,7 @@ def _drain_request_queue(request_id: str) -> None:
                 use_continuous_embedding,
                 all_hidden_states,
                 all_token_ids,
+                all_token_logprobs,
                 attention_weights,
                 token_embeddings,
             )
@@ -211,71 +216,16 @@ def _pack_trace(trace: dict[str, list[Any]]) -> dict[str, np.ndarray | list[int]
         "continuous_latent_log_probs": np.asarray(packed_latent_log_probs, dtype=np.float32) if packed_latent_log_probs else np.empty((0,), dtype=np.float32),
         "continuous_token_mask": np.asarray(list(trace.get("continuous_token_mask", [])), dtype=np.bool_),
         "all_token_ids": list(trace.get("all_token_ids", [])),
+        "all_token_logprobs": np.asarray(list(trace.get("all_token_logprobs", [])), dtype=np.float32),
     }
-
-    if _STORE_VISUALIZATION_DATA:
-        if trace.get("all_hidden_states"):
-            result["all_hidden_states"] = np.array(trace["all_hidden_states"], dtype=np.float16)
-        if trace.get("all_token_embeddings"):
-            result["all_token_embeddings"] = np.array(trace["all_token_embeddings"], dtype=np.float16)
-        if trace.get("attention_weights"):
-            result["attention_weights"] = np.array(trace["attention_weights"], dtype=np.float32)
+    if trace.get("all_hidden_states"):
+        result["all_hidden_states"] = np.array(trace["all_hidden_states"], dtype=np.float16)
+    if trace.get("all_token_embeddings"):
+        result["all_token_embeddings"] = np.array(trace["all_token_embeddings"], dtype=np.float16)
+    if trace.get("attention_weights"):
+        result["attention_weights"] = np.array(trace["attention_weights"], dtype=np.float32)
 
     return result
-
-
-def _save_trace_to_file(request_id: str, trace_data: dict) -> None:
-    """Save trace data to a temporary file for cross-process access."""
-    if not _STORE_VISUALIZATION_DATA:
-        return
-    trace_file = os.path.join(_TRACE_DIR, f"{_TRACE_FILE_PREFIX}{request_id}.pkl")
-    try:
-        serializable_data = {}
-        for key, value in trace_data.items():
-            if isinstance(value, np.ndarray):
-                serializable_data[key] = value.tolist()
-            else:
-                serializable_data[key] = value
-        with open(trace_file, 'wb') as f:
-            pickle.dump(serializable_data, f)
-    except Exception:
-        pass  # Silently fail to avoid breaking workers
-
-
-def _load_trace_from_file(request_id: str) -> dict | None:
-    """Load trace data from a temporary file."""
-    trace_file = os.path.join(_TRACE_DIR, f"{_TRACE_FILE_PREFIX}{request_id}.pkl")
-    if not os.path.exists(trace_file):
-        return None
-    try:
-        with open(trace_file, 'rb') as f:
-            data = pickle.load(f)
-            # Convert lists back to numpy arrays for visualization
-            for key, value in data.items():
-                if isinstance(value, list) and key in ["continuous_hidden_states", "continuous_latent_embeddings",
-                                                        "all_hidden_states", "attention_weights"]:
-                    if value and len(value) > 0:
-                        data[key] = np.array(value)
-            return data
-    except Exception:
-        return None
-
-
-def save_request_trace_to_file(request_id: str) -> None:
-    """Save the current trace to a file without popping it (called from worker)."""
-    if not _STORE_VISUALIZATION_DATA:
-        return
-    request_id = str(request_id)
-    _drain_request_queue(request_id)
-
-    with _TRACE_DICT_LOCK:
-        trace = _REQUEST_TRACES.get(request_id)
-        if trace is None:
-            return
-        result = _pack_trace(trace)
-
-    _save_trace_to_file(request_id, result)
-
 
 def pop_request_trace(request_id: str) -> dict[str, np.ndarray] | None:
     request_id = str(request_id)
@@ -290,12 +240,7 @@ def pop_request_trace(request_id: str) -> dict[str, np.ndarray] | None:
     if trace is None:
         return None
 
-    result = _pack_trace(trace)
-
-    # Save to file for cross-process access
-    _save_trace_to_file(request_id, result)
-
-    return result
+    return _pack_trace(trace)
 
 
 def get_request_trace(request_id: str) -> dict[str, np.ndarray] | None:
@@ -308,9 +253,6 @@ def get_request_trace(request_id: str) -> dict[str, np.ndarray] | None:
     with _TRACE_DICT_LOCK:
         trace = _REQUEST_TRACES.get(request_id)
         if trace is None:
-            # Try loading from file (for cross-process access)
-            if _STORE_VISUALIZATION_DATA:
-                return _load_trace_from_file(request_id)
             return None
         return _pack_trace(trace)
 
@@ -319,15 +261,6 @@ def get_latest_trace() -> dict[str, np.ndarray] | None:
     """Get the most recent trace (useful for single-request scenarios)."""
     with _TRACE_DICT_LOCK:
         if not _REQUEST_TRACES:
-            # No traces in memory, try loading from file
-            if _STORE_VISUALIZATION_DATA:
-                # Find the most recent trace file
-                trace_files = glob.glob(os.path.join(_TRACE_DIR, f"{_TRACE_FILE_PREFIX}*.pkl"))
-                if trace_files:
-                    latest_file = max(trace_files, key=os.path.getmtime)
-                    request_id = os.path.basename(latest_file)[len(_TRACE_FILE_PREFIX):-4]
-                    if request_id:
-                        return _load_trace_from_file(request_id)
             return None
         # Get the most recently added trace
         request_id = list(_REQUEST_TRACES.keys())[-1]
@@ -349,5 +282,4 @@ __all__ = [
     "list_request_ids",
     "record_request_step",
     "reset_request_trace",
-    "save_request_trace_to_file",
 ]

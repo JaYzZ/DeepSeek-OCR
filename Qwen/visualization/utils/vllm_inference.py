@@ -7,6 +7,7 @@ import base64
 from io import BytesIO
 import json
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -14,6 +15,10 @@ import torch
 from PIL import Image
 from vllm_thinking.trace_store import get_request_trace
 import yaml
+
+from Qwen.inference.vllm_utils import apply_runtime_env_for_thinking
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def load_runtime_env(config_path: str = "Qwen/configs/qwen3vl_runtime_env.yaml") -> Dict[str, Any]:
@@ -25,7 +30,10 @@ def load_runtime_env(config_path: str = "Qwen/configs/qwen3vl_runtime_env.yaml")
     Returns:
         Config dictionary
     """
-    with open(config_path, 'r') as f:
+    path = Path(config_path)
+    if not path.is_absolute():
+        path = (_REPO_ROOT / path).resolve()
+    with path.open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     return config
 
@@ -46,15 +54,15 @@ def setup_vllm_thinking_env(
     if lora_checkpoint_path:
         os.environ["VLLM_LORA_CHECKPOINT_PATH"] = lora_checkpoint_path
 
-    if enable_thinking:
-        os.environ["VLLM_THINKING_MODE"] = "1"
-        os.environ["VLLM_THINKING_DEBUG"] = "1"
+    os.environ["VLLM_THINKING"] = "1" if enable_thinking else "0"
+    os.environ["VLLM_TOKENIZER_PATH"] = model_path
+    apply_runtime_env_for_thinking()
 
-    # Enable thinking-specific token IDs (Qwen3-VL specific)
-    os.environ["QWEN3VL_THINKING_START_ID"] = "151667"
-    os.environ["QWEN3VL_THINKING_END_ID"] = "151668"
-    os.environ["QWEN3VL_LATENT_TOKEN_ID"] = "151669"
-    os.environ["QWEN3VL_THINKING_SEP_ID"] = "151670"
+    runtime_cfg = load_runtime_env()
+    os.environ.setdefault("QWEN3VL_THINKING_START_ID", str(runtime_cfg.get("thinking_start_id", 151667)))
+    os.environ.setdefault("QWEN3VL_THINKING_END_ID", str(runtime_cfg.get("thinking_end_id", 151668)))
+    os.environ.setdefault("QWEN3VL_LATENT_TOKEN_ID", str(runtime_cfg.get("latent_token_id", 151669)))
+    os.environ.setdefault("QWEN3VL_THINKING_SEP_ID", str(runtime_cfg.get("thinking_sep_id", 151670)))
 
 
 def prepare_image_prompt(image_path: Optional[str] = None, image_base64: Optional[str] = None) -> List[Dict[str, Any]]:

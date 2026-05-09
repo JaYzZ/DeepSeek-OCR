@@ -50,7 +50,8 @@ from Qwen.data.utils import (
     format_cot_subsequences,
     normalize_thinking_text_for_rendering,
 )
-from Qwen.scripts.train_qwen3vl_opsd import (
+from Qwen.inference.vllm_utils import append_forced_think_prompt, should_force_think_prompt
+from Qwen.scripts.qwen3vl_opsd_common import (
     OpsdManifestDataset,
     _configure_quiet_logging,
     _format_user_prompt,
@@ -134,8 +135,8 @@ def _build_user_messages(
     return messages
 
 
-def _teacher_force_think(config: dict[str, Any]) -> bool:
-    return bool((config.get("teacher") or {}).get("vllm_force_think", False))
+def _teacher_force_discrete_think_prompt(config: dict[str, Any]) -> bool:
+    return not bool((config.get("teacher") or {}).get("vllm_thinking", False))
 
 
 def _teacher_rollout_backend(config: dict[str, Any]) -> str:
@@ -164,11 +165,11 @@ def _build_replay_renderer(config: dict[str, Any]) -> AdaptiveSkiaRenderer:
     )
 
 
-def _teacher_prompt_text(processor, messages: list[dict[str, Any]], *, force_think: bool) -> str:
+def _teacher_prompt_text(processor, messages: list[dict[str, Any]], *, force_discrete_think_prompt: bool) -> str:
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     text = text + "<|im_start|>assistant\n"
-    if force_think:
-        text = text + "<think>"
+    if force_discrete_think_prompt:
+        text = append_forced_think_prompt(text, default="0")
     return text
 
 
@@ -315,7 +316,7 @@ def _prepare_student_training_batch(
 
     valid_specs: list[dict[str, Any]] = []
     all_chunk_texts: list[str] = []
-    forced_think_prefix = _teacher_force_think(config)
+    forced_think_prefix = _teacher_force_discrete_think_prompt(config)
     replay_render_config = _build_replay_render_config(config)
 
     for row, rollout in zip(prepared_rows, teacher_rollouts):
@@ -565,7 +566,6 @@ def _prepare_teacher_rollout_runtime(config: dict[str, Any], accelerator: Accele
         )
     rollout_cfg = copy.deepcopy(config.get("rollout") or {})
     rollout_cfg["vllm_thinking"] = bool(teacher_cfg.get("vllm_thinking", False))
-    rollout_cfg["vllm_force_think"] = bool(teacher_cfg.get("vllm_force_think", False))
     rollout_cfg["enable_sleep_mode"] = bool(teacher_cfg.get("enable_sleep_mode", rollout_cfg.get("enable_sleep_mode", True)))
     rollout_cfg["gpu_memory_utilization"] = float(
         teacher_cfg.get("gpu_memory_utilization", rollout_cfg.get("gpu_memory_utilization", 0.35))
@@ -580,7 +580,6 @@ def _prepare_teacher_rollout_runtime(config: dict[str, Any], accelerator: Accele
     teacher_rollout_config["rollout"] = rollout_cfg
 
     previous_vllm_thinking = os.environ.get("VLLM_THINKING")
-    previous_vllm_force_think = os.environ.get("VLLM_FORCE_THINK")
     try:
         rollout_engine, sampling_params, rollout_processor, blocked_ids = _init_vllm_rollout_engine(
             accelerator=accelerator,
@@ -592,10 +591,6 @@ def _prepare_teacher_rollout_runtime(config: dict[str, Any], accelerator: Accele
             os.environ.pop("VLLM_THINKING", None)
         else:
             os.environ["VLLM_THINKING"] = previous_vllm_thinking
-        if previous_vllm_force_think is None:
-            os.environ.pop("VLLM_FORCE_THINK", None)
-        else:
-            os.environ["VLLM_FORCE_THINK"] = previous_vllm_force_think
 
     if rollout_engine is None:
         raise RuntimeError("Teacher rollout engine was not initialized. Set rollout.enable=true.")
@@ -628,22 +623,20 @@ def _generate_teacher_rollouts(
     sampling_params: SamplingParams,
     rollout_processor,
     prepared_rows: list[dict[str, Any]],
-    force_think: bool,
+    force_discrete_think_prompt: bool,
 ) -> list[dict[str, Any]]:
     sleep_enabled = bool(getattr(rollout_engine, "opsd_enable_sleep_mode", False))
     if sleep_enabled and hasattr(rollout_engine, "wake_up"):
         torch.cuda.empty_cache()
         rollout_engine.wake_up()
 
-    previous_vllm_force_think = os.environ.get("VLLM_FORCE_THINK")
-    os.environ["VLLM_FORCE_THINK"] = "1" if force_think else "0"
-    try:
-        inputs = [_prepare_messages_for_vllm(row["teacher_messages"], rollout_processor) for row in prepared_rows]
-    finally:
-        if previous_vllm_force_think is None:
-            os.environ.pop("VLLM_FORCE_THINK", None)
-        else:
-            os.environ["VLLM_FORCE_THINK"] = previous_vllm_force_think
+    expected_force = should_force_think_prompt(default="0")
+    if bool(force_discrete_think_prompt) != bool(expected_force):
+        raise RuntimeError(
+            f"Teacher prompt forcing mismatch: force_discrete_think_prompt={force_discrete_think_prompt} but "
+            f"VLLM_THINKING={os.environ.get('VLLM_THINKING', '')!r} implies force_discrete_think_prompt={expected_force}."
+        )
+    inputs = [_prepare_messages_for_vllm(row["teacher_messages"], rollout_processor) for row in prepared_rows]
 
     outputs = rollout_engine.generate(inputs, sampling_params=sampling_params, use_tqdm=False)
     if sleep_enabled and hasattr(rollout_engine, "sleep"):
@@ -775,7 +768,7 @@ def _run_dry_run(config: dict[str, Any], dry_run_batches: int) -> None:
             sampling_params=sampling_params,
             rollout_processor=rollout_processor,
             prepared_rows=prepared_rows,
-            force_think=_teacher_force_think(config),
+            force_discrete_think_prompt=_teacher_force_discrete_think_prompt(config),
         )
         training_batch, valid_specs = _prepare_student_training_batch(
             config=config,
@@ -917,7 +910,7 @@ def _run_training(config: dict[str, Any]) -> None:
                     sampling_params=rollout_sampling_params,
                     rollout_processor=rollout_processor,
                     prepared_rows=prepared_rows,
-                    force_think=_teacher_force_think(config),
+                    force_discrete_think_prompt=_teacher_force_discrete_think_prompt(config),
                 )
                 stage_seconds["rollout"] += time.perf_counter() - stage_start
 

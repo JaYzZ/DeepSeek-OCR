@@ -1,0 +1,131 @@
+data:
+  train_files: ${oc.env:TRAIN_FILE,Qwen/data/opsd_manifest/r1ov_deepvision_opsd.jsonl}
+  val_files: ${oc.env:VAL_FILE,Qwen/data/opsd_manifest/r1ov_deepvision_opsd.jsonl}
+  custom_cls:
+    path: ${oc.env:ROOT_DIR}/sources/DeepSeek-OCR/Qwen/verl/opsd_rl_dataset.py
+    name: OPSDRLDataset
+  opsd:
+    system_prompt: ${oc.env:OPSD_SYSTEM_PROMPT,""}
+    student_template: ${oc.env:OPSD_STUDENT_TEMPLATE,"Answer the question.\n\nQuestion:\n{question_text}"}
+    teacher_template: ${oc.env:OPSD_TEACHER_TEMPLATE,"Problem:\n{question_text}\n\nHere is a reference solution to this problem:\n=== Reference Solution Begin ===\n{reference_solution}\n=== Reference Solution End ===\n\nAfter reading the reference solution above, make sure you truly understand the reasoning behind each step. Do not copy or paraphrase it. Now, using your own words and independent reasoning, derive the same final answer to the problem above."}
+    teacher_max_prompt_length: ${oc.decode:${oc.env:OPSD_TEACHER_MAX_PROMPT_LENGTH,4096}}
+    image_min_pixels: ${oc.decode:${oc.env:OPSD_IMAGE_MIN_PIXELS,1024}}
+    image_max_pixels: ${oc.decode:${oc.env:OPSD_IMAGE_MAX_PIXELS,262144}}
+  gen_batch_size: ${oc.decode:${oc.env:GEN_BATCH_SIZE,4}}
+  train_batch_size: ${oc.decode:${oc.env:TRAIN_BATCH_SIZE,4}}
+  val_batch_size: ${oc.decode:${oc.env:VAL_BATCH_SIZE,4}}
+  max_prompt_length: ${oc.decode:${oc.env:MAX_PROMPT_LENGTH,8192}}
+  max_response_length: ${oc.decode:${oc.env:MAX_RESPONSE_LENGTH,8192}}
+  dataloader_num_workers: ${oc.decode:${oc.env:DATALOADER_NUM_WORKERS,0}}
+  filter_overlong_prompts_workers: ${oc.decode:${oc.env:FILTER_OVERLONG_PROMPTS_WORKERS,1}}
+  filter_overlong_prompts: ${oc.decode:${oc.env:FILTER_OVERLONG_PROMPTS,false}}
+  truncation: error
+  return_multi_modal_inputs: true
+  image_key: images
+
+actor_rollout_ref:
+  model:
+    path: ${oc.env:MODEL_PATH}
+    trust_remote_code: true
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+    lora_rank: ${oc.decode:${oc.env:LORA_RANK,8}}
+    lora_alpha: ${oc.decode:${oc.env:LORA_ALPHA,16}}
+    target_modules: all-linear
+    exclude_modules: .*visual.*
+
+  actor:
+    freeze_vision_tower: true
+    optim:
+      lr: ${oc.decode:${oc.env:LR,1e-6}}
+    use_dynamic_bsz: ${oc.decode:${oc.env:USE_DYNAMIC_BSZ,true}}
+    ppo_mini_batch_size: ${oc.decode:${oc.env:PPO_MINI_BATCH_SIZE,4}}
+    ppo_micro_batch_size_per_gpu: ${oc.decode:${oc.env:ACTOR_MICRO_BATCH_SIZE,1}}
+    ppo_max_token_len_per_gpu: ${oc.decode:${oc.env:ACTOR_PPO_MAX_TOKEN_LEN,20480}}
+    use_kl_loss: ${oc.decode:${oc.env:USE_KL_LOSS,true}}
+    kl_loss_coef: ${oc.decode:${oc.env:KL_COEF,0.001}}
+    kl_loss_type: low_var_kl
+    entropy_coeff: ${oc.decode:${oc.env:ENTROPY_COEFF,0.0}}
+    entropy_checkpointing: ${oc.decode:${oc.env:ENTROPY_CHECKPOINTING,false}}
+    clip_ratio_low: ${oc.decode:${oc.env:CLIP_RATIO_LOW,0.0003}}
+    clip_ratio_high: ${oc.decode:${oc.env:CLIP_RATIO_HIGH,0.0004}}
+    policy_loss:
+      loss_mode: gspo
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: false
+
+  ref:
+    log_prob_use_dynamic_bsz: ${oc.decode:${oc.env:USE_DYNAMIC_BSZ,true}}
+    log_prob_micro_batch_size_per_gpu: ${oc.decode:${oc.env:REF_LOGPROB_MB,1}}
+    log_prob_max_token_len_per_gpu: ${oc.decode:${oc.env:INFER_PPO_MAX_TOKEN_LEN,20480}}
+    fsdp_config:
+      param_offload: true
+    ulysses_sequence_parallel_size: ${oc.decode:${oc.env:SP_SIZE,1}}
+
+  rollout:
+    name: vllm
+    mode: async
+    tensor_model_parallel_size: ${oc.decode:${oc.env:ROLLOUT_TP_SIZE,1}}
+    n: ${oc.decode:${oc.env:ROLLOUT_N,1}}
+    temperature: ${oc.decode:${oc.env:TEMPERATURE,1.0}}
+    top_p: ${oc.decode:${oc.env:TOP_P,1}}
+    top_k: ${oc.decode:${oc.env:TOP_K,20}}
+    gpu_memory_utilization: ${oc.decode:${oc.env:GPU_MEMORY_UTILIZATION,0.55}}
+    log_prob_use_dynamic_bsz: ${oc.decode:${oc.env:USE_DYNAMIC_BSZ,true}}
+    log_prob_micro_batch_size_per_gpu: ${oc.decode:${oc.env:ROLLOUT_LOGPROB_MB,1}}
+    log_prob_max_token_len_per_gpu: ${oc.decode:${oc.env:INFER_PPO_MAX_TOKEN_LEN,20480}}
+    max_num_batched_tokens: ${oc.decode:${oc.env:ROLLOUT_MAX_BATCHED_TOKENS,20480}}
+    max_model_len: ${oc.decode:${oc.env:ROLLOUT_MAX_MODEL_LEN,20480}}
+    enable_chunked_prefill: true
+    enforce_eager: ${oc.decode:${oc.env:ROLLOUT_ENFORCE_EAGER,false}}
+    free_cache_engine: true
+    calculate_log_probs: true
+    engine_kwargs:
+      vllm:
+        disable_mm_preprocessor_cache: ${oc.decode:${oc.env:ROLLOUT_DISABLE_MM_PREPROCESSOR_CACHE,false}}
+    agent:
+      num_workers: ${oc.decode:${oc.env:AGENT_NUM_WORKERS,1}}
+
+reward:
+  num_workers: ${oc.decode:${oc.env:REWARD_NUM_WORKERS,1}}
+  custom_reward_function:
+    path: ${oc.env:ROOT_DIR}/sources/DeepSeek-OCR/Qwen/verl/deepvision_gspo_reward.py
+    name: compute_score
+  reward_manager:
+    source: register
+    name: dapo
+  reward_kwargs:
+    overlong_buffer_cfg:
+      enable: ${oc.decode:${oc.env:ENABLE_OVERLONG_BUFFER,false}}
+      len: ${oc.decode:${oc.env:OVERLONG_BUFFER_LEN,2000}}
+      penalty_factor: ${oc.decode:${oc.env:OVERLONG_PENALTY_FACTOR,0.1}}
+      log: ${oc.decode:${oc.env:OVERLONG_LOG,false}}
+    max_resp_len: ${oc.decode:${oc.env:MAX_RESPONSE_LENGTH,8192}}
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  rollout_correction:
+    bypass_mode: true
+
+trainer:
+  critic_warmup: 0
+  logger: ["console"]
+  val_before_train: false
+  project_name: ${oc.env:PROJECT_NAME,qwen3vl-opsd}
+  experiment_name: ${oc.env:EXPERIMENT_NAME,single_node}
+  default_local_dir: ${oc.env:OUTPUT_DIR}
+  n_gpus_per_node: ${oc.decode:${oc.env:GPUS_PER_NODE,1}}
+  nnodes: ${oc.decode:${oc.env:NNODES,1}}
+  resume_mode: ${oc.env:RESUME_MODE,disable}
+  max_actor_ckpt_to_keep: ${oc.decode:${oc.env:MAX_ACTOR_CKPT_TO_KEEP,2}}
+  max_critic_ckpt_to_keep: ${oc.decode:${oc.env:MAX_CRITIC_CKPT_TO_KEEP,2}}
+  save_freq: ${oc.decode:${oc.env:SAVE_FREQ,10}}
+  test_freq: ${oc.decode:${oc.env:TEST_FREQ,-1}}
+  total_epochs: ${oc.decode:${oc.env:TOTAL_EPOCHS,1}}
+
+ray_kwargs:
+  ray_init:
+    num_cpus: ${oc.decode:${oc.env:RAY_NUM_CPUS,8}}
+    include_dashboard: false

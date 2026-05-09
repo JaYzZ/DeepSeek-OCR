@@ -30,16 +30,17 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
-from tqdm import tqdm
-from PIL import Image
-from transformers import AutoProcessor
-import pandas as pd
-from project_paths import hf_path
 
 _EVAL_DIR = Path(__file__).parent
 _REPO_ROOT = _EVAL_DIR.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+from tqdm import tqdm
+from PIL import Image
+from transformers import AutoProcessor
+import pandas as pd
+from project_paths import hf_path
 
 from Qwen.evaluation.config import QWEN3_VL_2B_THINKING, get_data_path
 from Qwen.evaluation.utils import select_compatible_tensor_parallel_gpus
@@ -54,6 +55,18 @@ LOCAL_JUDGE_DEFAULT_MODEL = str(hf_path("Qwen", "Qwen2.5-VL-7B-Instruct"))
 EXPLORE_TEMPERATURE = 0.7
 EXPLORE_MAX_TOKENS = 8192
 EXPLORE_N = 8
+
+
+def _ensure_local_no_proxy() -> None:
+    """Keep local benchmark server traffic off HTTP proxy settings."""
+    local_hosts = ["127.0.0.1", "localhost", "0.0.0.0"]
+    for key in ("NO_PROXY", "no_proxy"):
+        existing = [item.strip() for item in os.environ.get(key, "").split(",") if item.strip()]
+        merged = existing + [host for host in local_hosts if host not in existing]
+        os.environ[key] = ",".join(merged)
+
+
+_ensure_local_no_proxy()
 
 
 def _sanitize_json_value(value):
@@ -438,6 +451,7 @@ def run_unified_inference(
     """
     adapter_meta = resolve_lora_artifacts(model_path, lora_path)
     resolved_model_path = adapter_meta["model_path"] or model_path
+    resolved_lora_path = adapter_meta["lora_path"]
     resolved_lora_rank = adapter_meta["lora_rank"] if adapter_meta["lora_rank"] is not None else 64
     script_path = Path(__file__).parent / "run_all_inference.py"
 
@@ -454,24 +468,24 @@ def run_unified_inference(
     ]
 
     # Add LoRA argument if provided
-    if lora_path:
-        cmd.extend(["--lora-path", lora_path])
+    if resolved_lora_path:
+        cmd.extend(["--lora-path", resolved_lora_path])
 
     # Set GPU environment
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
 
     # Set LoRA checkpoint path for VAE loading
-    if lora_path:
-        env["VLLM_LORA_CHECKPOINT_PATH"] = lora_path
+    if resolved_lora_path:
+        env["VLLM_LORA_CHECKPOINT_PATH"] = resolved_lora_path
 
     # Log detailed information
     if logger:
         logger.log_section("RUNNING UNIFIED INFERENCE")
         logger.log(f"Requested model: {model_path}")
         logger.log(f"Resolved model: {resolved_model_path}")
-        logger.log(f"LoRA: {lora_path if lora_path else 'Disabled'}")
-        if lora_path:
+        logger.log(f"LoRA: {resolved_lora_path if resolved_lora_path else 'Disabled'}")
+        if resolved_lora_path:
             logger.log(f"Resolved LoRA rank: {resolved_lora_rank}")
         logger.log(f"Benchmarks: {', '.join(benchmarks)}")
         logger.log(f"Num samples: {num_samples}")
@@ -488,8 +502,8 @@ def run_unified_inference(
     print(f"Running HYBRID inference for {len(benchmarks)} benchmarks")
     print(f"Auto-detects model type: vLLM (official) or HF Transformers (Linear variant)")
     print(f"Model: {resolved_model_path}")
-    print(f"LoRA: {lora_path if lora_path else 'Disabled'}")
-    if lora_path:
+    print(f"LoRA: {resolved_lora_path if resolved_lora_path else 'Disabled'}")
+    if resolved_lora_path:
         print(f"LoRA rank: {resolved_lora_rank}")
     print(f"{'='*80}")
     print(f"Command: {' '.join(cmd)}")
@@ -1968,6 +1982,7 @@ def start_vllm_server(
     lora_path: str,
     gpus: List[int],
     gpu_memory_utilization: float,
+    max_model_len: int,
     port: int = 8016,  # default port, will auto-find if taken
     logger: "BenchmarkLogger" = None
 ) -> str:
@@ -1992,7 +2007,8 @@ def start_vllm_server(
     port = find_available_port(port)
     print(f"Using port: {port}")
 
-    server_url = f"http://localhost:{port}"
+    server_host = "127.0.0.1"
+    server_url = f"http://{server_host}:{port}"
     server_gpus, tensor_parallel_size = select_compatible_tensor_parallel_gpus(
         model_path,
         gpus,
@@ -2011,6 +2027,7 @@ def start_vllm_server(
         logger.log(f"GPUs: {server_gpus}")
         logger.log(f"Tensor parallel: {tensor_parallel_size}")
         logger.log(f"GPU memory util: {gpu_memory_utilization}")
+        logger.log(f"Max model len: {max_model_len}")
         logger.log(f"Port: {port}")
 
     print(f"\n{'='*80}")
@@ -2023,6 +2040,7 @@ def start_vllm_server(
     print(f"GPUs: {server_gpus}")
     print(f"Tensor parallel: {tensor_parallel_size}")
     print(f"GPU memory util: {gpu_memory_utilization}")
+    print(f"Max model len: {max_model_len}")
     print(f"Port: {port}")
     print(f"{'='*80}\n")
 
@@ -2040,8 +2058,10 @@ def start_vllm_server(
         str(script_path),
         "--model-path", resolved_model_path,
         "--port", str(port),
+        "--host", server_host,
         "--tensor-parallel-size", str(tensor_parallel_size),
         "--gpu-memory-utilization", str(gpu_memory_utilization),
+        "--max-model-len", str(max_model_len),
     ]
 
     if lora_path:
@@ -2288,8 +2308,8 @@ Examples:
     parser.add_argument(
         "--benchmarks",
         type=str,
-        default="MathVision,MMMU,RealWorldQA",
-        help="Comma-separated list of benchmarks to run (default: MathVision,MMMU,RealWorldQA)"
+        default="MathVision,MMMU,RealWorldQA,M3CoT",
+        help="Comma-separated list of benchmarks to run (default: MathVision,MMMU,RealWorldQA,M3CoT)"
     )
 
     # LoRA arguments
@@ -2370,6 +2390,12 @@ Examples:
         type=int,
         default=None,
         help="Override max tokens for server-mode inference"
+    )
+    parser.add_argument(
+        "--server-max-model-len",
+        type=int,
+        default=int(os.environ.get("QWEN3VL_BENCHMARK_MAX_MODEL_LEN", "12288")),
+        help="Max model len for benchmark vLLM server (default: 12288)"
     )
     parser.add_argument(
         "--explore",
@@ -2503,6 +2529,7 @@ Examples:
                         lora_path=args.lora_path,
                         gpus=gpus,
                         gpu_memory_utilization=0.85,
+                        max_model_len=int(args.server_max_model_len),
                         port=args.port,
                         logger=logger
                     )

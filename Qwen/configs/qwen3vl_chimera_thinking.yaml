@@ -71,6 +71,12 @@ gradient_checkpointing: false
 dataloader_pin_memory: true
 dataloader_persistent_workers: true
 
+### generation
+generation:
+  max_new_tokens: 8192
+  min_continuous_steps: 0
+  max_continuous_steps: null
+
 # FSDP configuration for LoRA + latent-VAE training.
 fsdp:
   - full_shard

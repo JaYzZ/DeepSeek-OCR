@@ -29,23 +29,20 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from tokenizers import AddedToken
-
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO_ROOT))
 
 from Qwen.inference.vllm_utils import (
     apply_runtime_env_for_thinking,
+    append_forced_think_prompt,
     infer_tensor_parallel_size,
     normalize_media_path,
     normalize_checkpoint_name,
     parse_cuda_visible_devices,
+    prepare_inference_tokenizer,
     resolve_lora_artifacts,
+    vllm_thinking_enabled,
 )
-
-
-def _env_flag_enabled(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
 # Set vLLM multiprocessing method BEFORE importing vLLM
@@ -53,22 +50,20 @@ os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 
 # Load runtime env before enabling plugins so YAML can control VLLM_THINKING.
 apply_runtime_env_for_thinking(repo_root=_REPO_ROOT)
-THINKING_MODE_ENABLED = _env_flag_enabled("VLLM_THINKING") or _env_flag_enabled("VLLM_FORCE_THINK")
-if THINKING_MODE_ENABLED:
-    existing_plugins = [p.strip() for p in os.environ.get("VLLM_PLUGINS", "").split(",") if p.strip()]
-    if "vllm_thinking" not in existing_plugins:
-        existing_plugins.append("vllm_thinking")
-    os.environ["VLLM_PLUGINS"] = ",".join(existing_plugins)
+THINKING_MODE_ENABLED = vllm_thinking_enabled(default="0")
+existing_plugins = [p.strip() for p in os.environ.get("VLLM_PLUGINS", "").split(",") if p.strip()]
+if "vllm_thinking" not in existing_plugins:
+    existing_plugins.append("vllm_thinking")
+os.environ["VLLM_PLUGINS"] = ",".join(existing_plugins)
 
-    # Import thinking mode plugin BEFORE vLLM to apply patches.
-    from vllm_thinking.runner_patch import apply_thinking_mode_patch
-else:
-    apply_thinking_mode_patch = None
+# Import decode patch BEFORE vLLM to support both continuous AR and discrete
+# latent carry.
+from vllm_thinking.runner_patch import apply_thinking_mode_patch
 
 from vllm import LLM, SamplingParams
 from vllm.multimodal.hasher import MultiModalHasher
 from vllm.v1.engine import LoRARequest
-from transformers import AutoProcessor
+from transformers import AutoProcessor, AutoTokenizer
 
 HAS_LORA_REQUEST = True
 
@@ -307,8 +302,7 @@ def prepare_inputs_for_vllm(messages, processor):
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     # Manually add generation prompt as per repo's common practice
     text = text + "<|im_start|>assistant\n"
-    if _env_flag_enabled("VLLM_FORCE_THINK"):
-        text = text + "<think>"
+    text = append_forced_think_prompt(text, default="0")
 
     # Extract media from messages and, if provided, preserve benchmark-specific
     # min/max pixel constraints (MathVision/RealWorldQA/etc).
@@ -364,47 +358,31 @@ def prepare_inputs_for_vllm(messages, processor):
         return text
 
 
-def resolve_model_path(model_path: str, lora_path: str | None) -> str:
-    """Mirror backfill behavior: prefer adapter-declared base model for LoRA checkpoints."""
-    if not lora_path:
-        return model_path
-
-    adapter_config_path = Path(lora_path) / "adapter_config.json"
-    if not adapter_config_path.exists():
-        return model_path
-
-    try:
-        with open(adapter_config_path, "r", encoding="utf-8") as f:
-            adapter_config = json.load(f)
-        resolved = adapter_config.get("base_model_name_or_path") or model_path
-        print(f"Detected LoRA adapter. Using base model: {resolved}")
-        return resolved
-    except Exception as exc:
-        print(f"Warning: failed to read {adapter_config_path}: {exc}")
-        return model_path
-
-
 def load_model(
     model_path: str,
     tensor_parallel_size: int = 1,
     gpu_memory_utilization: float = 0.9,
+    max_model_len: int = 12288,
     lora_path: str = None,
     lora_name: str = "default",
 ):
     """Load vLLM model."""
     global llm, processor, lora_request, config
     adapter_meta = resolve_lora_artifacts(model_path, lora_path)
-    resolved_model_path = adapter_meta["model_path"] or resolve_model_path(model_path, lora_path)
+    resolved_model_path = adapter_meta["model_path"] or model_path
+    resolved_lora_path = adapter_meta["lora_path"]
+    resolved_tokenizer_path = os.environ.get("VLLM_TOKENIZER_PATH", "").strip() or resolved_model_path
     resolved_lora_rank = adapter_meta["lora_rank"] if adapter_meta["lora_rank"] is not None else 64
 
     print(f"\n{'='*80}")
     print(f"Loading vLLM model...")
     print(f"{'='*80}")
     print(f"Model: {resolved_model_path}")
+    print(f"Tokenizer: {resolved_tokenizer_path}")
     print(f"Tensor parallel: {tensor_parallel_size}")
     print(f"GPU memory: {gpu_memory_utilization}")
-    if lora_path:
-        print(f"LoRA: {lora_path}")
+    if resolved_lora_path:
+        print(f"LoRA: {resolved_lora_path}")
         print(f"LoRA rank: {resolved_lora_rank}")
     print(f"{'='*80}\n")
 
@@ -413,48 +391,10 @@ def load_model(
     # ============================================================================
     # CRITICAL: Add special tokens for latent thinking BEFORE loading vLLM
     # ============================================================================
-    from transformers import AutoTokenizer
-
-    # Load tokenizer and add special tokens
-    tokenizer_with_special_tokens = AutoTokenizer.from_pretrained(
-        resolved_model_path, trust_remote_code=True
-    )
-
-    # Ensure <latent>/<think_sep> are single tokens for inference.
-    # Use regular added tokens (not "special") so they are generated/displayed
-    # like <think> and </think>.
-    special_tokens = ["<latent>", "<think_sep>"]
-    added_count = 0
-    for token in special_tokens:
-        encoded = tokenizer_with_special_tokens.encode(token, add_special_tokens=False)
-        if len(encoded) > 1:
-            num_added = tokenizer_with_special_tokens.add_tokens([token], special_tokens=False)
-            added_count += num_added
-
-    # If checkpoint tokenizer marks these as special, demote them at runtime.
-    # vLLM generation then treats them like regular tokens.
-    for token in special_tokens:
-        token_id = tokenizer_with_special_tokens.convert_tokens_to_ids(token)
-        added = tokenizer_with_special_tokens.added_tokens_decoder.get(token_id)
-        if added is not None and getattr(added, "special", False):
-            tokenizer_with_special_tokens._tokenizer.add_tokens([AddedToken(token, special=False)])
-            print(f"Demoted special token to regular token at runtime: {token} (ID {token_id})")
-
-    if added_count > 0:
-        print(f"Added {added_count} regular thinking tokens to tokenizer")
-
-    # Always export unified token IDs used by both training and vLLM plugin.
-    for token in special_tokens:
-        token_id = tokenizer_with_special_tokens.convert_tokens_to_ids(token)
-        print(f"  {token} -> ID {token_id}")
-        if token == "<latent>":
-            os.environ["QWEN3VL_LATENT_TOKEN_ID"] = str(token_id)
-        elif token == "<think_sep>":
-            os.environ["QWEN3VL_THINKING_SEP_ID"] = str(token_id)
+    prepare_inference_tokenizer(resolved_tokenizer_path)
 
     # Apply thinking mode patch only when explicitly enabled.
-    if THINKING_MODE_ENABLED and apply_thinking_mode_patch is not None:
-        apply_thinking_mode_patch()
+    apply_thinking_mode_patch()
 
     # Load processor
     processor = AutoProcessor.from_pretrained(
@@ -468,14 +408,14 @@ def load_model(
         "tensor_parallel_size": tensor_parallel_size,
         "gpu_memory_utilization": gpu_memory_utilization,
         "trust_remote_code": True,
-        "max_model_len": 128000,
+        "max_model_len": int(max_model_len),
         "limit_mm_per_prompt": {"image": 10},
         "enforce_eager": os.environ.get("VLLM_ENFORCE_EAGER", "0") == "1",
         "disable_custom_all_reduce": True, # Key to the distributed inference with mode change
     }
 
     # Add LoRA config if path provided
-    if lora_path:
+    if resolved_lora_path:
         llm_kwargs["enable_lora"] = True
         llm_kwargs["max_lora_rank"] = resolved_lora_rank
         llm_kwargs["max_loras"] = 1
@@ -485,14 +425,14 @@ def load_model(
 
     # Create LoRA request
     effective_lora_name = lora_name
-    if lora_path and lora_name == "default":
-        effective_lora_name = normalize_checkpoint_name(lora_path)
+    if resolved_lora_path and lora_name == "default":
+        effective_lora_name = normalize_checkpoint_name(resolved_lora_path)
 
-    if HAS_LORA_REQUEST and lora_path:
+    if HAS_LORA_REQUEST and resolved_lora_path:
         lora_request = LoRARequest(
             lora_name=effective_lora_name,
             lora_int_id=1,
-            lora_path=lora_path,
+            lora_path=resolved_lora_path,
         )
 
     load_time = time.time() - start_time
@@ -502,7 +442,7 @@ def load_model(
     config = {
         "model_path": resolved_model_path,
         "requested_model_path": model_path,
-        "lora_path": lora_path,
+        "lora_path": resolved_lora_path,
         "resolved_lora_rank": resolved_lora_rank,
         "tensor_parallel_size": tensor_parallel_size,
         "gpu_memory_utilization": gpu_memory_utilization,
@@ -522,6 +462,7 @@ def main():
         help="Tensor parallel size. Use 0 to auto-infer from CUDA_VISIBLE_DEVICES.",
     )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="GPU memory utilization")
+    parser.add_argument("--max-model-len", type=int, default=12288, help="Max model length for vLLM")
     parser.add_argument("--lora-path", type=str, default=None, help="LoRA adapter path")
     parser.add_argument("--lora-name", type=str, default="default", help="LoRA adapter name")
     args = parser.parse_args()
@@ -582,6 +523,7 @@ def main():
         model_path=args.model_path,
         tensor_parallel_size=resolved_tp,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        max_model_len=args.max_model_len,
         lora_path=args.lora_path,
         lora_name=args.lora_name,
     )

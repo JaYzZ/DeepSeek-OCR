@@ -15,6 +15,8 @@ For each row, the builder emits a compact manifest for OPSD training:
 - `student_user_text`
 - `assistant_target`
 - `answer_text`
+- `teacher_solution_text`
+- `teacher_assistant_target`
 - `latent_ground_truth`
 - `latent_supervision`
 - `latent_seq_lens`
@@ -28,6 +30,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
+from Qwen.data.utils import extract_thinking_and_answer
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = REPO_ROOT / "Qwen" / "data"
@@ -84,6 +87,41 @@ def _split_answer(text: str) -> str:
     return text[idx + len(marker):].strip()
 
 
+def _teacher_thinking_text(row: dict[str, Any]) -> str:
+    cot = str(row.get("cot") or "").strip()
+    if cot:
+        thinking, _ = extract_thinking_and_answer(cot, max_chars=None, return_chunks=False)
+        if thinking:
+            return thinking.strip()
+        return cot.replace("<think>", "").replace("</think>", "").strip()
+
+    assistant = _assistant_text(row)
+    thinking, _ = extract_thinking_and_answer(assistant, max_chars=None, return_chunks=False)
+    return thinking.strip()
+
+
+def _format_teacher_solution_text(row: dict[str, Any]) -> str:
+    thinking = _teacher_thinking_text(row)
+    answer = _split_answer(_assistant_text(row))
+    parts: list[str] = []
+    if thinking:
+        parts.append(thinking)
+    if answer:
+        if "\n" in answer or answer.startswith(("The correct answer", "Answer:", "(")):
+            parts.append(f"Final answer:\n{answer}")
+        else:
+            parts.append(f"Final answer: {answer}")
+    return "\n\n".join(part for part in parts if part).strip()
+
+
+def _format_teacher_assistant_target(row: dict[str, Any]) -> str:
+    thinking = _teacher_thinking_text(row)
+    answer = _split_answer(_assistant_text(row))
+    if thinking:
+        return f"<think>{thinking}</think>{answer}".strip()
+    return _assistant_text(row).strip()
+
+
 def _strip_leading_image_placeholder(text: str) -> str:
     stripped = text.strip()
     if stripped.startswith("<image>"):
@@ -124,6 +162,8 @@ def _build_row(source_dataset: str, row_idx: int, row: dict[str, Any]) -> dict[s
         "student_user_text": _strip_leading_image_placeholder(_user_text(row)),
         "assistant_target": _assistant_text(row),
         "answer_text": _split_answer(_assistant_text(row)),
+        "teacher_solution_text": _format_teacher_solution_text(row),
+        "teacher_assistant_target": _format_teacher_assistant_target(row),
         "latent_ground_truth": rationale_latents,
         "latent_supervision": list(row.get("latent_supervision") or []),
         "latent_seq_lens": list(row.get("latent_seq_lens") or []),

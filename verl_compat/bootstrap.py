@@ -15,6 +15,9 @@ from pathlib import Path
 import torch.distributed as dist
 from omegaconf import open_dict
 from safetensors.torch import save_file
+from verl.utils.debug import log_gpu_memory_usage
+from verl.utils.fsdp_utils import load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
+from verl.utils.memory_utils import aggressive_empty_cache
 
 from Qwen.compat.flash_attn import apply_flash_attn_varlen_compat_patch
 from .continuous_replay import _restore_policy_latent_vae, apply_continuous_replay_patches
@@ -38,6 +41,7 @@ def patch_worker_env_vars(existing_env_vars: dict | None) -> dict:
     env_vars = dict(existing_env_vars or {})
     env_vars["PYTHONPATH"] = build_repo_pythonpath(env_vars.get("PYTHONPATH", os.environ.get("PYTHONPATH", "")))
     env_vars["QWEN3VL_APPLY_VERL_PATCHES"] = "1"
+    env_vars["QWEN3VL_DEFER_VERL_PATCHES"] = "1"
 
     # For CUDA workers, always let Ray manage CUDA_VISIBLE_DEVICES for the
     # actor-specific subset. Forwarding the outer subset or enabling Ray's
@@ -58,6 +62,17 @@ def patch_worker_env_vars(existing_env_vars: dict | None) -> dict:
         "QWEN3VL_LATENT_SUPERVISION",
         "QWEN3VL_LOSS_TYPE",
         "QWEN3VL_VAE_INTERMEDIATE_SIZE",
+        "QWEN3VL_VAE_TRAINABLE",
+        "OPSD_ENABLED",
+        "OPSD_WEIGHT",
+        "OPSD_TEMPERATURE",
+        "OPSD_LOGPROB_CHUNK_SIZE",
+        "OPSD_OT_REPLAY",
+        "OPSD_OT_WEIGHT",
+        "OPSD_TEACHER_MODEL_PATH",
+        "OPSD_TEACHER_ADAPTER_PATH",
+        "OPSD_OFFLOAD_TEACHER_MODEL",
+        "OPSD_OFF_POLICY_MODE",
     ):
         passthrough_value = os.environ.get(passthrough_name)
         if passthrough_value:
@@ -347,6 +362,32 @@ def _patch_fsdp_update_actor_metadata() -> None:
     if getattr(original_update_actor, "_qwen3vl_compat_patch", False):
         return
 
+    def _sync_actor_lr_scheduler_param_groups(worker) -> None:
+        scheduler = getattr(worker, "actor_lr_scheduler", None)
+        optimizer = getattr(worker, "actor_optimizer", None)
+        if scheduler is None or optimizer is None:
+            return
+
+        optimizer_group_count = len(optimizer.param_groups)
+        scheduler_group_count = len(getattr(scheduler, "base_lrs", []))
+        if optimizer_group_count <= scheduler_group_count:
+            return
+
+        added_groups = optimizer.param_groups[scheduler_group_count:]
+        if hasattr(scheduler, "base_lrs"):
+            scheduler.base_lrs.extend(group["lr"] for group in added_groups)
+        if hasattr(scheduler, "_last_lr"):
+            scheduler._last_lr.extend(group["lr"] for group in added_groups)
+        lr_lambdas = getattr(scheduler, "lr_lambdas", None)
+        if isinstance(lr_lambdas, list) and lr_lambdas:
+            lr_lambdas.extend([lr_lambdas[-1]] * (optimizer_group_count - scheduler_group_count))
+
+        logger.warning(
+            "Extended actor LR scheduler param groups from %s to %s after latent VAE optimizer injection",
+            scheduler_group_count,
+            optimizer_group_count,
+        )
+
     def compat_update_actor(self, data):
         meta_info = getattr(data, "meta_info", None)
         if meta_info is not None and "temperature" not in meta_info:
@@ -356,12 +397,56 @@ def _patch_fsdp_update_actor_metadata() -> None:
                 "Injected missing actor update temperature metadata from rollout config: temperature=%s",
                 rollout_temperature,
             )
+        _sync_actor_lr_scheduler_param_groups(self)
         return original_update_actor(self, data)
 
     compat_update_actor = functools.wraps(original_update_actor)(compat_update_actor)
     compat_update_actor.__dict__.update(original_update_actor.__dict__)
     compat_update_actor._qwen3vl_compat_patch = True
     worker_cls.update_actor = compat_update_actor
+
+
+def _patch_rollout_mode_weight_sync() -> None:
+    """Allow rollout weight synchronization to be disabled explicitly."""
+
+    external_workers = importlib.import_module("verl.workers.fsdp_workers")
+    worker_cls = external_workers.ActorRolloutRefWorker
+    original_rollout_mode = worker_cls.rollout_mode
+
+    if getattr(original_rollout_mode, "_qwen3vl_compat_patch", False):
+        return
+
+    async def compat_rollout_mode(self):
+        off_policy_enabled = str(os.environ.get("OPSD_OFF_POLICY_MODE", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not off_policy_enabled:
+            return await original_rollout_mode(self)
+
+        aggressive_empty_cache(force_sync=True)
+
+        log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
+
+        log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
+
+        if self.config.rollout.free_cache_engine:
+            await self.rollout.resume(tags=["weights"])
+            await self.rollout.resume(tags=["kv_cache"])
+        logger.warning("Skipped rollout weight synchronization because OPSD_OFF_POLICY_MODE=true")
+
+    compat_rollout_mode = functools.wraps(original_rollout_mode)(compat_rollout_mode)
+    compat_rollout_mode.__dict__.update(original_rollout_mode.__dict__)
+    compat_rollout_mode._qwen3vl_compat_patch = True
+    worker_cls.rollout_mode = compat_rollout_mode
 
 
 def _patch_rollout_correction_helper() -> None:
@@ -459,6 +544,7 @@ def apply_runtime_compat_patches() -> None:
     _patch_ray_visible_devices_flag_parser()
     _patch_fsdp_checkpoint_manager()
     _patch_fsdp_update_actor_metadata()
+    _patch_rollout_mode_weight_sync()
     _patch_rollout_correction_helper()
     _patch_rlhf_dataset_message_builder()
 

@@ -44,7 +44,6 @@ prompts:
 teacher:
   rollout_source: shared_student
   vllm_thinking: false
-  vllm_force_think: true
   max_new_tokens: 32768
   temperature: 0.0
   top_p: 1.0
@@ -78,6 +77,8 @@ student_loss:
 
 generation:
   max_new_tokens: 32768
+  min_continuous_steps: 0
+  max_continuous_steps: null
   do_sample: true
   temperature: 1.0
   top_p: 1.0

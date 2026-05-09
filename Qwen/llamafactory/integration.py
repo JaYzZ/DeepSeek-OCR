@@ -2933,7 +2933,7 @@ def _generate_with_dynamic_thinking_mode(
     kv_cache = None
     tokens_used = 0
     latent_step_id = int(os.environ.get("QWEN3VL_LATENT_TOKEN_ID", "151669"))
-    max_thinking_steps = int(os.environ.get("QWEN3VL_MAX_THINKING_STEPS", str(max_new_tokens // 2)))
+    max_thinking_steps = int(os.environ.get("MAX_CONTINUOUS_STEPS", str(max_new_tokens // 2)))
 
     # State: 'discrete' or 'continuous'
     state = 'discrete'

@@ -21,10 +21,18 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from Qwen.inference.vllm_utils import (
     apply_runtime_env_for_thinking,
+    append_forced_think_prompt,
+    build_opsd_span_student_prompt,
     infer_tensor_parallel_size,
     normalize_checkpoint_name,
+    opsd_span_prompt_enabled,
     parse_cuda_visible_devices,
+    prepare_inference_tokenizer,
+    resolve_lora_artifacts,
 )
+
+# Match the rest of the vLLM eval entrypoints and avoid CUDA re-init in forked workers.
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 # Load runtime env before enabling plugins so YAML/shell control VLLM_THINKING.
 apply_runtime_env_for_thinking(repo_root=_REPO_ROOT)
@@ -34,7 +42,6 @@ if "vllm_thinking" not in existing_plugins:
 os.environ["VLLM_PLUGINS"] = ",".join(existing_plugins)
 
 from PIL import Image, ImageFont, ImageDraw
-from tokenizers import AddedToken
 from transformers import AutoProcessor, AutoTokenizer
 
 from vllm import LLM, SamplingParams
@@ -42,9 +49,7 @@ from vllm.v1.engine import LoRARequest
 from vllm_thinking.runner_patch import apply_thinking_mode_patch
 from project_paths import hf_path, resolve_project_path
 
-
-if os.environ.get("VLLM_THINKING", "0").strip().lower() in {"1", "true", "yes", "on"}:
-    apply_thinking_mode_patch()
+apply_thinking_mode_patch()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -166,6 +171,34 @@ def _load_target_prob_trace(path: str) -> dict[str, list[dict]]:
     return traces
 
 
+def _resolve_target_trace_records(
+    traces: dict[str, list[dict]],
+    request_id: str,
+) -> list[dict]:
+    if not request_id:
+        return []
+    exact = traces.get(request_id)
+    if exact is not None:
+        return exact
+
+    prefix = f"{request_id}-"
+    matched_keys = sorted(key for key in traces if key.startswith(prefix))
+    if matched_keys:
+        return traces[matched_keys[0]]
+
+    short_request_id = request_id.split("-", 1)[0]
+    if short_request_id != request_id:
+        exact_short = traces.get(short_request_id)
+        if exact_short is not None:
+            return exact_short
+        short_prefix = f"{short_request_id}-"
+        matched_keys = sorted(key for key in traces if key.startswith(short_prefix))
+        if matched_keys:
+            return traces[matched_keys[0]]
+
+    return []
+
+
 def _load_target_prob_trace_records(path: str) -> list[dict]:
     records: list[dict] = []
     if not path or not os.path.exists(path):
@@ -185,21 +218,35 @@ def _load_target_prob_trace_records(path: str) -> list[dict]:
 def find_latest_checkpoint(checkpoint_dir: Path) -> Path:
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+    if (checkpoint_dir / "adapter_config.json").exists():
+        return checkpoint_dir
+
+    checkpoint_dirs = [d for d in checkpoint_dir.iterdir() if d.is_dir() and d.name.startswith('checkpoint-')]
+    if checkpoint_dirs:
+        return max(checkpoint_dirs, key=lambda d: int(d.name.split('-')[1]))
+
+    version_dirs = [d for d in checkpoint_dir.iterdir() if d.is_dir() and d.name.startswith("v")]
+    if version_dirs:
+        latest_version = max(version_dirs, key=lambda d: d.stat().st_mtime)
+        checkpoint_dirs = [d for d in latest_version.iterdir() if d.is_dir() and d.name.startswith('checkpoint-')]
+        if checkpoint_dirs:
+            return max(checkpoint_dirs, key=lambda d: int(d.name.split('-')[1]))
+
     run_dirs = [d for d in checkpoint_dir.iterdir() if d.is_dir() and d.name.startswith('run_')]
-    if not run_dirs:
-        raise FileNotFoundError(f"No run directories found in {checkpoint_dir}")
-    latest_run = max(run_dirs, key=lambda d: d.stat().st_mtime)
-    checkpoint_dirs = [d for d in latest_run.iterdir() if d.is_dir() and d.name.startswith('checkpoint-')]
-    if not checkpoint_dirs:
-        raise FileNotFoundError(f"No checkpoints found in {latest_run}")
-    return max(checkpoint_dirs, key=lambda d: int(d.name.split('-')[1]))
+    if run_dirs:
+        latest_run = max(run_dirs, key=lambda d: d.stat().st_mtime)
+        checkpoint_dirs = [d for d in latest_run.iterdir() if d.is_dir() and d.name.startswith('checkpoint-')]
+        if checkpoint_dirs:
+            return max(checkpoint_dirs, key=lambda d: int(d.name.split('-')[1]))
+
+    raise FileNotFoundError(f"No checkpoints found under {checkpoint_dir}")
 
 
 def load_model_vllm(checkpoint_path: Path, tensor_parallel_size: int = 1, gpu_memory_utilization: float = 0.8):
     """Load model with vLLM - handles LoRA detection and setup."""
-
-    # Fallback base model path if adapter metadata is missing.
-    OFFICIAL_BASE_MODEL = str(hf_path("Qwen", "Qwen3-VL-2B-Thinking"))
+    run_prompt_config_path = checkpoint_path.parents[2] / "qwen3vl_opsd_span.yaml"
+    if run_prompt_config_path.exists():
+        os.environ["OPSD_SPAN_PROMPT_CONFIG_PATH"] = str(run_prompt_config_path)
 
     # Check for LoRA adapter
     adapter_config_path = checkpoint_path / "adapter_config.json"
@@ -207,12 +254,13 @@ def load_model_vllm(checkpoint_path: Path, tensor_parallel_size: int = 1, gpu_me
     lora_path = None
 
     if adapter_config_path.exists():
-        with open(adapter_config_path) as f:
-            adapter_config = json.load(f)
-        base_model_path = adapter_config.get("base_model_name_or_path") or OFFICIAL_BASE_MODEL
         lora_path = str(checkpoint_path)
+        fallback_base_model = str(hf_path("Qwen", "Qwen3-VL-2B-Thinking"))
+        adapter_meta = resolve_lora_artifacts(fallback_base_model, lora_path)
+        base_model_path = adapter_meta["model_path"] or fallback_base_model
+        lora_path = adapter_meta["lora_path"]
         logger.info(f"Detected LoRA adapter. Using base model: {base_model_path}")
-        logger.info(f"LoRA path: {lora_path}")
+        logger.info(f"LoRA path: {lora_path if lora_path else '<merged-for-vllm>'}")
     else:
         base_model_path = str(checkpoint_path)
         logger.info(f"Loading base model from {base_model_path}")
@@ -221,42 +269,11 @@ def load_model_vllm(checkpoint_path: Path, tensor_parallel_size: int = 1, gpu_me
     # CRITICAL: Add special tokens for latent thinking BEFORE loading vLLM
     # ============================================================================
 
-    # Load tokenizer and add special tokens
-    tokenizer_with_special_tokens = AutoTokenizer.from_pretrained(
-        base_model_path, trust_remote_code=True
+    tokenizer_path = os.environ.get("VLLM_TOKENIZER_PATH", "").strip() or base_model_path
+    tokenizer_with_special_tokens, _validated_token_ids = prepare_inference_tokenizer(
+        tokenizer_path,
+        logger=logger,
     )
-
-    # Ensure <latent>/<think_sep> are single tokens for inference.
-    # Use regular added tokens (not "special") so they can be generated/displayed
-    # like <think> and </think>.
-    special_tokens = ["<latent>", "<think_sep>"]
-    added_count = 0
-    for token in special_tokens:
-        encoded = tokenizer_with_special_tokens.encode(token, add_special_tokens=False)
-        if len(encoded) > 1:
-            num_added = tokenizer_with_special_tokens.add_tokens([token], special_tokens=False)
-            added_count += num_added
-
-    # If checkpoint tokenizer marks these as special, demote them at runtime.
-    # vLLM generation then treats them like regular tokens.
-    for token in special_tokens:
-        token_id = tokenizer_with_special_tokens.convert_tokens_to_ids(token)
-        added = tokenizer_with_special_tokens.added_tokens_decoder.get(token_id)
-        if added is not None and getattr(added, "special", False):
-            tokenizer_with_special_tokens._tokenizer.add_tokens([AddedToken(token, special=False)])
-            logger.info(f"Demoted special token to regular token at runtime: {token} (ID {token_id})")
-
-    if added_count > 0:
-        logger.info(f"Added {added_count} regular thinking tokens to tokenizer")
-
-    # Always export unified token IDs used by both training and vLLM plugin.
-    for token in special_tokens:
-        token_id = tokenizer_with_special_tokens.convert_tokens_to_ids(token)
-        logger.info(f"  {token} -> ID {token_id}")
-        if token == "<latent>":
-            os.environ["QWEN3VL_LATENT_TOKEN_ID"] = str(token_id)
-        elif token == "<think_sep>":
-            os.environ["QWEN3VL_THINKING_SEP_ID"] = str(token_id)
 
     # Initialize vLLM
     llm_kwargs = {
@@ -280,7 +297,8 @@ def load_model_vllm(checkpoint_path: Path, tensor_parallel_size: int = 1, gpu_me
     # Load processor separately (tokenizer doesn't have image_processor)
     processor = AutoProcessor.from_pretrained(base_model_path, trust_remote_code=True)
 
-    logger.info(f"Model loaded with vLLM (thinking mode enabled)")
+    mode = "continuous" if os.environ.get("VLLM_THINKING", "0").strip().lower() in {"1", "true", "yes", "on"} else "discrete"
+    logger.info("Model loaded with vLLM (%s mode)", mode)
     return llm, tokenizer, processor, lora_path
 
 
@@ -398,6 +416,9 @@ def run_evaluation(
                                 break
             if not instruction_text:
                 instruction_text = "Describe the image."
+            prompt_instruction_text = instruction_text
+            if opsd_span_prompt_enabled():
+                prompt_instruction_text = build_opsd_span_student_prompt(instruction_text)
 
             # Extract ground_truth from assistant message
             ground_truth = ""
@@ -421,14 +442,13 @@ def run_evaluation(
                 messages[0]["content"].append({"type": "image", "image": img})
 
             # Add text instruction
-            messages[0]["content"].append({"type": "text", "text": instruction_text})
+            messages[0]["content"].append({"type": "text", "text": prompt_instruction_text})
 
             # Apply chat template to get prompt with proper placeholders
             # This will insert <|vision_start|><|image_pad|><|vision_end|> for each image
             text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
             text = text + "<|im_start|>assistant\n"
-            if os.environ.get("VLLM_FORCE_THINK", "0") == "1":
-                text = text + "<think>"
+            text = append_forced_think_prompt(text)
 
             # Get min/max pixels from processor for vLLM image processing
             min_pixels = getattr(processor.image_processor, 'min_pixels', 28 * 28 * 256)
@@ -448,6 +468,7 @@ def run_evaluation(
                 },
                 'sample': sample,
                 'instruction_text': instruction_text,
+                'prompt_instruction_text': prompt_instruction_text,
                 'ground_truth': ground_truth,
             })
             valid_indices.append(i)
@@ -560,8 +581,9 @@ def run_evaluation(
             probe_token_ids=probe_token_ids,
         )
 
+        matched_runner_trace = _resolve_target_trace_records(target_traces, req_id)
         runner_by_step: dict[int, dict] = {}
-        for rec in target_traces.get(req_id, []):
+        for rec in matched_runner_trace:
             try:
                 runner_by_step[int(rec.get("step", 0))] = rec.get("target_logprobs", {}) or {}
             except Exception:
@@ -632,6 +654,8 @@ def run_evaluation(
             'images': sample['images'],
             'instruction': inp['instruction_text'],
             'ground_truth': inp['ground_truth'],
+            'prediction': full_output if full_output else "[EMPTY]",
+            'prediction_display': display_output if display_output else "[EMPTY]",
             'generated_answer': full_output if full_output else "[EMPTY]",
             'generated_answer_display': display_output if display_output else "[EMPTY]",
         })
@@ -652,7 +676,7 @@ def run_evaluation(
                 'token_logprobs_topk': token_logprobs_topk,
                 'post_think_token_logprobs': post_think_token_logprobs,
                 'step_target_token_logprobs': step_target_logprobs,
-                'step_target_token_logprobs_runner': target_traces.get(req_id, []),
+                'step_target_token_logprobs_runner': matched_runner_trace,
             },
         })
 
@@ -970,6 +994,14 @@ def main():
     )
     logger.info(f"CUDA_VISIBLE_DEVICES: {','.join(visible_gpus) if visible_gpus else 'not set'}")
     logger.info(f"Tensor parallel (resolved): {resolved_tp}")
+    logger.info(
+        "OPSD_DELTA_MEMORY_ENABLED: %s",
+        os.environ.get("OPSD_DELTA_MEMORY_ENABLED", "0"),
+    )
+    logger.info(
+        "OPSD_DELTA_MEMORY_GAMMA: %s",
+        os.environ.get("OPSD_DELTA_MEMORY_GAMMA", "0.5"),
+    )
 
     checkpoint_dir = Path(args.checkpoint_dir)
     if args.checkpoint:
@@ -983,7 +1015,7 @@ def main():
     if args.metadata:
         eval_metadata = Path(args.metadata)
     else:
-        eval_metadata = _REPO_ROOT / "Qwen/data/eval/transparent_eval.jsonl"
+        eval_metadata = _REPO_ROOT / "Qwen/evaluation/data/transparent_eval.jsonl"
 
     if not eval_metadata.exists():
         raise FileNotFoundError(f"Metadata not found: {eval_metadata}")
@@ -995,10 +1027,10 @@ def main():
     target_prob_trace_path = str(
         (trace_dir / f"_debug_trace_{int(time.time())}_{os.getpid()}.jsonl").resolve()
     )
-    os.environ["VLLM_THINKING_TARGET_PROB_PATH"] = target_prob_trace_path
-    os.environ["VLLM_THINKING_TARGET_PROB_MAX_STEPS"] = str(args.logprobs_max_steps)
     if os.path.exists(target_prob_trace_path):
         os.remove(target_prob_trace_path)
+    os.environ["VLLM_THINKING_TARGET_PROB_PATH"] = target_prob_trace_path
+    os.environ["VLLM_THINKING_TARGET_PROB_MAX_STEPS"] = str(max(0, int(args.logprobs_max_steps)))
 
     llm, tokenizer, processor, lora_path = load_model_vllm(
         checkpoint_path,

@@ -14,7 +14,7 @@ import torch.nn as nn
 from safetensors.torch import load_file
 from project_paths import hf_path
 
-from vllm_thinking.trace_store import record_request_step, reset_request_trace, save_request_trace_to_file
+from vllm_thinking.trace_store import record_request_step, reset_request_trace
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
@@ -24,6 +24,17 @@ _TARGET_PROB_IO_WARNED = False
 _VLLM_VAE_LOGGED = False
 _CONTINUOUS_AR_CERT_LOGGED = False
 _FORCED_THINK_END_LOGPROB_SYNC_LOGGED = False
+_DISCRETE_LATENT_CARRY_LOGGED = False
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "1" if default else "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _thinking_mode_enabled() -> bool:
+    return os.environ.get("VLLM_THINKING", "0").strip().lower() in {"1", "true", "yes", "on"}
+
 
 def _debug_log(msg: str):
     """Write debug message to stderr - visible in worker output."""
@@ -58,6 +69,32 @@ def _get_logprob_row(logits_for_trace: torch.Tensor | None, req_idx: int) -> tor
     if logits_for_trace.ndim == 3:
         return logits_for_trace[req_idx, -1, :].float()
     return None
+
+
+def _sampled_token_logprob(logits_for_trace: torch.Tensor | None, req_idx: int, token_id: int) -> float | None:
+    logits_row = _get_logprob_row(logits_for_trace, req_idx)
+    if logits_row is None:
+        return None
+    vocab_size = int(logits_row.shape[-1])
+    if not 0 <= int(token_id) < vocab_size:
+        return None
+    return float((logits_row[int(token_id)] - torch.logsumexp(logits_row, dim=-1)).item())
+
+
+def _store_visualization_data_enabled() -> bool:
+    return os.environ.get("VLLM_STORE_VISUALIZATION_DATA", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _delta_memory_enabled() -> bool:
+    return _env_flag("OPSD_DELTA_MEMORY_ENABLED", default=False)
+
+
+def _delta_memory_gamma() -> float:
+    raw = os.environ.get("OPSD_DELTA_MEMORY_GAMMA", "0.5").strip()
+    try:
+        return float(raw)
+    except ValueError:
+        return 0.5
 
 
 def _sync_forced_token_logprobs(
@@ -100,6 +137,15 @@ def _sync_forced_token_logprobs(
             forced_rank = int((logits_row > logits_row[forced_token_id]).sum().item() + 1)
             logprobs.logprobs[pos_idx, 0] = forced_logprob
             logprobs.sampled_token_ranks[pos_idx] = forced_rank
+            # vLLM/Swift later materializes a per-token dict keyed by token_id.
+            # Keep that mapping aligned as well, otherwise forced token ids can
+            # trigger KeyError during logprob formatting.
+            if hasattr(logprobs, "topk_token_ids") and hasattr(logprobs, "topk_logprobs"):
+                topk_token_ids = logprobs.topk_token_ids
+                topk_logprobs = logprobs.topk_logprobs
+                if pos_idx < topk_token_ids.shape[0] and topk_token_ids.shape[1] > 0:
+                    topk_token_ids[pos_idx, 0] = int(forced_token_id)
+                    topk_logprobs[pos_idx, 0] = forced_logprob
             if not _FORCED_THINK_END_LOGPROB_SYNC_LOGGED:
                 logger.warning(
                     "[Thinking] Synced forced </think> token with rollout logprobs: req_id=%s token_id=%s rank=%s",
@@ -117,6 +163,40 @@ def _sync_forced_token_logprobs(
             forced_token_id,
         )
         _FORCED_THINK_END_LOGPROB_SYNC_LOGGED = True
+
+
+def _sync_forced_token_ids(
+    result,
+    *,
+    req_idx: int,
+    forced_token_id: int,
+) -> None:
+    """Keep sampled token ids aligned across async and sync result containers."""
+    try:
+        sampled_token_ids = getattr(result, "sampled_token_ids", None)
+        if sampled_token_ids is not None:
+            sampled_token_ids[req_idx][0] = int(forced_token_id)
+    except Exception:
+        pass
+
+    try:
+        sampled_token_ids_cpu = getattr(result, "sampled_token_ids_cpu", None)
+        async_copy_ready_event = getattr(result, "async_copy_ready_event", None)
+        if sampled_token_ids_cpu is not None:
+            if async_copy_ready_event is not None:
+                async_copy_ready_event.synchronize()
+            sampled_token_ids_cpu[req_idx, 0] = int(forced_token_id)
+    except Exception:
+        pass
+
+    try:
+        model_runner_output = getattr(result, "_model_runner_output", None)
+        if model_runner_output is not None and req_idx < len(model_runner_output.sampled_token_ids):
+            row = model_runner_output.sampled_token_ids[req_idx]
+            if row:
+                row[0] = int(forced_token_id)
+    except Exception:
+        pass
 
 
 def _get_thinking_token_ids():
@@ -199,7 +279,7 @@ def _align_vae_to_hidden_state(vae: nn.Module, hidden_state: torch.Tensor) -> nn
 
 
 # Token IDs now resolved lazily via _get_token_id() - see section above
-DEFAULT_THINKING_LENGTH = 1024  # Will be min(max_tokens//2, 1024)
+DEFAULT_THINKING_LENGTH = 1024  # Fallback only when per-request limits are unavailable.
 DEFAULT_MIN_CONTINUOUS_STEPS = 0
 
 
@@ -209,6 +289,18 @@ def _get_min_continuous_steps() -> int:
         return max(0, int(os.environ.get("MIN_CONTINUOUS_STEPS", str(DEFAULT_MIN_CONTINUOUS_STEPS))))
     except Exception:
         return DEFAULT_MIN_CONTINUOUS_STEPS
+
+
+def _get_max_continuous_steps(max_tokens: int | None = None) -> int:
+    """Maximum continuous AR steps before forcing </think>."""
+    derived = max(1, int(max_tokens or 2048) // 2)
+    raw = os.environ.get("MAX_CONTINUOUS_STEPS", "")
+    if not str(raw).strip():
+        return derived
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return derived
 
 
 def _get_req_num_sched_for_forward(model_runner, req_idx: int) -> int:
@@ -257,6 +349,67 @@ def _get_result_sampled_token_ids(result) -> list[list[int]]:
         if 0 <= req_idx < len(sampled_list):
             sampled_list[req_idx] = []
     return sampled_list
+
+
+def _resolve_token_embedding_weight(model_runner) -> torch.Tensor | None:
+    model = getattr(model_runner, "model", None)
+    if model is None:
+        return None
+    if (
+        hasattr(model, "language_model")
+        and hasattr(model.language_model, "model")
+        and hasattr(model.language_model.model, "embed_tokens")
+    ):
+        return model.language_model.model.embed_tokens.weight
+    if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
+        return model.model.embed_tokens.weight
+    if hasattr(model, "model") and hasattr(model.model, "language_model"):
+        language_model = model.model.language_model
+        if hasattr(language_model, "model") and hasattr(language_model.model, "embed_tokens"):
+            return language_model.model.embed_tokens.weight
+        if hasattr(language_model, "embed_tokens"):
+            return language_model.embed_tokens.weight
+    if hasattr(model, "model") and hasattr(model.model, "llm_model") and hasattr(model.model.llm_model, "embed_tokens"):
+        return model.model.llm_model.embed_tokens.weight
+    return None
+
+
+def _build_discrete_latent_carry_embedding(
+    *,
+    model_runner,
+    latent_token_id: int,
+    hidden_state: torch.Tensor | None,
+    previous_memory: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    if hidden_state is None:
+        return None
+    embed_weight = _resolve_token_embedding_weight(model_runner)
+    if embed_weight is None:
+        return None
+    vocab_size = int(embed_weight.shape[0])
+    if not 0 <= int(latent_token_id) < vocab_size:
+        return None
+
+    token_embedding = embed_weight[latent_token_id : latent_token_id + 1].detach()
+    carry_hidden = hidden_state.detach()
+    if carry_hidden.ndim == 1:
+        carry_hidden = carry_hidden.unsqueeze(0)
+    if carry_hidden.ndim == 2:
+        carry_hidden = carry_hidden[:, :].clone()
+    if _delta_memory_enabled():
+        if previous_memory is not None:
+            memory = previous_memory.detach()
+            if memory.ndim == 1:
+                memory = memory.unsqueeze(0)
+            gamma = _delta_memory_gamma()
+            carry_hidden = memory + gamma * (carry_hidden - memory)
+        else:
+            carry_hidden = carry_hidden.clone()
+    if carry_hidden.dtype != token_embedding.dtype:
+        carry_hidden = carry_hidden.to(dtype=token_embedding.dtype)
+    if carry_hidden.device != token_embedding.device:
+        carry_hidden = carry_hidden.to(device=token_embedding.device)
+    return token_embedding + carry_hidden
 
 _patch_applied = False
 
@@ -332,6 +485,8 @@ def apply_thinking_mode_patch():
         logger.debug("[Thinking] No VAE found")
 
     def _detect_initial_mode_from_prompt(prompt_ids) -> str:
+        if not _thinking_mode_enabled():
+            return "discrete"
         prompt_ids = list(prompt_ids or [])
         if not prompt_ids:
             return "discrete"
@@ -421,12 +576,13 @@ def apply_thinking_mode_patch():
                     mode = _detect_initial_mode_from_prompt(prompt_ids)
 
                     max_tokens = getattr(req, 'max_tokens', 2048) or 2048
-                    thinking_length = min(max_tokens // 2, DEFAULT_THINKING_LENGTH)
+                    thinking_length = _get_max_continuous_steps(max_tokens)
 
                     self._thinking_state[req.req_id] = {
                         'mode': mode,
                         'step': 0,
                         'embedding': None,
+                        'delta_memory': None,
                         'thinking_length': thinking_length,
                         'max_thinking_length': thinking_length,
                         'min_continuous_steps': _get_min_continuous_steps(),
@@ -449,6 +605,7 @@ def apply_thinking_mode_patch():
                         'mode': 'discrete',
                         'step': 0,
                         'embedding': None,
+                        'delta_memory': None,
                     }
                     _debug_log(f"[DEBUG] Cached req {req_id}: init as discrete")
 
@@ -646,12 +803,13 @@ def apply_thinking_mode_patch():
         sample_hidden_states = None
         logits_for_trace = None
         attention_weights = None
+        store_visualization_data = _store_visualization_data_enabled()
         if hasattr(self, 'execute_model_state') and self.execute_model_state is not None:
             hidden_states = self.execute_model_state.hidden_states
             sample_hidden_states = self.execute_model_state.sample_hidden_states
             logits_for_trace = self.execute_model_state.logits
-            # Try to extract attention weights if available
-            attention_weights = getattr(self.execute_model_state, 'attention_weights', None)
+            if store_visualization_data:
+                attention_weights = getattr(self.execute_model_state, 'attention_weights', None)
 
         # Call original sample_tokens
         result = _orig_sample_tokens(self, grammar_output)
@@ -744,11 +902,11 @@ def apply_thinking_mode_patch():
                         pass
 
                 # Monitor sampled token for mode switching
-                if sampled == _get_token_id('think_start'):
+                if _thinking_mode_enabled() and sampled == _get_token_id('think_start'):
                     state['mode'] = 'continuous'
                     state['step'] = 0
                     _debug_log(f"[DEBUG] sample_tokens: switched to continuous (think_start)")
-                elif sampled == _get_token_id('think_end'):
+                elif _thinking_mode_enabled() and sampled == _get_token_id('think_end'):
                     min_steps = int(state.get('min_continuous_steps', _get_min_continuous_steps()))
                     if mode == 'continuous' and step < min_steps:
                         _debug_log(
@@ -757,8 +915,9 @@ def apply_thinking_mode_patch():
                     else:
                         state['mode'] = 'discrete'
                         state['embedding'] = None
+                        state['delta_memory'] = None
                         _debug_log(f"[DEBUG] sample_tokens: switched to discrete (think_end)")
-                elif sampled == _get_token_id('think_sep'):
+                elif _thinking_mode_enabled() and sampled == _get_token_id('think_sep'):
                     state['thinking_length'] = state.get('max_thinking_length', DEFAULT_THINKING_LENGTH)
                     state['step'] = 0
                     _debug_log(f"[DEBUG] sample_tokens: reset thinking length to {state['thinking_length']} (think_sep)")
@@ -766,10 +925,16 @@ def apply_thinking_mode_patch():
                 thinking_length = state.get('thinking_length', DEFAULT_THINKING_LENGTH)
                 latent_embedding = None
                 latent_logprob = None
-                if state.get('mode') == 'continuous' and step >= thinking_length:
+                thinking_enabled = _thinking_mode_enabled()
+                if thinking_enabled and state.get('mode') == 'continuous' and step >= thinking_length:
                     if i < len(sampled_tokens_list) and sampled_tokens_list[i]:
                         sampled_tokens_list[i][0] = _get_token_id('think_end')
                         sampled = sampled_tokens_list[i][0]
+                        _sync_forced_token_ids(
+                            result,
+                            req_idx=i,
+                            forced_token_id=int(sampled),
+                        )
                         _sync_forced_token_logprobs(
                             result,
                             req_idx=i,
@@ -786,10 +951,10 @@ def apply_thinking_mode_patch():
                         _debug_log(f"[DEBUG] sample_tokens: forced think_end for req={req_id}")
                     state['mode'] = 'discrete'
                     state['embedding'] = None
+                    state['delta_memory'] = None
                     state['thinking_length'] = state.get('max_thinking_length', DEFAULT_THINKING_LENGTH)
                     _debug_log(f"[DEBUG] sample_tokens: exited continuous (step limit)")
-                else:
-                    if state.get('mode') == 'continuous' and last_hidden is not None:
+                elif thinking_enabled and state.get('mode') == 'continuous' and last_hidden is not None:
                         if self.latent_vae is not None:
                             self.latent_vae = _align_vae_to_hidden_state(self.latent_vae, last_hidden)
                             vae_dist = self.latent_vae.forward(last_hidden, temperature=1.0)
@@ -800,7 +965,49 @@ def apply_thinking_mode_patch():
                         else:
                             state['embedding'] = last_hidden
 
-                use_continuous_embedding = bool(state.get('mode') == 'continuous' and last_hidden is not None)
+                discrete_latent_carry_embedding = None
+                use_discrete_latent_carry = bool(
+                    state.get('mode') == 'discrete'
+                    and last_hidden is not None
+                    and int(sampled) == _get_token_id('latent')
+                )
+                if use_discrete_latent_carry:
+                    discrete_latent_carry_embedding = _build_discrete_latent_carry_embedding(
+                        model_runner=self,
+                        latent_token_id=_get_token_id('latent'),
+                        hidden_state=last_hidden,
+                        previous_memory=state.get('delta_memory'),
+                    )
+                    state['embedding'] = discrete_latent_carry_embedding
+                    if _delta_memory_enabled() and last_hidden is not None:
+                        updated_memory = last_hidden.detach().clone()
+                        previous_memory = state.get('delta_memory')
+                        if previous_memory is not None:
+                            gamma = _delta_memory_gamma()
+                            updated_memory = previous_memory.detach().to(
+                                device=updated_memory.device,
+                                dtype=updated_memory.dtype,
+                            ) + gamma * (updated_memory - previous_memory.detach().to(
+                                device=updated_memory.device,
+                                dtype=updated_memory.dtype,
+                            ))
+                        state['delta_memory'] = updated_memory
+                    global _DISCRETE_LATENT_CARRY_LOGGED
+                    if discrete_latent_carry_embedding is not None and not _DISCRETE_LATENT_CARRY_LOGGED:
+                        hidden_norm = float(last_hidden.float().norm().item())
+                        carry_norm = float(discrete_latent_carry_embedding.float().norm().item())
+                        logger.warning(
+                            "[Thinking] discrete latent carry active: req_id=%s token_id=%s mode=add_hidden_to_next_input hidden_norm=%.6f carry_norm=%.6f",
+                            req_id,
+                            int(sampled),
+                            hidden_norm,
+                            carry_norm,
+                        )
+                        _DISCRETE_LATENT_CARRY_LOGGED = True
+
+                use_continuous_embedding = bool(
+                    thinking_enabled and state.get('mode') == 'continuous' and last_hidden is not None
+                )
                 global _CONTINUOUS_AR_CERT_LOGGED
                 if use_continuous_embedding and not _CONTINUOUS_AR_CERT_LOGGED:
                     logger.warning(
@@ -811,58 +1018,44 @@ def apply_thinking_mode_patch():
                         bool(latent_logprob is not None),
                     )
                     _CONTINUOUS_AR_CERT_LOGGED = True
-                # Prepare per-generated-token data for visualization:
-                # - token embeddings (input embeddings for sampled tokens)
-                # - hidden states (final layer output)
-                # - VAE samples (latent embeddings for continuous tokens)
-                token_hidden_state_for_step = None
+                # Keep answer-token trace lightweight; continuous tokens still
+                # carry hidden/latent tensors for VAE replay.
+                token_hidden_state_for_step = last_hidden if store_visualization_data else None
                 token_embedding_for_step = None
                 all_token_ids_for_step = []
+                all_token_logprobs_for_step = []
 
-                if last_hidden is not None:
-                    # Store exactly one hidden-state vector per sampled token so
-                    # visualization stays aligned with the generated sequence.
-                    token_hidden_state_for_step = last_hidden
-
-                # Capture token embedding for the sampled token
                 if sampled is not None:
                     all_token_ids_for_step = [int(sampled)]
-                    try:
-                        # Get embedding matrix from model - try multiple paths for different model architectures
-                        embed_tokens = None
+                    all_token_logprobs_for_step = [
+                        _sampled_token_logprob(logits_for_trace, i, int(sampled))
+                    ]
+                    if store_visualization_data:
+                        try:
+                            embed_tokens = None
+                            if (
+                                hasattr(self.model, 'language_model')
+                                and hasattr(self.model.language_model, 'model')
+                                and hasattr(self.model.language_model.model, 'embed_tokens')
+                            ):
+                                embed_tokens = self.model.language_model.model.embed_tokens.weight
+                            elif hasattr(self.model.model, 'embed_tokens'):
+                                embed_tokens = self.model.model.embed_tokens.weight
+                            elif hasattr(self.model.model, 'language_model'):
+                                language_model = self.model.model.language_model
+                                if hasattr(language_model, 'model') and hasattr(language_model.model, 'embed_tokens'):
+                                    embed_tokens = language_model.model.embed_tokens.weight
+                                elif hasattr(language_model, 'embed_tokens'):
+                                    embed_tokens = language_model.embed_tokens.weight
+                            elif hasattr(self.model.model, 'llm_model') and hasattr(self.model.model.llm_model, 'embed_tokens'):
+                                embed_tokens = self.model.model.llm_model.embed_tokens.weight
 
-                        # For Qwen3-VL: self.model.language_model.model.embed_tokens
-                        if hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'model') and hasattr(self.model.language_model.model, 'embed_tokens'):
-                            embed_tokens = self.model.language_model.model.embed_tokens.weight
-                            _debug_log(f"[DEBUG] Found embed_tokens at language_model.model.embed_tokens (Qwen3-VL)")
-                        # Try direct embed_tokens (most models)
-                        elif hasattr(self.model.model, 'embed_tokens'):
-                            embed_tokens = self.model.model.embed_tokens.weight
-                            _debug_log(f"[DEBUG] Found embed_tokens at self.model.model.embed_tokens")
-                        # Try language_model.model.embed_tokens (Qwen2-VL style)
-                        elif hasattr(self.model.model, 'language_model'):
-                            lm = self.model.model.language_model
-                            if hasattr(lm, 'model') and hasattr(lm.model, 'embed_tokens'):
-                                embed_tokens = lm.model.embed_tokens.weight
-                                _debug_log(f"[DEBUG] Found embed_tokens at model.language_model.model.embed_tokens")
-                            elif hasattr(lm, 'embed_tokens'):
-                                embed_tokens = lm.embed_tokens.weight
-                                _debug_log(f"[DEBUG] Found embed_tokens at model.language_model.embed_tokens")
-                        # Try llm_model.embed_tokens
-                        elif hasattr(self.model.model, 'llm_model') and hasattr(self.model.model.llm_model, 'embed_tokens'):
-                            embed_tokens = self.model.model.llm_model.embed_tokens.weight
-                            _debug_log(f"[DEBUG] Found embed_tokens at llm_model.embed_tokens")
-
-                        if embed_tokens is not None:
-                            token_emb = embed_tokens[sampled:sampled+1, :].detach().clone()
-                            if token_emb.dtype != torch.bfloat16:
-                                token_emb = token_emb.to(dtype=torch.bfloat16)
-                            token_embedding_for_step = token_emb
-                            _debug_log(f"[DEBUG] Captured token embedding for token_id={sampled}, shape={token_emb.shape}")
-                        else:
-                            _debug_log(f"[WARNING] Could not find embed_tokens in model structure")
-                    except Exception as e:
-                        _debug_log(f"[ERROR] sample_tokens: failed to extract token embedding: {e}")
+                            if embed_tokens is not None:
+                                token_embedding_for_step = embed_tokens[sampled:sampled + 1, :].detach().clone()
+                                if token_embedding_for_step.dtype != torch.bfloat16:
+                                    token_embedding_for_step = token_embedding_for_step.to(dtype=torch.bfloat16)
+                        except Exception as exc:
+                            _debug_log(f"[ERROR] sample_tokens: failed to extract token embedding: {exc}")
 
                 record_request_step(
                     req_id,
@@ -872,6 +1065,7 @@ def apply_thinking_mode_patch():
                     use_continuous_embedding=use_continuous_embedding,
                     all_hidden_states=token_hidden_state_for_step,
                     all_token_ids=all_token_ids_for_step,
+                    all_token_logprobs=all_token_logprobs_for_step,
                     attention_weights=attention_weights,
                     token_embeddings=token_embedding_for_step,
                 )
@@ -881,23 +1075,24 @@ def apply_thinking_mode_patch():
                 # `num_tokens - 1`. Override that slot so the next forward consumes
                 # the hidden-state-derived embedding instead of the sampled token ID.
                 token_pos = _get_req_token_pos_after_sample(self, i, req_id)
-                if state.get('mode') == 'continuous':
+                if thinking_enabled and state.get('mode') == 'continuous':
                     _set_next_decode_embedding(
                         self,
                         i,
                         token_pos,
                         state.get('embedding'),
                     )
+                elif use_discrete_latent_carry:
+                    _set_next_decode_embedding(
+                        self,
+                        i,
+                        token_pos,
+                        discrete_latent_carry_embedding,
+                    )
                 else:
+                    if state.get('mode') == 'discrete':
+                        state['embedding'] = None
                     _set_next_decode_embedding(self, i, token_pos, None)
-
-        # Save traces to file for cross-process visualization access
-        if os.environ.get("VLLM_STORE_VISUALIZATION_DATA", "0") == "1":
-            for req_id in batch_req_ids:
-                try:
-                    save_request_trace_to_file(req_id)
-                except Exception as e:
-                    logger.warning(f"[Thinking] Failed to save trace for {req_id}: {e}")
 
         return result
 
